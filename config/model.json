@@ -1,0 +1,32 @@
+{
+  "version": "2026-06-04",
+  "fixed_model": true,
+  "lineup_source": {
+    "primary": "RotoWire",
+    "use_projected_when_unconfirmed": true
+  },
+  "pitch_velocity": {
+    "exact_band_mph": 1.5,
+    "fallback_band_mph": 3.0,
+    "weak_sample_max_pa": 9,
+    "moderate_sample_max_pa": 24,
+    "plus_adjusted_woba": 0.36,
+    "minus_adjusted_woba": 0.29
+  },
+  "bullpen": {
+    "yesterday_normal_max_pitches": 20,
+    "yesterday_limited_min_pitches": 21,
+    "yesterday_unavailable_min_pitches": 30,
+    "consecutive_days_limited": 2,
+    "three_straight_unavailable": true
+  },
+  "weather": {
+    "included_by_default": false,
+    "preferred_user_source": "BallparkPal"
+  },
+  "market": {
+    "odds_format": "decimal",
+    "applied_after_baseball_scores": true
+  }
+}
+

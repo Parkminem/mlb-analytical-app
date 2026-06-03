@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Temporary source snapshots and local analysis artifacts
+_tmp_*
+data/cache/
+reports/private/
+
