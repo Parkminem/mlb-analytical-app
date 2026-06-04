@@ -54,14 +54,16 @@ class BullpenAvailabilityTests(unittest.TestCase):
         self.assertIn("Closer", result.limited_arms)
         self.assertEqual(result.unavailable_arms, [])
 
-    def test_single_yesterday_appearance_at_thirty_or_more_pitches_is_unavailable(self):
+    def test_single_yesterday_appearance_at_thirty_or_more_pitches_is_performance_risk(self):
         appearances = [
             RelieverAppearance("Closer", "closer", days_ago=1, pitches=30),
         ]
 
         result = score_bullpen_availability(appearances)
 
-        self.assertIn("Closer", result.unavailable_arms)
+        self.assertIn("Closer", result.limited_arms)
+        self.assertEqual(result.unavailable_arms, [])
+        self.assertTrue(any("performance/use risk" in note for note in result.notes))
 
     def test_consecutive_high_leverage_usage_flags_limited_arms(self):
         appearances = [
@@ -749,6 +751,60 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.f5_ml, "lean")
         self.assertEqual(result.full_game_ml, "lean")
         self.assertIn("short favorite with starter command/HR risk capped", result.notes)
+
+    def test_key_power_bat_missing_downgrades_side_priority(self):
+        context = FullGameContext(
+            f5_edge=82,
+            lineup_edge=74,
+            bullpen_score=76,
+            bullpen_quality=76,
+            market_total=8.0,
+            projected_total=7.9,
+            run_environment=0,
+            key_power_bat_missing=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "lean")
+        self.assertIn("key power bat missing lowers side priority", result.notes)
+
+    def test_injury_return_or_short_exit_risk_caps_full_game_ml(self):
+        context = FullGameContext(
+            f5_edge=76,
+            lineup_edge=74,
+            bullpen_score=72,
+            bullpen_quality=72,
+            market_total=8.0,
+            projected_total=7.8,
+            run_environment=0,
+            injury_return_or_recent_short_exit_risk=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "lean")
+        self.assertIn("injury return or recent short exit caps full-game ML", result.notes)
+
+    def test_two_sided_run_volatility_separates_over_from_side(self):
+        context = FullGameContext(
+            f5_edge=72,
+            lineup_edge=70,
+            bullpen_score=65,
+            bullpen_quality=60,
+            market_total=8.0,
+            projected_total=9.2,
+            run_environment=0,
+            two_sided_run_volatility=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.full_game_total, "over")
+        self.assertEqual(result.full_game_ml, "pass")
+        self.assertIn("two-sided run volatility separates over from side", result.notes)
 
     def test_fastball_only_plus_slots_against_two_pitch_starter_downgrade_side(self):
         context = FullGameContext(

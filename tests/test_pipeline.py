@@ -15,6 +15,8 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(config["lineup_source"]["primary"], "RotoWire")
         self.assertTrue(config["lineup_source"]["use_projected_when_unconfirmed"])
         self.assertFalse(config["weather"]["included_by_default"])
+        self.assertEqual(config["bullpen"]["yesterday_performance_risk_min_pitches"], 30)
+        self.assertTrue(config["side_priority"]["downgrade_key_power_bat_missing"])
 
     def test_model_layers_keep_the_documented_order(self):
         self.assertEqual(

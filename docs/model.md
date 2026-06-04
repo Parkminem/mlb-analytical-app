@@ -176,7 +176,7 @@ Availability rules:
 
 - Pitching yesterday alone is not a downgrade when the reliever threw 20 or fewer pitches and is not on consecutive-day usage.
 - Throwing 21-29 pitches yesterday creates a slight downgrade.
-- Throwing 30 or more pitches yesterday makes a high-leverage arm unavailable by default.
+- Throwing 30 or more pitches yesterday makes a high-leverage arm limited with performance and usage risk, not automatically unavailable.
 - Pitching on consecutive days limits the arm.
 - Pitching three straight days makes a high-leverage arm unavailable by default.
 - Multiple limited high-leverage arms create an additional bullpen downgrade.
@@ -257,6 +257,9 @@ Rules:
 - Full-game ML may survive moderate starter volatility when the bullpen is rested and materially better.
 - Late-inning bullpen risk can move a full-game ML pick toward F5 or pass.
 - If the model side is a favorite at decimal odds of `1.60` or lower and the starter has command or HR risk, cap the side at `lean`.
+- If a confirmed lineup removes a key power bat or the largest positive pitch-velocity slot, downgrade side priority at least one level.
+- If the model side's starter is returning from injury or had a recent short exit, downgrade full-game ML as well as F5.
+- If the best total case comes from two-sided run volatility, separate the over from the side and downgrade ML.
 - Market movement does not create the baseball edge; it is reviewed after the model score is complete.
 
 ### Plus Handicap
@@ -296,6 +299,7 @@ Over rules:
 
 - Over requires starter collapse risk, live lineup fit, lower-bullpen exposure, or a favorable run environment.
 - Positive matchup slots alone are not enough when recent power and walk pressure are weak.
+- When over is driven by both teams' starter or bullpen volatility, prefer the total and avoid forcing a side.
 - Starter-source conflicts are not over signals.
 - Short-starter or bullpen-game labels do not automatically support over.
 - If both starters are likely to reach the sixth inning and neither has clear collapse risk, do not upgrade over from lineup fit alone.

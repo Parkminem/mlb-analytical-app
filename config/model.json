@@ -16,9 +16,14 @@
   "bullpen": {
     "yesterday_normal_max_pitches": 20,
     "yesterday_limited_min_pitches": 21,
-    "yesterday_unavailable_min_pitches": 30,
+    "yesterday_performance_risk_min_pitches": 30,
     "consecutive_days_limited": 2,
     "three_straight_unavailable": true
+  },
+  "side_priority": {
+    "downgrade_key_power_bat_missing": true,
+    "downgrade_injury_return_or_recent_short_exit": true,
+    "downgrade_side_when_over_is_two_sided_volatility": true
   },
   "weather": {
     "included_by_default": false,
@@ -29,4 +34,3 @@
     "applied_after_baseball_scores": true
   }
 }
-

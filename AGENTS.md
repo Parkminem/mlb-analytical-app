@@ -25,6 +25,10 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - Label hitter slots as `플러스`, `중립`, `마이너스`, or `표본 부족`. Never treat `표본 부족` as hitter weakness.
 - Explain both teams' all-lineup pitch/velocity response, recent form, starter risk, bullpen availability and quality, and umpire impact when available.
 - Avoid ambiguous claims based only on handedness. State whether a conclusion comes from actual matchup data or a limited-sample inference.
+- If a confirmed lineup removes a key power bat or the strongest positive pitch-velocity slot, downgrade side priority.
+- If a starter is returning from injury or had a recent short exit, downgrade full-game ML as well as F5.
+- Treat a high-leverage reliever who threw 30+ pitches yesterday as limited with performance/use risk, not automatically unavailable. Keep three straight days as unavailable.
+- If the over case is driven by volatility on both sides, prefer O/U and downgrade ML.
 
 ## Default Output
 
@@ -35,4 +39,3 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - If data is missing or conflicting, state the limitation and cap confidence instead of inventing precision.
 
 Use `python3 -m analysis.pipeline` to inspect the fixed analysis manifest and `docs/analysis-output-template.md` for the preferred response structure.
-

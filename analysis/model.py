@@ -258,6 +258,9 @@ class FullGameContext:
     opposing_starter_has_two_pitch_command: bool = False
     opposing_prim_bulk_with_weak_lineup_fit: bool = False
     weak_early_scoring_support: bool = False
+    key_power_bat_missing: bool = False
+    injury_return_or_recent_short_exit_risk: bool = False
+    two_sided_run_volatility: bool = False
 
 
 @dataclass(frozen=True)
@@ -292,10 +295,10 @@ def score_bullpen_availability(appearances: list[RelieverAppearance]) -> Bullpen
             notes.append(f"{name} used on consecutive days")
 
         if pitches_yesterday >= 30:
-            score -= 20 if high_leverage else 6
+            score -= 18 if high_leverage else 6
             if high_leverage:
-                unavailable.add(name)
-            notes.append(f"{name} threw 30+ pitches yesterday")
+                limited.add(name)
+            notes.append(f"{name} threw 30+ pitches yesterday; performance/use risk")
         elif pitches_yesterday >= 21:
             score -= 8 if high_leverage else 3
             if high_leverage:
@@ -746,6 +749,14 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
         adjusted_f5_edge -= 8
         notes.append("weak early scoring support caps F5 confidence")
 
+    if context.key_power_bat_missing:
+        adjusted_f5_edge -= 10
+        notes.append("key power bat missing lowers side priority")
+
+    if context.injury_return_or_recent_short_exit_risk:
+        adjusted_f5_edge -= 6
+        notes.append("injury return or recent short exit caps full-game ML")
+
     diffuse_plus_slots = (
         context.lineup_pitch_velocity_plus_slots >= 6
         and context.top_order_pitch_velocity_plus_slots is not None
@@ -831,6 +842,16 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
 
     if fastball_only_cap:
         full_game_score -= 8
+
+    if context.key_power_bat_missing:
+        full_game_score -= 12
+
+    if context.injury_return_or_recent_short_exit_risk:
+        full_game_score -= 12
+
+    if context.two_sided_run_volatility:
+        full_game_score -= 12
+        notes.append("two-sided run volatility separates over from side")
 
     if context.late_bullpen_risk:
         full_game_ml = "pass"
