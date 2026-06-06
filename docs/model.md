@@ -46,6 +46,7 @@ Rules:
 - RotoWire remains the lineup source: confirmed lineup when posted, projected lineup when not posted.
 - Official MLB probable pitchers override projected pitcher sources.
 - When official MLB probable pitchers and RotoWire disagree and no clear opener/bulk explanation resolves the conflict, downgrade F5 and full-game ML confidence.
+- When the official probable pitcher and RotoWire disagree but the bulk or `PRIM` pitcher is clearly identified and used for the matchup, do not keep treating the game as an unresolved starter-source conflict.
 - Do not keep a strong F5 recommendation when the starter is not confirmed close to game time.
 - A projected lineup does not make a team weaker. It only lowers recommendation confidence.
 - A `표본 부족` pitch-velocity result does not make a hitter weaker. It only raises matchup uncertainty.
@@ -98,6 +99,7 @@ Rules:
 
 - Ace reputation does not override actual lineup fit.
 - If the opponent's top five contain three or more clear `플러스` matchups, reduce the ace bonus.
+- If the opponent's top five contain three or more clear `플러스` matchups and the model-side starter has HR risk or collapse risk, downgrade the model-side ML and consider O/U or pass before side.
 - If a lineup has many `플러스` and many `마이너스` matchups, treat the result as mixed rather than clearly hitter-friendly.
 - If six or more `플러스` slots are present but fewer than three sit in the top five, or fewer than two belong to clear power bats, downgrade the lineup edge.
 - If the edge is concentrated mostly on fastballs and the starter has reliable secondary command, downgrade the lineup edge.
@@ -260,6 +262,7 @@ Rules:
 - If a confirmed lineup removes a key power bat or the largest positive pitch-velocity slot, downgrade side priority at least one level.
 - If the model side's starter is returning from injury or had a recent short exit, downgrade full-game ML as well as F5.
 - If the best total case comes from two-sided run volatility, separate the over from the side and downgrade ML.
+- If starter HR/collapse risk is identified and the opponent's top order has three or more pitch-velocity `플러스` slots, do not leave the model side as a primary ML pick. Move first to O/U when the run environment supports it, otherwise pass or reduce the side to a weak lean.
 - Market movement does not create the baseball edge; it is reviewed after the model score is complete.
 
 ### Plus Handicap

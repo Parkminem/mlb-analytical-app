@@ -17,6 +17,14 @@ class ModelConfigTests(unittest.TestCase):
         self.assertFalse(config["weather"]["included_by_default"])
         self.assertEqual(config["bullpen"]["yesterday_performance_risk_min_pitches"], 30)
         self.assertTrue(config["side_priority"]["downgrade_key_power_bat_missing"])
+        self.assertTrue(
+            config["side_priority"][
+                "downgrade_ml_when_opponent_top_order_attacks_starter_hr_or_collapse_risk"
+            ]
+        )
+        self.assertTrue(
+            config["side_priority"]["confirmed_bulk_pitcher_resolves_starter_source_conflict"]
+        )
 
     def test_model_layers_keep_the_documented_order(self):
         self.assertEqual(

@@ -806,6 +806,45 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.full_game_ml, "pass")
         self.assertIn("two-sided run volatility separates over from side", result.notes)
 
+    def test_opponent_top_order_plus_against_hr_risk_starter_blocks_model_side_ml(self):
+        context = FullGameContext(
+            f5_edge=72,
+            lineup_edge=66,
+            bullpen_score=76,
+            bullpen_quality=74,
+            market_total=9.0,
+            projected_total=10.0,
+            run_environment=0,
+            opponent_top_order_pitch_velocity_plus_slots=3,
+            model_starter_hr_or_collapse_risk=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.full_game_total, "over")
+        self.assertEqual(result.full_game_ml, "pass")
+        self.assertIn("opponent top-order pitch-velocity edge attacks starter HR/collapse risk", result.notes)
+
+    def test_confirmed_bulk_pitcher_resolves_starter_source_conflict(self):
+        context = FullGameContext(
+            f5_edge=74,
+            lineup_edge=68,
+            bullpen_score=72,
+            bullpen_quality=72,
+            market_total=8.0,
+            projected_total=8.2,
+            run_environment=0,
+            starter_source_conflict=True,
+            confirmed_bulk_pitcher_used_for_matchup=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "lean")
+        self.assertNotIn("starter source conflict blocks strong F5 confidence", result.notes)
+        self.assertIn("confirmed bulk pitcher resolves starter-source conflict", result.notes)
+
     def test_fastball_only_plus_slots_against_two_pitch_starter_downgrade_side(self):
         context = FullGameContext(
             f5_edge=80,

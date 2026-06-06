@@ -261,6 +261,9 @@ class FullGameContext:
     key_power_bat_missing: bool = False
     injury_return_or_recent_short_exit_risk: bool = False
     two_sided_run_volatility: bool = False
+    opponent_top_order_pitch_velocity_plus_slots: int = 0
+    model_starter_hr_or_collapse_risk: bool = False
+    confirmed_bulk_pitcher_used_for_matchup: bool = False
 
 
 @dataclass(frozen=True)
@@ -737,9 +740,11 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
         adjusted_f5_edge -= 8
         notes.append("same-handed lineup with pitch-velocity uncertainty adds power variance")
 
-    if context.starter_source_conflict:
+    if context.starter_source_conflict and not context.confirmed_bulk_pitcher_used_for_matchup:
         adjusted_f5_edge -= 10
         notes.append("starter source conflict blocks strong F5 confidence")
+    elif context.starter_source_conflict and context.confirmed_bulk_pitcher_used_for_matchup:
+        notes.append("confirmed bulk pitcher resolves starter-source conflict")
 
     if context.opposing_prim_bulk_with_weak_lineup_fit:
         adjusted_f5_edge -= 8
@@ -756,6 +761,14 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if context.injury_return_or_recent_short_exit_risk:
         adjusted_f5_edge -= 6
         notes.append("injury return or recent short exit caps full-game ML")
+
+    opponent_top_order_attacks_starter_risk = (
+        context.opponent_top_order_pitch_velocity_plus_slots >= 3
+        and context.model_starter_hr_or_collapse_risk
+    )
+    if opponent_top_order_attacks_starter_risk:
+        adjusted_f5_edge -= 6
+        notes.append("opponent top-order pitch-velocity edge attacks starter HR/collapse risk")
 
     diffuse_plus_slots = (
         context.lineup_pitch_velocity_plus_slots >= 6
@@ -825,7 +838,7 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     ):
         full_game_score -= 6
 
-    if context.starter_source_conflict:
+    if context.starter_source_conflict and not context.confirmed_bulk_pitcher_used_for_matchup:
         full_game_score -= 8
 
     if context.opposing_prim_bulk_with_weak_lineup_fit:
@@ -852,6 +865,9 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if context.two_sided_run_volatility:
         full_game_score -= 12
         notes.append("two-sided run volatility separates over from side")
+
+    if opponent_top_order_attacks_starter_risk:
+        full_game_score -= 12
 
     if context.late_bullpen_risk:
         full_game_ml = "pass"

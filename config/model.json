@@ -1,5 +1,5 @@
 {
-  "version": "2026-06-04",
+  "version": "2026-06-06",
   "fixed_model": true,
   "lineup_source": {
     "primary": "RotoWire",
@@ -23,7 +23,9 @@
   "side_priority": {
     "downgrade_key_power_bat_missing": true,
     "downgrade_injury_return_or_recent_short_exit": true,
-    "downgrade_side_when_over_is_two_sided_volatility": true
+    "downgrade_side_when_over_is_two_sided_volatility": true,
+    "downgrade_ml_when_opponent_top_order_attacks_starter_hr_or_collapse_risk": true,
+    "confirmed_bulk_pitcher_resolves_starter_source_conflict": true
   },
   "weather": {
     "included_by_default": false,
