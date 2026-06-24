@@ -84,6 +84,24 @@ class LineupSource:
 
 
 @dataclass(frozen=True)
+class StarterStructureContext:
+    official_pitcher: str
+    rotowire_pitcher: str | None = None
+    official_pitcher_is_opener: bool = False
+    rotowire_pitcher_is_bulk_candidate: bool = False
+
+
+@dataclass(frozen=True)
+class StarterStructure:
+    matchup_pitcher: str
+    opener_pitcher: str | None = None
+    bulk_pitcher: str | None = None
+    starter_source_conflict: bool = False
+    confirmed_bulk_pitcher_used_for_matchup: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class UmpireContext:
     zone_size: str
     walk_tendency: str
@@ -148,6 +166,9 @@ class HandicapContext:
     lower_order_run_continuity: bool = True
     pitch_velocity_edge_fastball_only: bool = False
     secondary_pitch_support: bool = True
+    starter_walks_per_nine: float | None = None
+    starter_strikeout_walk_ratio: float | None = None
+    starter_recent_home_run_repetition: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,6 +198,24 @@ class TotalContext:
     both_starters_likely_to_reach_sixth: bool = False
     low_total_late_variance_risk: bool = False
     starter_under_but_full_game_pen_risk: bool = False
+    starter_length_tempers_plus_slots: bool = False
+    negative_power_bat_variance: bool = False
+    two_sided_over_volatility: bool = False
+    weak_favorite_lineup_with_starter_edge: bool = False
+    side_uncertain_total_preferred: bool = False
+    under_validation_strict: bool = False
+    over_validation_strict: bool = False
+    recent_starter_command_or_hr_volatility: bool = False
+    neutral_heavy_traffic_risk: bool = False
+    both_starters_command_risk: bool = False
+    post_sixth_bullpen_exposure_risk: bool = False
+    lineup_on_base_path_a: bool = True
+    lineup_on_base_path_b: bool = True
+    lower_order_run_continuity_a: bool = True
+    lower_order_run_continuity_b: bool = True
+    high_total_recent_power_walk_conversion: bool = True
+    starter_kbb_length_suppresses_over: bool = False
+    over_lacks_walk_or_late_bullpen_path: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,6 +303,15 @@ class FullGameContext:
     opponent_top_order_pitch_velocity_plus_slots: int = 0
     model_starter_hr_or_collapse_risk: bool = False
     confirmed_bulk_pitcher_used_for_matchup: bool = False
+    opponent_neutral_pitch_velocity_slots: int = 0
+    opponent_pitch_velocity_minus_slots: int = 0
+    opponent_negative_power_bat_slots: int = 0
+    f5_only_preferred: bool = False
+    model_lineup_core_minus_slots: int = 0
+    plus_slots_low_run_efficiency_prefers_total: bool = False
+    post_sixth_bullpen_exposure_risk: bool = False
+    high_recent_strikeout_rate: bool = False
+    unfamiliar_opposing_starter: bool = False
 
 
 @dataclass(frozen=True)
@@ -453,6 +501,42 @@ def resolve_lineup_source(status: LineupStatus) -> LineupSource:
     )
 
 
+def resolve_starter_structure(context: StarterStructureContext) -> StarterStructure:
+    notes: list[str] = []
+    official_pitcher = context.official_pitcher.strip()
+    rotowire_pitcher = (context.rotowire_pitcher or "").strip()
+    sources_match = official_pitcher.casefold() == rotowire_pitcher.casefold()
+
+    if not rotowire_pitcher or sources_match:
+        return StarterStructure(
+            matchup_pitcher=official_pitcher,
+            notes=["official starter used for matchup"],
+        )
+
+    opener_with_bulk_candidate = (
+        context.official_pitcher_is_opener
+        and context.rotowire_pitcher_is_bulk_candidate
+    )
+    if opener_with_bulk_candidate:
+        notes.append("official opener and RotoWire bulk candidate identified")
+        notes.append("bulk pitcher is used for pitch-velocity matchup")
+        return StarterStructure(
+            matchup_pitcher=rotowire_pitcher,
+            opener_pitcher=official_pitcher,
+            bulk_pitcher=rotowire_pitcher,
+            starter_source_conflict=False,
+            confirmed_bulk_pitcher_used_for_matchup=True,
+            notes=notes,
+        )
+
+    notes.append("official and RotoWire starters disagree without confirmed opener/bulk structure")
+    return StarterStructure(
+        matchup_pitcher=official_pitcher,
+        starter_source_conflict=True,
+        notes=notes,
+    )
+
+
 def apply_umpire_adjustment(
     base_f5_edge: int,
     umpire: UmpireContext,
@@ -522,6 +606,22 @@ def evaluate_plus_handicap(context: HandicapContext) -> HandicapDecision:
         notes.append("small-sample starter survival risk")
         return HandicapDecision(rating="pass", notes=notes)
 
+    cap_plus_handicap = False
+    small_sample_command_risk = (
+        context.starter_sample_risk
+        and context.starter_walks_per_nine is not None
+        and context.starter_walks_per_nine >= 4.0
+        and context.starter_strikeout_walk_ratio is not None
+        and context.starter_strikeout_walk_ratio < 2.0
+    )
+    if small_sample_command_risk:
+        cap_plus_handicap = True
+        notes.append("small-sample command risk caps plus handicap")
+
+    if context.starter_recent_home_run_repetition:
+        cap_plus_handicap = True
+        notes.append("recent starter HR repetition caps plus handicap")
+
     if context.bullpen_score < 55:
         notes.append("bullpen cannot protect handicap")
         return HandicapDecision(rating="pass", notes=notes)
@@ -537,6 +637,8 @@ def evaluate_plus_handicap(context: HandicapContext) -> HandicapDecision:
     if context.lineup_edge >= 62 and context.decimal_odds >= 1.60:
         if capped_by_run_continuity:
             notes.append("fastball-only edge with weak lower-order continuity caps plus handicap")
+            return HandicapDecision(rating="lean", notes=notes)
+        if cap_plus_handicap:
             return HandicapDecision(rating="lean", notes=notes)
         if context.opponent_late_risk:
             notes.append("opponent late risk supports plus handicap")
@@ -558,9 +660,21 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         context.pitch_velocity_unknown_rate_a >= 0.45
         or context.pitch_velocity_unknown_rate_b >= 0.45
     )
+    two_sided_on_base_and_continuity = (
+        context.lineup_on_base_path_a
+        and context.lineup_on_base_path_b
+        and context.lower_order_run_continuity_a
+        and context.lower_order_run_continuity_b
+    )
 
     if context.starter_source_conflict:
         notes.append("starter source conflict lowers confidence but is not over support")
+
+    if context.weak_favorite_lineup_with_starter_edge:
+        notes.append("weak favorite lineup makes total review higher priority than ML")
+
+    if context.side_uncertain_total_preferred:
+        notes.append("side uncertainty moves O/U into the main priority stack")
 
     if context.starter_under_but_full_game_pen_risk:
         notes.append("starter under only; bullpen risk blocks full-game under")
@@ -570,7 +684,23 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         notes.append("low total leaves no margin for late variance")
         return TotalDecision(rating="pass", notes=notes)
 
+    low_total_under_candidate = (
+        context.market_total <= 7.5
+        and context.projected_total <= context.market_total + 0.2
+        and (total_edge >= 0.3 or context.low_total_starter_duel)
+    )
+    if low_total_under_candidate and context.recent_starter_command_or_hr_volatility:
+        notes.append("recent starter command/HR volatility blocks low-total under")
+        return TotalDecision(rating="pass", notes=notes)
+
+    if low_total_under_candidate and context.neutral_heavy_traffic_risk:
+        notes.append("neutral-heavy traffic risk blocks low-total under")
+        return TotalDecision(rating="pass", notes=notes)
+
     if total_edge >= 0.7:
+        if context.negative_power_bat_variance:
+            notes.append("negative pitch-velocity power bats add run variance, not under support")
+            return TotalDecision(rating="pass", notes=notes)
         if high_unknown_pitch_velocity:
             notes.append("pitch-velocity sample shortage is uncertainty, not under support")
             return TotalDecision(rating="pass", notes=notes)
@@ -583,7 +713,10 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         if not both_lineups_muted:
             notes.append("under requires muted lineup contact")
             return TotalDecision(rating="pass", notes=notes)
-        return TotalDecision(rating="under", notes=["both starters and bullpens support under"])
+        if context.under_validation_strict:
+            notes.append("strict under validation passed")
+        notes.append("both starters and bullpens support under")
+        return TotalDecision(rating="under", notes=notes)
 
     if (
         total_edge >= 0.3
@@ -592,6 +725,11 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         and both_lineups_muted
         and not high_unknown_pitch_velocity
     ):
+        if context.negative_power_bat_variance:
+            notes.append("negative pitch-velocity power bats add run variance, not under support")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.under_validation_strict:
+            notes.append("strict under validation passed")
         notes.append("both starters' recent stability supports under")
         return TotalDecision(rating="under", notes=notes)
 
@@ -605,8 +743,64 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         and not high_unknown_pitch_velocity
         and not context.lower_bullpen_risk
     ):
+        if context.negative_power_bat_variance:
+            notes.append("negative pitch-velocity power bats add run variance, not under support")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.under_validation_strict:
+            notes.append("strict under validation passed")
         notes.append("low-total starter duel prioritizes under over side")
         return TotalDecision(rating="under", notes=notes)
+
+    if (
+        context.low_total_starter_duel
+        and context.market_total <= 7.5
+        and context.projected_total <= context.market_total + 0.2
+        and both_starters_stable
+        and both_bullpens_stable
+        and not context.lower_bullpen_risk
+        and not context.low_total_late_variance_risk
+        and not context.negative_power_bat_variance
+        and not high_unknown_pitch_velocity
+        and context.both_starters_recently_stable
+        and (context.both_starters_likely_to_reach_sixth or context.both_starters_can_work_deep)
+        and context.starter_length_tempers_plus_slots
+        and context.lineup_contact_a < 70
+        and context.lineup_contact_b < 70
+    ):
+        if context.under_validation_strict:
+            notes.append("strict under validation passed")
+        notes.append("starter length tempers pitch-velocity plus slots at low total")
+        return TotalDecision(rating="under", notes=notes)
+
+    if (
+        context.starter_kbb_length_suppresses_over
+        and context.market_total >= 8.5
+        and not context.lower_bullpen_risk
+        and not context.post_sixth_bullpen_exposure_risk
+    ):
+        notes.append("starter K/BB length suppresses pitch-velocity over")
+        return TotalDecision(rating="pass", notes=notes)
+
+    if (
+        context.over_lacks_walk_or_late_bullpen_path
+        and context.both_starters_likely_to_reach_sixth
+        and both_starters_stable
+        and not context.lower_bullpen_risk
+        and not context.post_sixth_bullpen_exposure_risk
+    ):
+        notes.append("sixth-inning starter path requires walk or late-bullpen support for over")
+        return TotalDecision(rating="pass", notes=notes)
+
+    if (
+        context.post_sixth_bullpen_exposure_risk
+        and context.projected_total >= context.market_total - 0.2
+        and (context.lineup_contact_a >= 58 or context.lineup_contact_b >= 58)
+    ):
+        if context.over_validation_strict and not two_sided_on_base_and_continuity:
+            notes.append("strict over validation requires two-sided on-base and lower-order continuity")
+            return TotalDecision(rating="pass", notes=notes)
+        notes.append("post-sixth bullpen exposure keeps over live")
+        return TotalDecision(rating="over", notes=notes)
 
     if (
         context.both_starters_can_work_deep
@@ -628,15 +822,72 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
 
     starter_collapse = context.starter_stability_a < 45 or context.starter_stability_b < 45
     lineup_fit = context.lineup_contact_a >= 70 or context.lineup_contact_b >= 70
+
+    if (
+        context.market_total >= 9.5
+        and context.both_starters_command_risk
+        and context.two_sided_over_volatility
+        and context.projected_total >= context.market_total - 0.3
+        and context.lineup_contact_a >= 58
+        and context.lineup_contact_b >= 58
+        and (context.lineup_contact_a >= 62 or context.lineup_contact_b >= 62)
+    ):
+        if context.over_validation_strict and not context.high_total_recent_power_walk_conversion:
+            notes.append("high-total over requires recent power or walk conversion")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.over_validation_strict and not two_sided_on_base_and_continuity:
+            notes.append("strict over validation requires two-sided on-base and lower-order continuity")
+            return TotalDecision(rating="pass", notes=notes)
+        notes.append("two command-risk starters keep high-total over live")
+        notes.append("two-sided volatility makes over preferable to side")
+        return TotalDecision(rating="over", notes=notes)
+
     if starter_collapse and lineup_fit:
+        if context.over_validation_strict and not two_sided_on_base_and_continuity:
+            notes.append("strict over validation requires two-sided on-base and lower-order continuity")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.over_validation_strict and not (
+            context.lower_bullpen_risk
+            or (
+                context.lineup_contact_a >= 62
+                and context.lineup_contact_b >= 62
+            )
+        ):
+            notes.append("strict over validation requires two-sided scoring or bullpen exposure")
+            return TotalDecision(rating="pass", notes=notes)
         notes.append("starter collapse plus lineup fit supports over")
+        if context.two_sided_over_volatility:
+            notes.append("two-sided volatility makes over preferable to side")
         return TotalDecision(rating="over", notes=notes)
 
     if context.lower_bullpen_risk and (context.lineup_contact_a >= 62 or context.lineup_contact_b >= 62):
         if context.short_starter_midgame_viable and not starter_collapse:
             notes.append("short starter can reach middle innings; do not auto-upgrade over")
             return TotalDecision(rating="pass", notes=notes)
+        if context.over_validation_strict and not two_sided_on_base_and_continuity:
+            notes.append("strict over validation requires two-sided on-base and lower-order continuity")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.over_validation_strict and context.lineup_contact_a < 58 and context.lineup_contact_b < 58:
+            notes.append("strict over validation requires a live lineup path")
+            return TotalDecision(rating="pass", notes=notes)
         notes.append("lower bullpen risk supports over")
+        if context.two_sided_over_volatility:
+            notes.append("two-sided volatility makes over preferable to side")
+        return TotalDecision(rating="over", notes=notes)
+
+    if (
+        context.two_sided_over_volatility
+        and context.projected_total >= context.market_total - 0.2
+        and (context.lineup_contact_a >= 62 or context.lineup_contact_b >= 62)
+        and (starter_collapse or context.lower_bullpen_risk)
+    ):
+        if context.over_validation_strict and not two_sided_on_base_and_continuity:
+            notes.append("strict over validation requires two-sided on-base and lower-order continuity")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.over_validation_strict and not (context.lineup_contact_a >= 58 and context.lineup_contact_b >= 58):
+            notes.append("strict over validation requires both teams to have a scoring path")
+            return TotalDecision(rating="pass", notes=notes)
+        notes.append("two-sided volatility makes over preferable to side")
         return TotalDecision(rating="over", notes=notes)
 
     return TotalDecision(rating="pass", notes=notes)
@@ -758,6 +1009,11 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
         adjusted_f5_edge -= 10
         notes.append("key power bat missing lowers side priority")
 
+    core_minus_concentration = context.model_lineup_core_minus_slots >= 3
+    if core_minus_concentration:
+        adjusted_f5_edge -= 10
+        notes.append("core lineup pitch-velocity minus concentration caps F5")
+
     if context.injury_return_or_recent_short_exit_risk:
         adjusted_f5_edge -= 6
         notes.append("injury return or recent short exit caps full-game ML")
@@ -769,6 +1025,19 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if opponent_top_order_attacks_starter_risk:
         adjusted_f5_edge -= 6
         notes.append("opponent top-order pitch-velocity edge attacks starter HR/collapse risk")
+
+    opponent_neutral_depth = (
+        context.opponent_neutral_pitch_velocity_slots >= 6
+        and context.opponent_pitch_velocity_minus_slots <= 2
+    )
+    if opponent_neutral_depth:
+        adjusted_f5_edge -= 4
+        notes.append("neutral-heavy opponent lineup can create traffic")
+
+    opponent_power_variance = context.opponent_negative_power_bat_slots >= 1
+    if opponent_power_variance:
+        adjusted_f5_edge -= 4
+        notes.append("negative pitch-velocity power bats still carry one-swing variance")
 
     diffuse_plus_slots = (
         context.lineup_pitch_velocity_plus_slots >= 6
@@ -786,6 +1055,15 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if context.low_recent_run_efficiency and context.lineup_pitch_velocity_plus_slots >= 6:
         adjusted_f5_edge -= 8
         notes.append("low recent run efficiency tempers pitch-velocity edge")
+
+    strikeout_unfamiliar_starter_cap = (
+        context.lineup_pitch_velocity_plus_slots >= 6
+        and context.high_recent_strikeout_rate
+        and context.unfamiliar_opposing_starter
+    )
+    if strikeout_unfamiliar_starter_cap:
+        adjusted_f5_edge -= 10
+        notes.append("high recent strikeout rate plus unfamiliar starter caps pitch-velocity side")
 
     short_favorite_risk = (
         context.model_side_is_favorite
@@ -850,6 +1128,21 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if context.low_recent_run_efficiency and context.lineup_pitch_velocity_plus_slots >= 6:
         full_game_score -= 8
 
+    if strikeout_unfamiliar_starter_cap:
+        full_game_score -= 12
+
+    if core_minus_concentration:
+        full_game_score -= 10
+
+    poor_conversion_with_plus_slots = (
+        context.plus_slots_low_run_efficiency_prefers_total
+        and context.low_recent_run_efficiency
+        and context.lineup_pitch_velocity_plus_slots >= 6
+    )
+    if poor_conversion_with_plus_slots:
+        full_game_score -= 12
+        notes.append("plus slots with poor run conversion move ML to pass or total review")
+
     if short_favorite_risk:
         full_game_score -= 10
 
@@ -869,6 +1162,12 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
     if opponent_top_order_attacks_starter_risk:
         full_game_score -= 12
 
+    if opponent_neutral_depth:
+        full_game_score -= 6
+
+    if opponent_power_variance:
+        full_game_score -= 6
+
     if context.late_bullpen_risk:
         full_game_ml = "pass"
         notes.append("late bullpen risk downgrades full-game ML")
@@ -877,6 +1176,25 @@ def recommend_full_game(context: FullGameContext) -> Recommendation:
         notes.append("bullpen fatigue downgrades full-game ML")
     else:
         full_game_ml = _edge_label(round(full_game_score))
+
+    if poor_conversion_with_plus_slots:
+        full_game_ml = "pass"
+
+    if context.post_sixth_bullpen_exposure_risk:
+        notes.append("post-sixth bullpen exposure downgrades full-game ML")
+        full_game_ml = "pass"
+
+    if context.f5_only_preferred:
+        notes.append("F5-only edge blocks duplicate full-game ML priority")
+        late_path_supports_ml = (
+            context.bullpen_score >= 72
+            and context.bullpen_quality >= 72
+            and not context.late_bullpen_risk
+        )
+        if not late_path_supports_ml:
+            full_game_ml = "pass"
+        elif full_game_ml == "play":
+            full_game_ml = "lean"
 
     total_edge = context.market_total - context.projected_total
     if total_edge >= 1.0 and context.run_environment <= 0:

@@ -15,6 +15,8 @@
 ## Quick Start
 
 ```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 python3 -m unittest discover -s tests -v
 python3 -m analysis.pipeline --lineup projected --starter confirmed
 python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
