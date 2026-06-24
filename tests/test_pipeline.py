@@ -16,6 +16,12 @@ class ModelConfigTests(unittest.TestCase):
         self.assertTrue(config["lineup_source"]["use_projected_when_unconfirmed"])
         self.assertFalse(config["weather"]["included_by_default"])
         self.assertEqual(config["bullpen"]["yesterday_performance_risk_min_pitches"], 30)
+        self.assertTrue(
+            config["starter_structure"][
+                "official_opener_plus_rotowire_bulk_resolves_conflict"
+            ]
+        )
+        self.assertTrue(config["starter_structure"]["use_bulk_pitcher_for_main_matchup"])
         self.assertTrue(config["side_priority"]["downgrade_key_power_bat_missing"])
         self.assertTrue(
             config["side_priority"][
@@ -25,6 +31,27 @@ class ModelConfigTests(unittest.TestCase):
         self.assertTrue(
             config["side_priority"]["confirmed_bulk_pitcher_resolves_starter_source_conflict"]
         )
+        self.assertTrue(config["side_priority"]["cap_side_against_neutral_heavy_lineup"])
+        self.assertTrue(config["side_priority"]["treat_negative_power_bats_as_variance"])
+        self.assertTrue(config["total_priority"]["compete_with_sides_in_final_priority"])
+        self.assertTrue(config["total_priority"]["strict_under_validation"])
+        self.assertTrue(config["total_priority"]["strict_over_validation"])
+        self.assertTrue(config["total_priority"]["low_total_starter_length_can_temper_plus_slots"])
+        self.assertTrue(config["total_priority"]["strict_over_requires_two_sided_on_base_path"])
+        self.assertTrue(config["total_priority"]["block_low_total_under_on_recent_command_or_hr_volatility"])
+        self.assertTrue(config["total_priority"]["block_low_total_under_on_neutral_heavy_traffic"])
+        self.assertTrue(config["total_priority"]["allow_high_total_over_when_both_starters_have_command_risk"])
+        self.assertTrue(config["total_priority"]["high_total_over_requires_recent_power_or_walk_conversion"])
+        self.assertTrue(config["total_priority"]["starter_kbb_length_suppresses_pitch_velocity_over"])
+        self.assertTrue(config["side_priority"]["cap_plus_handicap_on_small_sample_command_risk"])
+        self.assertTrue(config["side_priority"]["cap_plus_handicap_on_recent_hr_repetition"])
+        self.assertTrue(config["side_priority"]["avoid_duplicate_ml_when_f5_only_edge"])
+        self.assertTrue(config["side_priority"]["cap_f5_when_core_hitters_have_minus_matchups"])
+        self.assertTrue(config["side_priority"]["move_plus_slots_low_run_efficiency_to_pass_or_total_review"])
+        self.assertTrue(config["side_priority"]["downgrade_ml_on_post_sixth_bullpen_exposure"])
+        self.assertTrue(config["side_priority"]["cap_plus_slots_on_high_k_rate_and_unfamiliar_starter"])
+        self.assertTrue(config["total_priority"]["allow_over_on_post_sixth_bullpen_exposure"])
+        self.assertTrue(config["total_priority"]["sixth_inning_path_requires_walk_or_late_bullpen_over_support"])
 
     def test_model_layers_keep_the_documented_order(self):
         self.assertEqual(

@@ -1,5 +1,5 @@
 {
-  "version": "2026-06-06",
+  "version": "2026-06-24",
   "fixed_model": true,
   "lineup_source": {
     "primary": "RotoWire",
@@ -20,12 +20,51 @@
     "consecutive_days_limited": 2,
     "three_straight_unavailable": true
   },
+  "starter_structure": {
+    "official_opener_plus_rotowire_bulk_resolves_conflict": true,
+    "use_bulk_pitcher_for_main_matchup": true,
+    "use_opener_only_for_first_inning_context": true
+  },
   "side_priority": {
     "downgrade_key_power_bat_missing": true,
     "downgrade_injury_return_or_recent_short_exit": true,
     "downgrade_side_when_over_is_two_sided_volatility": true,
     "downgrade_ml_when_opponent_top_order_attacks_starter_hr_or_collapse_risk": true,
-    "confirmed_bulk_pitcher_resolves_starter_source_conflict": true
+    "confirmed_bulk_pitcher_resolves_starter_source_conflict": true,
+    "cap_side_against_neutral_heavy_lineup": true,
+    "treat_negative_power_bats_as_variance": true,
+    "cap_plus_handicap_on_small_sample_command_risk": true,
+    "cap_plus_handicap_on_recent_hr_repetition": true,
+    "downgrade_plus_handicap_against_ace_level_stability": true,
+    "avoid_plus_handicap_on_underdog_starter_collapse_risk": true,
+    "avoid_duplicate_ml_when_f5_only_edge": true,
+    "cap_f5_when_core_hitters_have_minus_matchups": true,
+    "move_plus_slots_low_run_efficiency_to_pass_or_total_review": true,
+    "downgrade_ml_on_post_sixth_bullpen_exposure": true,
+    "cap_plus_slots_on_high_k_rate_and_unfamiliar_starter": true
+  },
+  "total_priority": {
+    "compete_with_sides_in_final_priority": true,
+    "allow_independent_same_game_side_and_total_priorities": true,
+    "review_under_before_ml_when_favorite_lineup_is_weak": true,
+    "prefer_total_when_side_confidence_is_thin": true,
+    "prefer_over_when_two_sided_volatility_is_clearer_than_side": true,
+    "strict_under_validation": true,
+    "strict_over_validation": true,
+    "strict_over_requires_two_sided_on_base_path": true,
+    "same_game_side_over_requires_independent_total_path": true,
+    "block_side_over_pair_when_side_requires_run_suppression": true,
+    "cap_over_when_starter_length_and_kbb_are_strong": true,
+    "low_total_over_requires_two_sided_scoring_path": true,
+    "low_total_requires_late_variance_control": true,
+    "low_total_starter_length_can_temper_plus_slots": true,
+    "block_low_total_under_on_recent_command_or_hr_volatility": true,
+    "block_low_total_under_on_neutral_heavy_traffic": true,
+    "allow_high_total_over_when_both_starters_have_command_risk": true,
+    "allow_over_on_post_sixth_bullpen_exposure": true,
+    "high_total_over_requires_recent_power_or_walk_conversion": true,
+    "starter_kbb_length_suppresses_pitch_velocity_over": true,
+    "sixth_inning_path_requires_walk_or_late_bullpen_over_support": true
   },
   "weather": {
     "included_by_default": false,

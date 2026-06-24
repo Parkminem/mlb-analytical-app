@@ -11,6 +11,7 @@ from analysis.model import (
     MarketSignalContext,
     RelieverAppearance,
     StarterRecentForm,
+    StarterStructureContext,
     StarterVolatilityContext,
     TotalContext,
     UmpireContext,
@@ -24,6 +25,7 @@ from analysis.model import (
     evaluate_total,
     recommend_full_game,
     resolve_lineup_source,
+    resolve_starter_structure,
     score_bullpen_segments,
     score_bullpen_availability,
     score_starter_recent_form,
@@ -111,6 +113,39 @@ class LineupSourceTests(unittest.TestCase):
 
         self.assertEqual(result.source, "RotoWire projected lineup")
         self.assertIn("lineup not confirmed", result.notes)
+
+
+class StarterStructureTests(unittest.TestCase):
+    def test_official_opener_and_rotowire_bulk_resolve_source_conflict(self):
+        result = resolve_starter_structure(
+            StarterStructureContext(
+                official_pitcher="Bryan Hudson",
+                rotowire_pitcher="Sean Burke",
+                official_pitcher_is_opener=True,
+                rotowire_pitcher_is_bulk_candidate=True,
+            )
+        )
+
+        self.assertEqual(result.opener_pitcher, "Bryan Hudson")
+        self.assertEqual(result.bulk_pitcher, "Sean Burke")
+        self.assertEqual(result.matchup_pitcher, "Sean Burke")
+        self.assertFalse(result.starter_source_conflict)
+        self.assertTrue(result.confirmed_bulk_pitcher_used_for_matchup)
+        self.assertIn("bulk pitcher is used for pitch-velocity matchup", result.notes)
+
+    def test_unresolved_pitcher_disagreement_remains_source_conflict(self):
+        result = resolve_starter_structure(
+            StarterStructureContext(
+                official_pitcher="Pitcher A",
+                rotowire_pitcher="Pitcher B",
+                official_pitcher_is_opener=False,
+                rotowire_pitcher_is_bulk_candidate=False,
+            )
+        )
+
+        self.assertEqual(result.matchup_pitcher, "Pitcher A")
+        self.assertTrue(result.starter_source_conflict)
+        self.assertFalse(result.confirmed_bulk_pitcher_used_for_matchup)
 
 
 class StarterRecentFormTests(unittest.TestCase):
@@ -268,6 +303,40 @@ class HandicapTests(unittest.TestCase):
 
         self.assertEqual(result.rating, "play")
 
+    def test_plus_handicap_caps_small_sample_command_risk(self):
+        context = HandicapContext(
+            lineup_edge=72,
+            starter_stability=72,
+            bullpen_score=72,
+            opponent_late_risk=True,
+            decimal_odds=1.72,
+            starter_survival_score=72,
+            starter_sample_risk=True,
+            starter_walks_per_nine=4.3,
+            starter_strikeout_walk_ratio=1.6,
+        )
+
+        result = evaluate_plus_handicap(context)
+
+        self.assertEqual(result.rating, "lean")
+        self.assertIn("small-sample command risk caps plus handicap", result.notes)
+
+    def test_plus_handicap_caps_repeated_recent_hr_risk(self):
+        context = HandicapContext(
+            lineup_edge=72,
+            starter_stability=72,
+            bullpen_score=72,
+            opponent_late_risk=True,
+            decimal_odds=1.72,
+            starter_survival_score=72,
+            starter_recent_home_run_repetition=True,
+        )
+
+        result = evaluate_plus_handicap(context)
+
+        self.assertEqual(result.rating, "lean")
+        self.assertIn("recent starter HR repetition caps plus handicap", result.notes)
+
 
 class TotalTests(unittest.TestCase):
     def test_under_requires_both_starters_and_bullpens_to_be_stable(self):
@@ -384,6 +453,69 @@ class TotalTests(unittest.TestCase):
         self.assertEqual(result.rating, "under")
         self.assertIn("low-total starter duel prioritizes under over side", result.notes)
 
+    def test_low_total_under_blocks_recent_command_or_hr_volatility(self):
+        context = TotalContext(
+            market_total=7.5,
+            projected_total=7.1,
+            starter_stability_a=76,
+            starter_stability_b=73,
+            lineup_contact_a=50,
+            lineup_contact_b=52,
+            bullpen_score_a=71,
+            bullpen_score_b=69,
+            lower_bullpen_risk=False,
+            both_starters_recently_stable=True,
+            low_total_starter_duel=True,
+            recent_starter_command_or_hr_volatility=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("recent starter command/HR volatility blocks low-total under", result.notes)
+
+    def test_neutral_heavy_traffic_blocks_low_total_under(self):
+        context = TotalContext(
+            market_total=7.5,
+            projected_total=7.4,
+            starter_stability_a=76,
+            starter_stability_b=73,
+            lineup_contact_a=54,
+            lineup_contact_b=55,
+            bullpen_score_a=71,
+            bullpen_score_b=69,
+            lower_bullpen_risk=False,
+            low_total_starter_duel=True,
+            neutral_heavy_traffic_risk=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("neutral-heavy traffic risk blocks low-total under", result.notes)
+
+    def test_low_total_starter_length_keeps_under_candidate_despite_plus_slots(self):
+        context = TotalContext(
+            market_total=7.5,
+            projected_total=7.6,
+            starter_stability_a=78,
+            starter_stability_b=76,
+            lineup_contact_a=64,
+            lineup_contact_b=60,
+            bullpen_score_a=72,
+            bullpen_score_b=74,
+            lower_bullpen_risk=False,
+            low_total_starter_duel=True,
+            both_starters_recently_stable=True,
+            both_starters_likely_to_reach_sixth=True,
+            starter_length_tempers_plus_slots=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "under")
+        self.assertIn("starter length tempers pitch-velocity plus slots at low total", result.notes)
+
     def test_over_triggers_on_clear_starter_collapse_and_lineup_fit(self):
         context = TotalContext(
             market_total=9.0,
@@ -440,6 +572,31 @@ class TotalTests(unittest.TestCase):
         self.assertEqual(result.rating, "pass")
         self.assertIn("starter length can mute lineup-fit over", result.notes)
 
+    def test_post_sixth_bullpen_exposure_can_override_deep_starter_over_suppression(self):
+        context = TotalContext(
+            market_total=9.0,
+            projected_total=8.9,
+            starter_stability_a=68,
+            starter_stability_b=70,
+            lineup_contact_a=60,
+            lineup_contact_b=58,
+            bullpen_score_a=62,
+            bullpen_score_b=68,
+            lower_bullpen_risk=False,
+            both_starters_can_work_deep=True,
+            post_sixth_bullpen_exposure_risk=True,
+            over_validation_strict=True,
+            lineup_on_base_path_a=True,
+            lineup_on_base_path_b=True,
+            lower_order_run_continuity_a=True,
+            lower_order_run_continuity_b=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "over")
+        self.assertIn("post-sixth bullpen exposure keeps over live", result.notes)
+
     def test_low_total_under_passes_with_late_variance_risk(self):
         context = TotalContext(
             market_total=6.5,
@@ -478,6 +635,210 @@ class TotalTests(unittest.TestCase):
 
         self.assertEqual(result.rating, "pass")
         self.assertIn("starter under only; bullpen risk blocks full-game under", result.notes)
+
+    def test_negative_power_bat_variance_blocks_thin_full_game_under(self):
+        context = TotalContext(
+            market_total=8.0,
+            projected_total=7.2,
+            starter_stability_a=76,
+            starter_stability_b=74,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=72,
+            bullpen_score_b=70,
+            lower_bullpen_risk=False,
+            negative_power_bat_variance=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "negative pitch-velocity power bats add run variance, not under support",
+            result.notes,
+        )
+
+    def test_weak_favorite_lineup_moves_under_review_ahead_of_ml(self):
+        context = TotalContext(
+            market_total=8.5,
+            projected_total=7.8,
+            starter_stability_a=78,
+            starter_stability_b=72,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=70,
+            bullpen_score_b=71,
+            lower_bullpen_risk=False,
+            weak_favorite_lineup_with_starter_edge=True,
+            under_validation_strict=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "under")
+        self.assertIn("weak favorite lineup makes total review higher priority than ML", result.notes)
+        self.assertIn("strict under validation passed", result.notes)
+
+    def test_two_sided_volatility_can_prioritize_over_over_side(self):
+        context = TotalContext(
+            market_total=9.0,
+            projected_total=8.9,
+            starter_stability_a=42,
+            starter_stability_b=56,
+            lineup_contact_a=64,
+            lineup_contact_b=61,
+            bullpen_score_a=58,
+            bullpen_score_b=62,
+            lower_bullpen_risk=True,
+            two_sided_over_volatility=True,
+            over_validation_strict=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "over")
+        self.assertIn("two-sided volatility makes over preferable to side", result.notes)
+
+    def test_high_total_over_can_still_play_with_two_command_risk_starters(self):
+        context = TotalContext(
+            market_total=10.5,
+            projected_total=10.3,
+            starter_stability_a=52,
+            starter_stability_b=54,
+            lineup_contact_a=63,
+            lineup_contact_b=64,
+            bullpen_score_a=63,
+            bullpen_score_b=64,
+            lower_bullpen_risk=False,
+            two_sided_over_volatility=True,
+            over_validation_strict=True,
+            lineup_on_base_path_a=True,
+            lineup_on_base_path_b=True,
+            lower_order_run_continuity_a=True,
+            lower_order_run_continuity_b=True,
+            both_starters_command_risk=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "over")
+        self.assertIn("two command-risk starters keep high-total over live", result.notes)
+        self.assertIn("two-sided volatility makes over preferable to side", result.notes)
+
+    def test_high_total_over_requires_recent_power_or_walk_conversion(self):
+        context = TotalContext(
+            market_total=10.0,
+            projected_total=9.9,
+            starter_stability_a=52,
+            starter_stability_b=54,
+            lineup_contact_a=63,
+            lineup_contact_b=64,
+            bullpen_score_a=63,
+            bullpen_score_b=64,
+            lower_bullpen_risk=False,
+            two_sided_over_volatility=True,
+            over_validation_strict=True,
+            lineup_on_base_path_a=True,
+            lineup_on_base_path_b=True,
+            lower_order_run_continuity_a=True,
+            lower_order_run_continuity_b=True,
+            both_starters_command_risk=True,
+            high_total_recent_power_walk_conversion=False,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("high-total over requires recent power or walk conversion", result.notes)
+
+    def test_starter_kbb_length_suppresses_pitch_velocity_over(self):
+        context = TotalContext(
+            market_total=9.5,
+            projected_total=9.8,
+            starter_stability_a=72,
+            starter_stability_b=74,
+            lineup_contact_a=72,
+            lineup_contact_b=66,
+            bullpen_score_a=70,
+            bullpen_score_b=72,
+            lower_bullpen_risk=False,
+            both_starters_likely_to_reach_sixth=True,
+            starter_kbb_length_suppresses_over=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("starter K/BB length suppresses pitch-velocity over", result.notes)
+
+    def test_sixth_inning_path_requires_walk_or_bullpen_support_for_over(self):
+        context = TotalContext(
+            market_total=8.5,
+            projected_total=8.9,
+            starter_stability_a=70,
+            starter_stability_b=72,
+            lineup_contact_a=68,
+            lineup_contact_b=66,
+            bullpen_score_a=70,
+            bullpen_score_b=72,
+            lower_bullpen_risk=False,
+            both_starters_likely_to_reach_sixth=True,
+            over_lacks_walk_or_late_bullpen_path=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "sixth-inning starter path requires walk or late-bullpen support for over",
+            result.notes,
+        )
+
+    def test_strict_over_validation_requires_two_sided_on_base_and_lower_order_path(self):
+        context = TotalContext(
+            market_total=8.5,
+            projected_total=8.6,
+            starter_stability_a=42,
+            starter_stability_b=56,
+            lineup_contact_a=68,
+            lineup_contact_b=64,
+            bullpen_score_a=58,
+            bullpen_score_b=62,
+            lower_bullpen_risk=True,
+            two_sided_over_volatility=True,
+            over_validation_strict=True,
+            lineup_on_base_path_a=True,
+            lineup_on_base_path_b=False,
+            lower_order_run_continuity_a=True,
+            lower_order_run_continuity_b=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "strict over validation requires two-sided on-base and lower-order continuity",
+            result.notes,
+        )
+
+    def test_strict_over_validation_blocks_one_sided_volatility(self):
+        context = TotalContext(
+            market_total=9.0,
+            projected_total=9.1,
+            starter_stability_a=42,
+            starter_stability_b=70,
+            lineup_contact_a=74,
+            lineup_contact_b=52,
+            bullpen_score_a=66,
+            bullpen_score_b=68,
+            lower_bullpen_risk=False,
+            over_validation_strict=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("strict over validation requires two-sided scoring or bullpen exposure", result.notes)
 
 
 class LiveEntryTests(unittest.TestCase):
@@ -567,6 +928,24 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.full_game_ml, "pass")
         self.assertEqual(result.full_game_total, "pass")
         self.assertIn("late bullpen risk blocks full-game under", result.notes)
+
+    def test_f5_only_edge_blocks_duplicate_full_game_ml_priority(self):
+        context = FullGameContext(
+            f5_edge=82,
+            lineup_edge=68,
+            bullpen_score=70,
+            bullpen_quality=69,
+            market_total=8.5,
+            projected_total=8.2,
+            run_environment=0,
+            f5_only_preferred=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "play")
+        self.assertEqual(result.full_game_ml, "pass")
+        self.assertIn("F5-only edge blocks duplicate full-game ML priority", result.notes)
 
     def test_fatigued_bullpen_blocks_full_game_under(self):
         context = FullGameContext(
@@ -733,6 +1112,48 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.full_game_ml, "lean")
         self.assertIn("low recent run efficiency tempers pitch-velocity edge", result.notes)
 
+    def test_high_recent_strikeout_rate_and_unfamiliar_starter_cap_plus_slot_side(self):
+        context = FullGameContext(
+            f5_edge=84,
+            lineup_edge=78,
+            bullpen_score=78,
+            bullpen_quality=78,
+            market_total=9.0,
+            projected_total=8.8,
+            run_environment=0,
+            lineup_pitch_velocity_plus_slots=8,
+            high_recent_strikeout_rate=True,
+            unfamiliar_opposing_starter=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "lean")
+        self.assertIn(
+            "high recent strikeout rate plus unfamiliar starter caps pitch-velocity side",
+            result.notes,
+        )
+
+    def test_plus_slots_with_low_run_efficiency_move_ml_to_pass_or_total_review(self):
+        context = FullGameContext(
+            f5_edge=80,
+            lineup_edge=76,
+            bullpen_score=72,
+            bullpen_quality=72,
+            market_total=8.5,
+            projected_total=8.4,
+            run_environment=0,
+            lineup_pitch_velocity_plus_slots=7,
+            low_recent_run_efficiency=True,
+            plus_slots_low_run_efficiency_prefers_total=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.full_game_ml, "pass")
+        self.assertIn("plus slots with poor run conversion move ML to pass or total review", result.notes)
+
     def test_short_favorite_with_starter_command_or_hr_risk_cannot_be_top_priority(self):
         context = FullGameContext(
             f5_edge=84,
@@ -751,6 +1172,24 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.f5_ml, "lean")
         self.assertEqual(result.full_game_ml, "lean")
         self.assertIn("short favorite with starter command/HR risk capped", result.notes)
+
+    def test_short_favorite_f5_downgrades_when_core_hitters_have_minus_matchups(self):
+        context = FullGameContext(
+            f5_edge=84,
+            lineup_edge=74,
+            bullpen_score=78,
+            bullpen_quality=78,
+            market_total=8.0,
+            projected_total=7.8,
+            run_environment=0,
+            model_side_decimal_odds=1.42,
+            model_lineup_core_minus_slots=3,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertIn("core lineup pitch-velocity minus concentration caps F5", result.notes)
 
     def test_key_power_bat_missing_downgrades_side_priority(self):
         context = FullGameContext(
@@ -805,6 +1244,24 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.full_game_total, "over")
         self.assertEqual(result.full_game_ml, "pass")
         self.assertIn("two-sided run volatility separates over from side", result.notes)
+
+    def test_post_sixth_bullpen_exposure_caps_full_game_ml(self):
+        context = FullGameContext(
+            f5_edge=72,
+            lineup_edge=68,
+            bullpen_score=70,
+            bullpen_quality=68,
+            market_total=9.0,
+            projected_total=9.1,
+            run_environment=0,
+            post_sixth_bullpen_exposure_risk=True,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "pass")
+        self.assertIn("post-sixth bullpen exposure downgrades full-game ML", result.notes)
 
     def test_opponent_top_order_plus_against_hr_risk_starter_blocks_model_side_ml(self):
         context = FullGameContext(
@@ -864,6 +1321,30 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result.f5_ml, "lean")
         self.assertEqual(result.full_game_ml, "lean")
         self.assertIn("fastball-only plus slots are capped by starter's secondary command", result.notes)
+
+    def test_neutral_heavy_opponent_and_negative_power_bat_cap_side(self):
+        context = FullGameContext(
+            f5_edge=84,
+            lineup_edge=78,
+            bullpen_score=78,
+            bullpen_quality=78,
+            market_total=8.0,
+            projected_total=7.8,
+            run_environment=0,
+            opponent_neutral_pitch_velocity_slots=6,
+            opponent_pitch_velocity_minus_slots=2,
+            opponent_negative_power_bat_slots=1,
+        )
+
+        result = recommend_full_game(context)
+
+        self.assertEqual(result.f5_ml, "lean")
+        self.assertEqual(result.full_game_ml, "lean")
+        self.assertIn("neutral-heavy opponent lineup can create traffic", result.notes)
+        self.assertIn(
+            "negative pitch-velocity power bats still carry one-swing variance",
+            result.notes,
+        )
 
     def test_plus_handicap_needs_lower_order_run_continuity(self):
         context = HandicapContext(
