@@ -6,5 +6,6 @@ __pycache__/
 # Temporary source snapshots and local analysis artifacts
 _tmp_*
 .cache/
+.worktrees/
 data/cache/
 reports/private/
