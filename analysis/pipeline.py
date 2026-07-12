@@ -115,7 +115,7 @@ def build_analysis_manifest(
         "required_inputs": required_inputs,
         "confidence_flags": confidence_flags,
         "strength_adjustments": [],
-        "required_outputs": ["F5", "ML", "+1.5", "O/U", "review"],
+        "required_outputs": ["F5", "F5 O/U", "ML", "+1.5", "O/U", "review"],
     }
 
 

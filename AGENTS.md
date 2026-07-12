@@ -6,7 +6,7 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 
 - Do not modify the model, thresholds, source hierarchy, or output direction unless the user explicitly asks for a model change.
 - When the user asks for a postgame review, identify whether a model change is justified, but do not apply it without explicit approval.
-- Score each baseball input once and reuse it with different weights for F5, ML, `+1.5`, and O/U. Do not double count evidence.
+- Score each baseball input once and reuse it with different weights for F5, F5 O/U, ML, `+1.5`, and O/U. Do not double count evidence.
 
 ## Required Sources
 
@@ -29,10 +29,12 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - If a starter is returning from injury or had a recent short exit, downgrade full-game ML as well as F5.
 - Treat a high-leverage reliever who threw 30+ pitches yesterday as limited with performance/use risk, not automatically unavailable. Keep three straight days as unavailable.
 - If the over case is driven by volatility on both sides, prefer O/U and downgrade ML.
+- Evaluate F5 O/U independently from full-game O/U. Exclude full-game bullpen effects unless a verified opener/bulk arm is scheduled inside the first five innings.
+- Require a verified F5 total and decimal price. Never infer the F5 line from the full-game total.
 
 ## Default Output
 
-- Return F5, ML, `+1.5`, and O/U unless the user requests a narrower market set.
+- Return F5, F5 O/U, ML, `+1.5`, and O/U unless the user requests a narrower market set.
 - Keep the final direction consistent within each game.
 - Include the market total and decimal price when available.
 - Put umpire discussion in the written review rather than forcing it into the summary table.

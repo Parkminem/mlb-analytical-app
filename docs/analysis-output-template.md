@@ -4,15 +4,17 @@ Use this structure for daily MLB analysis. Keep the summary concise, then suppor
 
 ## Summary Table
 
-| Game | F5 | ML | +1.5 | O/U | Final |
-|---|---|---|---|---|---|
-| Away vs Home | pick / lean / pass | pick / lean / pass | pick / lean / pass | line + direction / pass | one or more non-conflicting choices |
+| Game | F5 | F5 O/U | ML | +1.5 | O/U | Final |
+|---|---|---|---|---|---|---|
+| Away vs Home | pick / lean / pass | line + direction / pass | pick / lean / pass | pick / lean / pass | line + direction / pass | one or more non-conflicting choices |
 
 Use decimal odds when prices are available.
 
 In the summary table, show only one side-family market per game. If ML and `+1.5` both qualify, choose the higher-probability or higher-scoring option and mark the other side-family column as `pass` or `review only`. Explain the rejected side-family alternative in the written review when useful.
 
 The final priority stack may include more than one market from the same game when the edges are independently validated, such as ML plus O/U or `+1.5` plus O/U. Do not duplicate the same side edge by listing both ML and `+1.5` unless the user asks for alternatives.
+
+F5 O/U must use a verified F5 line and decimal price. Do not infer it from the full-game total. If F5 O/U and full-game O/U use the same scoring edge, list only the higher-scoring one in the final priority stack unless independent early and late paths are explicitly verified.
 
 Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is not a separate baseball input and must not double count evidence.
 
@@ -67,6 +69,7 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 
 - Before assigning the final `0-100` score, apply the priority-admission caps using the already calculated run-conversion, pitching-chain, and bullpen results. Do not rescore or positively boost any input at this step.
 - Explain why F5 and ML may differ.
+- Explain why F5 O/U and full-game O/U may differ. Full-game bullpen risk is not an F5-total input unless a verified opener/bulk arm works inside the first five innings.
 - If the edge is F5-only, state whether bullpen and late path are strong enough to keep ML. If not, avoid duplicating ML into the final priority.
 - Explain why `+1.5` is playable or blocked, but if ML and `+1.5` both qualify, choose one side-family market for the table and final direction.
 - Explain why O/U is a play, lean, or pass at the current line.

@@ -108,6 +108,12 @@
     "one_dominant_kbb_starter_prioritizes_low_total_under": true,
     "traffic_over_requires_power_or_run_conversion_support": true
   },
+  "f5_total_priority": {
+    "independent_engine": true,
+    "use_full_game_bullpen_inputs": false,
+    "require_verified_market_line_and_price": true,
+    "deduplicate_correlated_full_game_total": true
+  },
   "weather": {
     "included_by_default": false,
     "preferred_user_source": "BallparkPal"

@@ -6,7 +6,7 @@ This model is fixed for day-to-day analysis unless the user explicitly asks to c
 
 ## Core Principles
 
-- Score each baseball input once, then reuse that score with different weights for F5, full-game ML, `+1.5`, and totals.
+- Score each baseball input once, then reuse that score with different weights for F5, F5 O/U, full-game ML, `+1.5`, and full-game totals.
 - Use RotoWire confirmed lineups when available and RotoWire projected lineups when they are not.
 - Treat official MLB probable pitchers, live feeds, and boxscores as the authoritative pitcher sources.
 - Treat pitch-type plus velocity splits as matchup signals, not standalone picks.
@@ -14,7 +14,7 @@ This model is fixed for day-to-day analysis unless the user explicitly asks to c
 - Downgrade F5 before full-game ML when starter WHIP, BB, HR, or early-collapse risk is high.
 - Use full-game ML only when the bullpen layer supports the starter and lineup edge.
 - Include totals in the default output. Weather is included only when the user provides it or explicitly requests it.
-- Let F5, ML, `+1.5`, and O/U compete in the same final priority stack. Do not keep totals secondary when the total is cleaner than the side.
+- Let F5, F5 O/U, ML, `+1.5`, and O/U compete in the same final priority stack. Do not keep totals secondary when the total is cleaner than the side.
 - Allow more than one market from the same game in the final priority stack when the edges are independent and non-conflicting, such as ML plus O/U or `+1.5` plus O/U.
 
 ## Model Flow
@@ -345,7 +345,20 @@ Rules:
 - If the case relies mostly on fastball edges and lower-order continuity is weak, cap the handicap at `lean`.
 - If the fastball-only edge also lacks secondary-pitch support, pass.
 
-### Totals
+### F5 Totals
+
+F5 O/U is a separate decision engine that reuses the existing starter, lineup, pitch-velocity, recent-form, and supporting-context scores with first-five weights.
+
+- Require a verified current F5 total and decimal price. Never infer an F5 line from the full-game total.
+- Exclude full-game bullpen availability and quality. Include a reliever only when a verified opener/bulk structure places that pitcher inside the first five innings.
+- F5 under requires two stable first-five pitching paths, controlled command and HR risk, muted early lineup paths, and no converted top-five matchup concentration.
+- F5 over requires a credible early scoring path supported by recent power or walk conversion, or by opposing starter command, HR, first-inning, injury-return, or short-exit risk.
+- At F5 totals of `4.0` or lower, over requires credible early scoring paths for both teams.
+- If both starters have strong K/BB shape and realistic five-inning floors, pass a thin F5 over that lacks starter risk.
+- If opener-to-bulk timing inside the first five is not verified, pass F5 O/U rather than guessing the pitching chain.
+- Full-game bullpen volatility cannot create an F5 over or block an otherwise qualified F5 under.
+
+### Full-Game Totals
 
 Totals use both teams' starter, lineup, and bullpen layers.
 
@@ -471,14 +484,15 @@ Confidence does not change which team is stronger. It changes whether the recomm
 
 When the user asks for analysis, return:
 
-| Game | F5 | ML | +1.5 | O/U | Umpire | Final |
-|---|---:|---:|---:|---:|---:|---|
+| Game | F5 | F5 O/U | ML | +1.5 | O/U | Umpire | Final |
+|---|---:|---:|---:|---:|---:|---:|---|
 
 Use decimal odds when discussing price. Avoid switching direction inside the same game summary. If the final choice is a plus handicap, frame the side as capable of winning or keeping the game close rather than mixing it with the opponent's ML.
 
 Final priority rules:
 
 - The final priority stack may include multiple entries from one game when they are different markets and independently validated.
+- If F5 O/U and full-game O/U rely on the same scoring edge, keep only the higher-scoring market in the final priority stack. Keep both only when independent early and late paths are explicitly verified.
 - Every entry in the final priority stack should include a `0-100` priority score. This score is an output-ranking expression of the existing model edge, market value, data confidence, and layer agreement; it does not create a new analysis layer or rescore baseball inputs.
 - Score guide: `80+` primary candidate, `72-79` playable candidate, `65-71` lean or price-dependent candidate, below `65` review-only unless the user asks for all leans.
 - Apply one final priority-admission gate after market value. This gate may only cap the existing priority score; it must not add points or score any baseball input again.

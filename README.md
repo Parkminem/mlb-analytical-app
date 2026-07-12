@@ -30,7 +30,7 @@ python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 2. RotoWire 확정 라인업을 사용하고, 미확정이면 예상 라인업을 사용합니다.
 3. Baseball Savant/Statcast로 양 팀 모든 타자의 구종+구속 대응력을 예상 타석과 투수 좌우 기준으로 평가합니다.
 4. 최근 타선 흐름, 선발 안정성, 불펜 가용성과 품질, 심판을 결합합니다.
-5. F5, ML, `+1.5`, O/U를 서로 다른 가중치로 판단하고 시장 가격을 마지막에 적용합니다.
+5. F5, F5 O/U, ML, `+1.5`, O/U를 서로 다른 가중치로 판단하고 시장 가격을 마지막에 적용합니다.
 6. 경기 후에는 `docs/reviews/README.md` 형식으로 복기합니다.
 
 ## Documentation

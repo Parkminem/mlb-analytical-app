@@ -183,6 +183,16 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(config["priority_admission"]["late_bullpen_protection_cap"], 71)
         self.assertEqual(config["priority_admission"]["discontinuous_lineup_over_cap"], 69)
         self.assertTrue(config["priority_admission"]["caps_only_no_positive_rescoring"])
+        self.assertTrue(config["f5_total_priority"]["independent_engine"])
+        self.assertFalse(
+            config["f5_total_priority"]["use_full_game_bullpen_inputs"]
+        )
+        self.assertTrue(
+            config["f5_total_priority"]["require_verified_market_line_and_price"]
+        )
+        self.assertTrue(
+            config["f5_total_priority"]["deduplicate_correlated_full_game_total"]
+        )
 
     def test_model_layers_keep_the_documented_order(self):
         self.assertEqual(
@@ -241,6 +251,7 @@ class AnalysisManifestTests(unittest.TestCase):
             manifest["cache_policy"]["rotowire_lineups"],
             "realtime",
         )
+        self.assertIn("F5 O/U", manifest["required_outputs"])
 
     def test_weather_is_excluded_unless_requested(self):
         manifest = build_analysis_manifest(
