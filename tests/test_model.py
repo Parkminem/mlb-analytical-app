@@ -3,6 +3,7 @@ import unittest
 from analysis.model import (
     AnalysisChecklist,
     BullpenSegment,
+    F5TotalContext,
     FullGameContext,
     HandicapContext,
     LiveGameState,
@@ -19,6 +20,7 @@ from analysis.model import (
     apply_umpire_adjustment,
     calculate_confidence_score,
     evaluate_pitch_velocity_sample,
+    evaluate_f5_total,
     evaluate_plus_handicap,
     evaluate_line_value,
     evaluate_live_entry,
@@ -33,6 +35,86 @@ from analysis.model import (
     score_starter_recent_form,
     score_starter_volatility,
 )
+
+
+class F5TotalTests(unittest.TestCase):
+    def test_f5_total_passes_without_verified_market_line_or_price(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=None,
+                decimal_odds=None,
+                projected_total=4.8,
+                starter_stability_a=45,
+                starter_stability_b=45,
+            )
+        )
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("F5 market total and decimal price are required", result.notes)
+
+    def test_bullpen_only_volatility_cannot_create_f5_over(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=4.6,
+                starter_stability_a=72,
+                starter_stability_b=74,
+                both_starters_five_inning_floor=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "pass")
+
+    def test_stable_starters_and_muted_lineups_support_f5_under(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=3.9,
+                starter_stability_a=78,
+                starter_stability_b=76,
+                lineup_muted_a=True,
+                lineup_muted_b=True,
+                both_starters_five_inning_floor=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "under")
+
+    def test_starter_risk_and_converted_early_path_support_f5_over(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=5.0,
+                starter_stability_a=42,
+                starter_stability_b=62,
+                starter_command_or_hr_risk_a=True,
+                lineup_early_scoring_path_b=True,
+                recent_power_or_walk_conversion_b=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "over")
+
+    def test_unverified_opener_bulk_chain_blocks_f5_total(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=5.1,
+                starter_stability_a=40,
+                starter_stability_b=55,
+                opener_bulk_structure=True,
+                first_five_pitching_chain_verified=False,
+                lineup_early_scoring_path_a=True,
+                recent_power_or_walk_conversion_a=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn("first-five pitching chain is not verified", result.notes)
 
 
 class PriorityAdmissionTests(unittest.TestCase):

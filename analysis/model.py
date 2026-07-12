@@ -191,6 +191,34 @@ class HandicapDecision:
 
 
 @dataclass(frozen=True)
+class F5TotalContext:
+    market_total: float | None
+    decimal_odds: float | None
+    projected_total: float
+    starter_stability_a: int
+    starter_stability_b: int
+    lineup_muted_a: bool = False
+    lineup_muted_b: bool = False
+    lineup_early_scoring_path_a: bool = False
+    lineup_early_scoring_path_b: bool = False
+    recent_power_or_walk_conversion_a: bool = False
+    recent_power_or_walk_conversion_b: bool = False
+    top_five_pitch_velocity_plus_a: int = 0
+    top_five_pitch_velocity_plus_b: int = 0
+    starter_command_or_hr_risk_a: bool = False
+    starter_command_or_hr_risk_b: bool = False
+    starter_first_inning_collapse_risk_a: bool = False
+    starter_first_inning_collapse_risk_b: bool = False
+    starter_injury_or_short_exit_risk_a: bool = False
+    starter_injury_or_short_exit_risk_b: bool = False
+    both_starters_five_inning_floor: bool = False
+    opener_bulk_structure: bool = False
+    first_five_pitching_chain_verified: bool = True
+    pitch_velocity_unknown_rate_a: float = 0.0
+    pitch_velocity_unknown_rate_b: float = 0.0
+
+
+@dataclass(frozen=True)
 class TotalContext:
     market_total: float
     projected_total: float
@@ -829,6 +857,90 @@ def evaluate_plus_handicap(context: HandicapContext) -> HandicapDecision:
         return HandicapDecision(rating="lean", notes=["price and opponent late risk support lean"])
 
     return HandicapDecision(rating="pass", notes=notes)
+
+
+def evaluate_f5_total(context: F5TotalContext) -> TotalDecision:
+    notes: list[str] = []
+
+    if context.market_total is None or context.decimal_odds is None:
+        notes.append("F5 market total and decimal price are required")
+        return TotalDecision(rating="pass", notes=notes)
+
+    if context.opener_bulk_structure and not context.first_five_pitching_chain_verified:
+        notes.append("first-five pitching chain is not verified")
+        return TotalDecision(rating="pass", notes=notes)
+
+    risk_a = (
+        context.starter_command_or_hr_risk_a
+        or context.starter_first_inning_collapse_risk_a
+        or context.starter_injury_or_short_exit_risk_a
+    )
+    risk_b = (
+        context.starter_command_or_hr_risk_b
+        or context.starter_first_inning_collapse_risk_b
+        or context.starter_injury_or_short_exit_risk_b
+    )
+    high_unknown_pitch_velocity = (
+        context.pitch_velocity_unknown_rate_a >= 0.45
+        or context.pitch_velocity_unknown_rate_b >= 0.45
+    )
+    concentrated_path_a = (
+        context.top_five_pitch_velocity_plus_a >= 3
+        and context.recent_power_or_walk_conversion_a
+    )
+    concentrated_path_b = (
+        context.top_five_pitch_velocity_plus_b >= 3
+        and context.recent_power_or_walk_conversion_b
+    )
+    early_path_a = context.lineup_early_scoring_path_a or concentrated_path_a
+    early_path_b = context.lineup_early_scoring_path_b or concentrated_path_b
+    supported_path_a = early_path_a and (
+        context.recent_power_or_walk_conversion_a or risk_b
+    )
+    supported_path_b = early_path_b and (
+        context.recent_power_or_walk_conversion_b or risk_a
+    )
+
+    under_edge = context.market_total - context.projected_total
+    if under_edge >= 0.3:
+        if risk_a or risk_b:
+            notes.append("starter command, HR, or early-exit risk blocks F5 under")
+            return TotalDecision(rating="pass", notes=notes)
+        if context.starter_stability_a < 65 or context.starter_stability_b < 65:
+            notes.append("F5 under requires both first-five pitching paths stable")
+            return TotalDecision(rating="pass", notes=notes)
+        if not context.lineup_muted_a or not context.lineup_muted_b:
+            notes.append("F5 under requires both lineups muted early")
+            return TotalDecision(rating="pass", notes=notes)
+        if concentrated_path_a or concentrated_path_b:
+            notes.append("converted top-five matchup concentration blocks F5 under")
+            return TotalDecision(rating="pass", notes=notes)
+        if high_unknown_pitch_velocity:
+            notes.append("pitch-velocity sample shortage is not F5 under support")
+            return TotalDecision(rating="pass", notes=notes)
+        notes.append("stable first-five pitching paths and muted lineups support under")
+        return TotalDecision(rating="under", notes=notes)
+
+    over_candidate = context.projected_total >= context.market_total - 0.1
+    if over_candidate:
+        if context.market_total <= 4.0 and not (supported_path_a and supported_path_b):
+            notes.append("low F5 total over requires two early scoring paths")
+            return TotalDecision(rating="pass", notes=notes)
+        if not (supported_path_a or supported_path_b):
+            notes.append("F5 over requires a converted early scoring path")
+            return TotalDecision(rating="pass", notes=notes)
+        if (
+            context.both_starters_five_inning_floor
+            and not risk_a
+            and not risk_b
+            and context.projected_total < context.market_total + 0.5
+        ):
+            notes.append("stable five-inning starter floors block thin F5 over")
+            return TotalDecision(rating="pass", notes=notes)
+        notes.append("starter risk and converted early scoring path support over")
+        return TotalDecision(rating="over", notes=notes)
+
+    return TotalDecision(rating="pass", notes=notes)
 
 
 def evaluate_total(context: TotalContext) -> TotalDecision:
