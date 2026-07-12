@@ -347,6 +347,20 @@ class PriorityAdmission:
 
 
 @dataclass(frozen=True)
+class TotalMarketPriorityContext:
+    f5_score: int | None
+    full_game_score: int | None
+    independent_paths: bool = False
+
+
+@dataclass(frozen=True)
+class TotalMarketPrioritySelection:
+    include_f5: bool
+    include_full_game: bool
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class FullGameContext:
     f5_edge: int
     lineup_edge: int
@@ -464,6 +478,32 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
         tier = "review-only"
 
     return PriorityAdmission(score=score, tier=tier, notes=notes)
+
+
+def select_total_priority_markets(
+    context: TotalMarketPriorityContext,
+) -> TotalMarketPrioritySelection:
+    include_f5 = context.f5_score is not None
+    include_full_game = context.full_game_score is not None
+
+    if not (include_f5 and include_full_game) or context.independent_paths:
+        return TotalMarketPrioritySelection(
+            include_f5=include_f5,
+            include_full_game=include_full_game,
+        )
+
+    if context.f5_score >= context.full_game_score:
+        return TotalMarketPrioritySelection(
+            include_f5=True,
+            include_full_game=False,
+            notes=["correlated total markets keep the higher-scoring F5 total"],
+        )
+
+    return TotalMarketPrioritySelection(
+        include_f5=False,
+        include_full_game=True,
+        notes=["correlated total markets keep the higher-scoring full-game total"],
+    )
 
 
 def score_bullpen_availability(appearances: list[RelieverAppearance]) -> BullpenAvailability:

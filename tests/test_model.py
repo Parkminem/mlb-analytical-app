@@ -15,6 +15,7 @@ from analysis.model import (
     StarterRecentForm,
     StarterStructureContext,
     StarterVolatilityContext,
+    TotalMarketPriorityContext,
     TotalContext,
     UmpireContext,
     apply_umpire_adjustment,
@@ -30,11 +31,38 @@ from analysis.model import (
     recommend_full_game,
     resolve_lineup_source,
     resolve_starter_structure,
+    select_total_priority_markets,
     score_bullpen_segments,
     score_bullpen_availability,
     score_starter_recent_form,
     score_starter_volatility,
 )
+
+
+class TotalMarketPriorityTests(unittest.TestCase):
+    def test_correlated_totals_keep_only_higher_score(self):
+        result = select_total_priority_markets(
+            TotalMarketPriorityContext(
+                f5_score=78,
+                full_game_score=81,
+                independent_paths=False,
+            )
+        )
+
+        self.assertFalse(result.include_f5)
+        self.assertTrue(result.include_full_game)
+
+    def test_independent_early_and_late_paths_allow_both_totals(self):
+        result = select_total_priority_markets(
+            TotalMarketPriorityContext(
+                f5_score=76,
+                full_game_score=79,
+                independent_paths=True,
+            )
+        )
+
+        self.assertTrue(result.include_f5)
+        self.assertTrue(result.include_full_game)
 
 
 class F5TotalTests(unittest.TestCase):
