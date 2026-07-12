@@ -1,5 +1,5 @@
 {
-  "version": "2026-06-24",
+  "version": "2026-07-12",
   "fixed_model": true,
   "lineup_source": {
     "primary": "RotoWire",
@@ -18,18 +18,24 @@
     "yesterday_limited_min_pitches": 21,
     "yesterday_performance_risk_min_pitches": 30,
     "consecutive_days_limited": 2,
-    "three_straight_unavailable": true
+    "three_straight_unavailable": true,
+    "lower_bullpen_usage_preserves_high_leverage_availability": true
   },
   "starter_structure": {
     "official_opener_plus_rotowire_bulk_resolves_conflict": true,
     "use_bulk_pitcher_for_main_matchup": true,
-    "use_opener_only_for_first_inning_context": true
+    "use_opener_only_for_first_inning_context": true,
+    "downgrade_side_when_opener_bulk_timing_uncertain": true,
+    "prim_bulk_requires_recent_workload_or_explicit_confirmation": true,
+    "stable_bulk_recent_workload_min_pitches": 50,
+    "uncertain_prim_keeps_source_conflict_cap": true
   },
   "side_priority": {
     "downgrade_key_power_bat_missing": true,
     "downgrade_injury_return_or_recent_short_exit": true,
     "downgrade_side_when_over_is_two_sided_volatility": true,
     "downgrade_ml_when_opponent_top_order_attacks_starter_hr_or_collapse_risk": true,
+    "block_ml_when_opponent_top_order_attacks_hr_risk_starter": true,
     "confirmed_bulk_pitcher_resolves_starter_source_conflict": true,
     "cap_side_against_neutral_heavy_lineup": true,
     "treat_negative_power_bats_as_variance": true,
@@ -41,7 +47,23 @@
     "cap_f5_when_core_hitters_have_minus_matchups": true,
     "move_plus_slots_low_run_efficiency_to_pass_or_total_review": true,
     "downgrade_ml_on_post_sixth_bullpen_exposure": true,
-    "cap_plus_slots_on_high_k_rate_and_unfamiliar_starter": true
+    "downgrade_ml_when_short_starter_requires_extended_bullpen": true,
+    "cap_plus_slots_on_high_k_rate_and_unfamiliar_starter": true,
+    "cap_recent_power_form_without_on_base_pressure": true,
+    "downgrade_cold_lineup_ml_toward_total_review": true,
+    "cap_short_favorite_ml_on_weak_confirmed_lineup_fit": true,
+    "cap_plus_handicap_on_sample_shortage_against_small_sample_starter": true,
+    "cap_fastball_plus_slots_on_secondary_command_rebound": true,
+    "cap_plus_handicap_against_stable_deep_starter_without_top_order_support": true,
+    "block_plus_handicap_when_underdog_run_creation_is_cold": true,
+    "plus_handicap_requires_independent_underdog_scoring_path": true,
+    "block_plus_handicap_priority_without_top_five_run_path": true,
+    "block_ml_when_model_starter_walk_risk_requires_f5_only": true,
+    "plus_handicap_starter_survival_overrides_lineup_edge": true,
+    "cap_plus_handicap_on_general_command_or_hr_risk": true,
+    "block_plus_handicap_on_underdog_starter_collapse_risk": true,
+    "cap_short_favorite_elite_starter_on_top_order_extra_base_route": true,
+    "plus_handicap_requires_late_bullpen_protection": true
   },
   "total_priority": {
     "compete_with_sides_in_final_priority": true,
@@ -53,25 +75,60 @@
     "strict_over_validation": true,
     "strict_over_requires_two_sided_on_base_path": true,
     "same_game_side_over_requires_independent_total_path": true,
+    "same_game_side_under_requires_coherent_low_scoring_path": true,
     "block_side_over_pair_when_side_requires_run_suppression": true,
     "cap_over_when_starter_length_and_kbb_are_strong": true,
     "low_total_over_requires_two_sided_scoring_path": true,
     "low_total_requires_late_variance_control": true,
     "low_total_starter_length_can_temper_plus_slots": true,
     "block_low_total_under_on_recent_command_or_hr_volatility": true,
+    "block_low_total_under_on_recent_power_hr_variance": true,
     "block_low_total_under_on_neutral_heavy_traffic": true,
     "allow_high_total_over_when_both_starters_have_command_risk": true,
     "allow_over_on_post_sixth_bullpen_exposure": true,
     "high_total_over_requires_recent_power_or_walk_conversion": true,
     "starter_kbb_length_suppresses_pitch_velocity_over": true,
-    "sixth_inning_path_requires_walk_or_late_bullpen_over_support": true
+    "recent_zero_walk_kbb_length_caps_thin_over": true,
+    "sixth_inning_path_requires_walk_or_late_bullpen_over_support": true,
+    "neutral_heavy_traffic_blocks_thin_full_game_under": true,
+    "prim_bulk_length_tempers_high_total_over": true,
+    "block_under_when_key_bats_missing_but_depth_remains_live": true,
+    "block_under_on_weak_bulk_or_lower_bullpen_collapse_risk": true,
+    "block_over_on_one_sided_scoring_path": true,
+    "block_high_total_over_when_one_lineup_path_is_weak": true,
+    "block_high_total_over_when_bridge_can_absorb_bullpen_fatigue": true,
+    "cap_fastball_only_over_on_secondary_command_rebound": true,
+    "keep_high_total_over_live_on_single_starter_collapse_plus_late_path": true,
+    "block_pitch_velocity_over_on_cold_run_conversion": true,
+    "market_nine_over_requires_more_than_five_inning_starter_floor": true,
+    "over_priority_requires_f5_scoring_path": true,
+    "stable_bulk_length_caps_high_total_over": true,
+    "bullpen_over_requires_starter_length_failure_or_post_sixth_exposure": true,
+    "extreme_total_over_requires_clear_two_sided_collapse_path": true,
+    "one_dominant_kbb_starter_prioritizes_low_total_under": true,
+    "traffic_over_requires_power_or_run_conversion_support": true
   },
   "weather": {
     "included_by_default": false,
     "preferred_user_source": "BallparkPal"
   },
+  "cache_policy": {
+    "savant_statcast_historical_ttl_hours": 24,
+    "mlb_official_schedule_probables": "realtime",
+    "rotowire_lineups": "realtime",
+    "market_odds_and_totals": "realtime",
+    "boxscore_bullpen_usage": "realtime"
+  },
   "market": {
     "odds_format": "decimal",
-    "applied_after_baseball_scores": true
+    "applied_after_baseball_scores": true,
+    "summary_table_single_side_market": true
+  },
+  "priority_admission": {
+    "caps_only_no_positive_rescoring": true,
+    "traffic_only_side_cap": 74,
+    "incomplete_pitching_chain_cap": 74,
+    "late_bullpen_protection_cap": 71,
+    "discontinuous_lineup_over_cap": 69
   }
 }

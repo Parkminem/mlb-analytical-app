@@ -111,6 +111,7 @@ def build_analysis_manifest(
         "layers": list(MODEL_LAYERS),
         "lineup_source": lineup_source,
         "include_weather": weather_enabled,
+        "cache_policy": model_config.get("cache_policy", {}),
         "required_inputs": required_inputs,
         "confidence_flags": confidence_flags,
         "strength_adjustments": [],
