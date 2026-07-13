@@ -16,6 +16,8 @@ The final priority stack may include more than one market from the same game whe
 
 F5 O/U must use a verified F5 line and decimal price. Do not infer it from the full-game total. If F5 O/U and full-game O/U use the same scoring edge, list only the higher-scoring one in the final priority stack unless independent early and late paths are explicitly verified.
 
+Before building the final priority stack, remove every market whose own decision engine returned `pass`, regardless of its preliminary score. Then assemble F5 side, F5 O/U, and full-game O/U together. If candidates share starter suppression, starter collapse, top-order matchup, recent conversion, or another canonical evidence path, retain only the higher-scoring candidate. Missing evidence does not establish independence; keep multiple markets only when their distinct non-empty paths are explicitly verified.
+
 Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is not a separate baseball input and must not double count evidence.
 
 When a same-game side or handicap plus O/U combination is listed, explain the independent total path. Do not list the total only because the side was strong.
@@ -67,6 +69,7 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 
 **Conclusion**
 
+- Exclude every market-engine `pass` before ranking or assigning final priority placement.
 - Before assigning the final `0-100` score, apply the priority-admission caps using the already calculated run-conversion, pitching-chain, and bullpen results. Do not rescore or positively boost any input at this step.
 - Explain why F5 and ML may differ.
 - Explain why F5 O/U and full-game O/U may differ. Full-game bullpen risk is not an F5-total input unless a verified opener/bulk arm works inside the first five innings.

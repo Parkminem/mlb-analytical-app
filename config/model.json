@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-12",
+  "version": "2026-07-13",
   "fixed_model": true,
   "lineup_source": {
     "primary": "RotoWire",
@@ -132,6 +132,10 @@
   },
   "priority_admission": {
     "caps_only_no_positive_rescoring": true,
+    "exclude_market_engine_pass_from_priority": true,
+    "canonical_evidence_paths_only": true,
+    "missing_evidence_blocks_multi_market_retention": true,
+    "same_game_candidate_assembler": "assemble_same_game_priority",
     "traffic_only_side_cap": 74,
     "incomplete_pitching_chain_cap": 74,
     "late_bullpen_protection_cap": 71,

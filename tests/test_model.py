@@ -1,5 +1,7 @@
 import unittest
 
+import analysis.model as model
+
 from analysis.model import (
     AnalysisChecklist,
     BullpenSegment,
@@ -63,6 +65,177 @@ class TotalMarketPriorityTests(unittest.TestCase):
 
         self.assertTrue(result.include_f5)
         self.assertTrue(result.include_full_game)
+
+
+class SameGamePriorityTests(unittest.TestCase):
+    def test_pass_decisions_from_market_engines_are_excluded(self):
+        handicap = evaluate_plus_handicap(
+            HandicapContext(
+                lineup_edge=70,
+                starter_stability=45,
+                bullpen_score=72,
+                opponent_late_risk=True,
+                decimal_odds=1.90,
+                underdog_starter_collapse_risk=True,
+            )
+        )
+        total = evaluate_total(
+            TotalContext(
+                market_total=9.0,
+                projected_total=9.4,
+                starter_stability_a=68,
+                starter_stability_b=67,
+                lineup_contact_a=72,
+                lineup_contact_b=45,
+                bullpen_score_a=72,
+                bullpen_score_b=70,
+                lower_bullpen_risk=False,
+                one_sided_over_path=True,
+            )
+        )
+
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    market="plus_1_5",
+                    score=84,
+                    decision_rating=handicap.rating,
+                    evidence_paths=frozenset(
+                        {model.PriorityEvidencePath.UNDERDOG_RUN_CREATION}
+                    ),
+                ),
+                model.PriorityMarketCandidate(
+                    market="full_total",
+                    score=83,
+                    decision_rating=total.rating,
+                    evidence_paths=frozenset(
+                        {model.PriorityEvidencePath.STARTER_COLLAPSE}
+                    ),
+                ),
+                model.PriorityMarketCandidate(
+                    market="f5_side",
+                    score=76,
+                    decision_rating="play",
+                    evidence_paths=frozenset(
+                        {model.PriorityEvidencePath.TOP_ORDER_MATCHUP}
+                    ),
+                ),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_side"])
+        self.assertCountEqual(
+            [candidate.market for candidate in result.excluded],
+            ["plus_1_5", "full_total"],
+        )
+
+    def test_correlated_f5_side_and_total_keep_higher_score(self):
+        shared_path = frozenset({model.PriorityEvidencePath.STARTER_SUPPRESSION})
+
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate("f5_side", 77, "play", shared_path),
+                model.PriorityMarketCandidate("f5_total", 75, "under", shared_path),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_side"])
+        self.assertEqual([candidate.market for candidate in result.excluded], ["f5_total"])
+
+    def test_independent_f5_side_and_total_can_both_remain(self):
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "f5_side",
+                    77,
+                    "play",
+                    frozenset({model.PriorityEvidencePath.TOP_ORDER_MATCHUP}),
+                ),
+                model.PriorityMarketCandidate(
+                    "f5_total",
+                    75,
+                    "under",
+                    frozenset({model.PriorityEvidencePath.STARTER_SUPPRESSION}),
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            [candidate.market for candidate in result.included],
+            ["f5_side", "f5_total"],
+        )
+        self.assertEqual(result.excluded, ())
+
+    def test_three_markets_keep_only_explicitly_independent_paths(self):
+        starter_path = frozenset({model.PriorityEvidencePath.STARTER_SUPPRESSION})
+        late_path = frozenset({model.PriorityEvidencePath.LATE_BULLPEN_EXPOSURE})
+
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate("f5_side", 77, "play", starter_path),
+                model.PriorityMarketCandidate("f5_total", 75, "under", starter_path),
+                model.PriorityMarketCandidate("full_total", 76, "over", late_path),
+            ]
+        )
+
+        self.assertEqual(
+            [candidate.market for candidate in result.included],
+            ["f5_side", "full_total"],
+        )
+        self.assertEqual([candidate.market for candidate in result.excluded], ["f5_total"])
+
+    def test_exact_correlated_tie_prefers_f5_side_then_f5_total(self):
+        shared_path = frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE})
+
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate("full_total", 78, "over", shared_path),
+                model.PriorityMarketCandidate("f5_total", 78, "over", shared_path),
+                model.PriorityMarketCandidate("f5_side", 78, "play", shared_path),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_side"])
+
+    def test_equal_score_correlated_totals_prefer_f5_total(self):
+        shared_path = frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE})
+
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate("full_total", 78, "over", shared_path),
+                model.PriorityMarketCandidate("f5_total", 78, "over", shared_path),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_total"])
+        self.assertEqual([candidate.market for candidate in result.excluded], ["full_total"])
+
+    def test_missing_evidence_cannot_retain_multiple_markets(self):
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate("f5_total", 80, "over"),
+                model.PriorityMarketCandidate(
+                    "full_total",
+                    79,
+                    "over",
+                    frozenset({model.PriorityEvidencePath.LATE_BULLPEN_EXPOSURE}),
+                ),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_total"])
+        self.assertEqual([candidate.market for candidate in result.excluded], ["full_total"])
+
+    def test_free_form_evidence_paths_are_rejected(self):
+        candidate = model.PriorityMarketCandidate(
+            "f5_total",
+            80,
+            "over",
+            frozenset({"post_hoc_pitcher_story"}),
+        )
+
+        with self.assertRaisesRegex(ValueError, "canonical PriorityEvidencePath"):
+            model.assemble_same_game_priority([candidate])
 
 
 class F5TotalTests(unittest.TestCase):

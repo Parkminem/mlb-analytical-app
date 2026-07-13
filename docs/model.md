@@ -491,8 +491,12 @@ Use decimal odds when discussing price. Avoid switching direction inside the sam
 
 Final priority rules:
 
+- A market engine's `pass` decision is ineligible for the final priority stack regardless of its preliminary score. Do not convert a failed handicap or total validation back into a scored lean at the output stage.
 - The final priority stack may include multiple entries from one game when they are different markets and independently validated.
 - If F5 O/U and full-game O/U rely on the same scoring edge, keep only the higher-scoring market in the final priority stack. Keep both only when independent early and late paths are explicitly verified.
+- Assemble F5 side, F5 O/U, and full-game O/U in one same-game selection stage. Use canonical evidence paths already produced by the fixed layers: starter suppression, starter collapse, top-order matchup, recent run conversion, underdog run creation, late-bullpen exposure, and bullpen protection.
+- When same-game candidates share an evidence path, keep only the higher-scoring candidate. On an exact correlated tie, prefer F5 side, then F5 O/U, then full-game O/U.
+- Missing evidence paths do not prove independence. Multiple same-game markets may coexist only when every retained market has a distinct, non-empty evidence path.
 - Every entry in the final priority stack should include a `0-100` priority score. This score is an output-ranking expression of the existing model edge, market value, data confidence, and layer agreement; it does not create a new analysis layer or rescore baseball inputs.
 - Score guide: `80+` primary candidate, `72-79` playable candidate, `65-71` lean or price-dependent candidate, below `65` review-only unless the user asks for all leans.
 - Apply one final priority-admission gate after market value. This gate may only cap the existing priority score; it must not add points or score any baseball input again.

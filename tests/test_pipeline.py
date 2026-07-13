@@ -183,6 +183,21 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(config["priority_admission"]["late_bullpen_protection_cap"], 71)
         self.assertEqual(config["priority_admission"]["discontinuous_lineup_over_cap"], 69)
         self.assertTrue(config["priority_admission"]["caps_only_no_positive_rescoring"])
+        self.assertTrue(
+            config["priority_admission"]["exclude_market_engine_pass_from_priority"]
+        )
+        self.assertTrue(
+            config["priority_admission"]["canonical_evidence_paths_only"]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "missing_evidence_blocks_multi_market_retention"
+            ]
+        )
+        self.assertEqual(
+            config["priority_admission"]["same_game_candidate_assembler"],
+            "assemble_same_game_priority",
+        )
         self.assertTrue(config["f5_total_priority"]["independent_engine"])
         self.assertFalse(
             config["f5_total_priority"]["use_full_game_bullpen_inputs"]
@@ -252,6 +267,18 @@ class AnalysisManifestTests(unittest.TestCase):
             "realtime",
         )
         self.assertIn("F5 O/U", manifest["required_outputs"])
+
+    def test_manifest_requires_unified_same_game_priority_assembler(self):
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+            include_weather=False,
+        )
+
+        self.assertEqual(
+            manifest["priority_candidate_assembler"],
+            "assemble_same_game_priority",
+        )
 
     def test_weather_is_excluded_unless_requested(self):
         manifest = build_analysis_manifest(

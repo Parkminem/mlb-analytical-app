@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 
 HIGH_LEVERAGE_ROLES = {"closer", "setup", "high"}
@@ -360,6 +361,31 @@ class TotalMarketPrioritySelection:
     notes: list[str] = field(default_factory=list)
 
 
+class PriorityEvidencePath(str, Enum):
+    STARTER_SUPPRESSION = "starter_suppression"
+    STARTER_COLLAPSE = "starter_collapse"
+    TOP_ORDER_MATCHUP = "top_order_matchup"
+    RECENT_RUN_CONVERSION = "recent_run_conversion"
+    UNDERDOG_RUN_CREATION = "underdog_run_creation"
+    LATE_BULLPEN_EXPOSURE = "late_bullpen_exposure"
+    BULLPEN_PROTECTION = "bullpen_protection"
+
+
+@dataclass(frozen=True)
+class PriorityMarketCandidate:
+    market: str
+    score: int
+    decision_rating: str
+    evidence_paths: frozenset[PriorityEvidencePath] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class SameGamePrioritySelection:
+    included: tuple[PriorityMarketCandidate, ...]
+    excluded: tuple[PriorityMarketCandidate, ...]
+    notes: list[str] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class FullGameContext:
     f5_edge: int
@@ -483,26 +509,108 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
 def select_total_priority_markets(
     context: TotalMarketPriorityContext,
 ) -> TotalMarketPrioritySelection:
-    include_f5 = context.f5_score is not None
-    include_full_game = context.full_game_score is not None
-
-    if not (include_f5 and include_full_game) or context.independent_paths:
-        return TotalMarketPrioritySelection(
-            include_f5=include_f5,
-            include_full_game=include_full_game,
+    candidates: list[PriorityMarketCandidate] = []
+    if context.f5_score is not None:
+        candidates.append(
+            PriorityMarketCandidate(
+                market="f5_total",
+                score=context.f5_score,
+                decision_rating="play",
+                evidence_paths=frozenset(
+                    {PriorityEvidencePath.STARTER_COLLAPSE}
+                ),
+            )
+        )
+    if context.full_game_score is not None:
+        full_game_path = (
+            PriorityEvidencePath.LATE_BULLPEN_EXPOSURE
+            if context.independent_paths
+            else PriorityEvidencePath.STARTER_COLLAPSE
+        )
+        candidates.append(
+            PriorityMarketCandidate(
+                market="full_total",
+                score=context.full_game_score,
+                decision_rating="play",
+                evidence_paths=frozenset({full_game_path}),
+            )
         )
 
-    if context.f5_score >= context.full_game_score:
-        return TotalMarketPrioritySelection(
-            include_f5=True,
-            include_full_game=False,
-            notes=["correlated total markets keep the higher-scoring F5 total"],
-        )
+    selection = assemble_same_game_priority(candidates)
+    included_markets = {candidate.market for candidate in selection.included}
+    notes = list(selection.notes)
+    if not context.independent_paths and len(candidates) == 2:
+        if "f5_total" in included_markets:
+            notes = ["correlated total markets keep the higher-scoring F5 total"]
+        else:
+            notes = ["correlated total markets keep the higher-scoring full-game total"]
 
     return TotalMarketPrioritySelection(
-        include_f5=False,
-        include_full_game=True,
-        notes=["correlated total markets keep the higher-scoring full-game total"],
+        include_f5="f5_total" in included_markets,
+        include_full_game="full_total" in included_markets,
+        notes=notes,
+    )
+
+
+def assemble_same_game_priority(
+    candidates: list[PriorityMarketCandidate],
+) -> SameGamePrioritySelection:
+    """Filter market passes and retain only explicitly independent evidence paths."""
+    tie_order = {
+        "f5_side": 0,
+        "f5_total": 1,
+        "full_total": 2,
+        "ml": 3,
+        "plus_1_5": 4,
+    }
+    included: list[PriorityMarketCandidate] = []
+    excluded: list[PriorityMarketCandidate] = []
+    notes: list[str] = []
+
+    eligible: list[PriorityMarketCandidate] = []
+    for candidate in candidates:
+        if any(
+            not isinstance(path, PriorityEvidencePath)
+            for path in candidate.evidence_paths
+        ):
+            raise ValueError("evidence paths must use canonical PriorityEvidencePath values")
+        if candidate.decision_rating == "pass":
+            excluded.append(candidate)
+            notes.append(f"{candidate.market} pass excluded from priority")
+        else:
+            eligible.append(candidate)
+
+    eligible.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            tie_order.get(candidate.market, len(tie_order)),
+            candidate.market,
+        )
+    )
+
+    for candidate in eligible:
+        if not included:
+            included.append(candidate)
+            continue
+
+        independence_verified = bool(candidate.evidence_paths) and all(
+            bool(selected.evidence_paths)
+            and candidate.evidence_paths.isdisjoint(selected.evidence_paths)
+            for selected in included
+        )
+        if independence_verified:
+            included.append(candidate)
+            continue
+
+        excluded.append(candidate)
+        notes.append(
+            f"{candidate.market} excluded because same-game evidence is correlated or unverified"
+        )
+
+    return SameGamePrioritySelection(
+        included=tuple(included),
+        excluded=tuple(excluded),
+        notes=notes,
     )
 
 

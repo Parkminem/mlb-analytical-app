@@ -7,6 +7,7 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - Do not modify the model, thresholds, source hierarchy, or output direction unless the user explicitly asks for a model change.
 - When the user asks for a postgame review, identify whether a model change is justified, but do not apply it without explicit approval.
 - Score each baseball input once and reuse it with different weights for F5, F5 O/U, ML, `+1.5`, and O/U. Do not double count evidence.
+- Before final priority ranking, exclude every market-engine `pass` and use the unified same-game candidate assembler. Keep multiple markets only when their canonical evidence paths are distinct and non-empty.
 
 ## Required Sources
 
