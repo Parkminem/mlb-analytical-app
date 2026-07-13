@@ -1,5 +1,7 @@
-from dataclasses import FrozenInstanceError, fields, replace
-from datetime import date, datetime, timezone
+from dataclasses import dataclass, FrozenInstanceError, fields, is_dataclass, replace
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
+import hashlib
 import math
 import unittest
 
@@ -28,6 +30,17 @@ from analysis.forecasting import (
     SourceObservation,
     StarterProjectionComponents,
     WorkloadHistory,
+)
+from analysis.forecasting.identity import (
+    build_forecast_run_id,
+    canonical_json,
+    capture_payload,
+    normalized_input_hash,
+    semantic_forecast_payload,
+)
+from analysis.forecasting.validation import (
+    iter_feature_provenance,
+    validate_pregame_input,
 )
 
 
@@ -258,6 +271,117 @@ def normalized_game(**overrides: object) -> NormalizedGameInput:
     }
     values.update(overrides)
     return NormalizedGameInput(**values)
+
+
+def complete_chain(team: str) -> PitcherChainInput:
+    opener_id = f"pitcher:{team}:opener"
+    bulk_id = f"pitcher:{team}:bulk"
+    return opener_bulk_chain(
+        pitchers=(
+            pitcher(opener_id, PitcherRole.OPENER),
+            pitcher(bulk_id, PitcherRole.BULK),
+        ),
+        official_pitcher_id=opener_id,
+        rotowire_pitcher_id=bulk_id,
+        matchup_pitcher_id=bulk_id,
+    )
+
+
+def lineup_against(team: str, pitcher_id: str) -> LineupInput:
+    slots = []
+    for order in range(1, 10):
+        slot = lineup_slot(order, batter_id=f"batter:{team}:{order}")
+        response = PitchVelocityResponse(
+            batter_id=slot.batter_id,
+            pitcher_id=pitcher_id,
+            expected_side=slot.expected_side,
+            pitch_type="FF",
+            velocity_center_mph=95.1,
+            band_width_mph=1.5,
+            plate_appearances=30,
+            adjusted_woba=0.340,
+            sample_strength="eligible",
+            slot_label="플러스",
+            provenance=provenance(),
+        )
+        slots.append(replace(slot, responses=(response,)))
+    return lineup(team, tuple(slots))
+
+
+def bullpen_with_appearance(team: str) -> BullpenInput:
+    base = bullpen(team)
+    segment = replace(
+        base.segments[0],
+        appearances=(
+            RelieverAppearanceInput(
+                pitcher_id=f"reliever:{team}:1",
+                days_ago=1,
+                pitches=18,
+                provenance=provenance(),
+            ),
+        ),
+    )
+    return replace(base, segments=(segment,))
+
+
+def complete_forecast_game(**overrides: object) -> NormalizedGameInput:
+    away_pitching = complete_chain("SEA")
+    home_pitching = complete_chain("MIN")
+    total_market = replace(
+        market_input(),
+        market_key="game:900001:full_total:over:8.0",
+        market_type=MarketType.FULL_TOTAL,
+        selected_side="over",
+        line=8.0,
+    )
+    values: dict[str, object] = {
+        "away_pitching": away_pitching,
+        "home_pitching": home_pitching,
+        "away_lineup": lineup_against("SEA", home_pitching.matchup_pitcher_id),
+        "home_lineup": lineup_against("MIN", away_pitching.matchup_pitcher_id),
+        "away_bullpen": bullpen_with_appearance("SEA"),
+        "home_bullpen": bullpen_with_appearance("MIN"),
+        "markets": (total_market,),
+    }
+    values.update(overrides)
+    return normalized_game(**values)
+
+
+def replace_all_provenance(
+    value: object,
+    replacement: FeatureProvenance,
+) -> object:
+    if isinstance(value, FeatureProvenance):
+        return replacement
+    if isinstance(value, tuple):
+        return tuple(replace_all_provenance(item, replacement) for item in value)
+    if is_dataclass(value):
+        changes = {
+            field.name: replace_all_provenance(getattr(value, field.name), replacement)
+            for field in fields(value)
+        }
+        return replace(value, **changes)
+    return value
+
+
+def replace_lineup_slot(
+    lineup_input: LineupInput,
+    index: int,
+    slot: LineupSlot,
+) -> LineupInput:
+    slots = list(lineup_input.slots)
+    slots[index] = slot
+    return replace(lineup_input, slots=tuple(slots))
+
+
+def replace_chain_pitcher(
+    chain: PitcherChainInput,
+    index: int,
+    pitcher_input: PitcherInput,
+) -> PitcherChainInput:
+    pitchers = list(chain.pitchers)
+    pitchers[index] = pitcher_input
+    return replace(chain, pitchers=tuple(pitchers))
 
 
 class ForecastInputSchemaTests(unittest.TestCase):
@@ -747,3 +871,894 @@ class ForecastInputSchemaTests(unittest.TestCase):
 
         with self.assertRaises(FrozenInstanceError):
             observation.source_name = "changed"
+
+
+class CanonicalNumber(Enum):
+    TWO = 2
+
+
+@dataclass(frozen=True)
+class CanonicalFixture:
+    when: datetime
+    day: date
+    state: LineupState
+    values: tuple[object, ...]
+
+
+@dataclass
+class MutableFixture:
+    value: int
+
+
+class ForecastIdentityTests(unittest.TestCase):
+    def test_canonical_json_normalizes_supported_values(self) -> None:
+        fixture = CanonicalFixture(
+            when=datetime(
+                2026,
+                7,
+                14,
+                10,
+                0,
+                tzinfo=timezone(timedelta(hours=9)),
+            ),
+            day=date(2026, 7, 14),
+            state=LineupState.CONFIRMED,
+            values=(1, CanonicalNumber.TWO),
+        )
+        equivalent_mapping = {
+            "values": [1, 2],
+            "state": "confirmed",
+            "day": "2026-07-14",
+            "when": datetime(2026, 7, 14, 1, 0, tzinfo=UTC),
+        }
+
+        self.assertEqual(
+            canonical_json(fixture),
+            canonical_json(equivalent_mapping),
+        )
+        self.assertEqual(
+            canonical_json(fixture),
+            '{"day":"2026-07-14","state":"confirmed",'
+            '"values":[1,2],"when":"2026-07-14T01:00:00Z"}',
+        )
+        self.assertEqual(
+            canonical_json({"b": 2, "a": {"d": 4, "c": 3}}),
+            canonical_json({"a": {"c": 3, "d": 4}, "b": 2}),
+        )
+
+    def test_canonical_json_rejects_unsupported_and_nonfinite_values(self) -> None:
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    canonical_json({"value": value})
+
+        for value in (object(), {1, 2}, MutableFixture(1)):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaises(TypeError):
+                    canonical_json(value)
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            canonical_json(datetime(2026, 7, 14, 1, 0))
+
+    def test_normalized_input_hash_hashes_the_semantic_payload(self) -> None:
+        game = complete_forecast_game()
+        expected = hashlib.sha256(
+            canonical_json(semantic_forecast_payload(game)).encode("utf-8")
+        ).hexdigest()
+
+        self.assertEqual(normalized_input_hash(game), expected)
+        self.assertEqual(len(expected), 64)
+
+    def test_forecast_id_ignores_audit_timing_and_generated_ids(self) -> None:
+        baseline = complete_forecast_game()
+        replacement_provenance = FeatureProvenance(
+            observation_ids=("obs:renamed",),
+            latest_available_at=datetime(2026, 7, 14, 1, 20, tzinfo=UTC),
+            lookback_end=datetime(2026, 7, 14, 0, 45, tzinfo=UTC),
+        )
+        changed = replace_all_provenance(baseline, replacement_provenance)
+        self.assertIsInstance(changed, NormalizedGameInput)
+        changed_observation = replace(
+            baseline.observations[0],
+            observation_id="obs:renamed",
+            observed_at=datetime(2026, 7, 14, 1, 21, tzinfo=UTC),
+            available_at=datetime(2026, 7, 14, 1, 20, tzinfo=UTC),
+            fetched_at=datetime(2026, 7, 14, 1, 50, tzinfo=UTC),
+        )
+        changed = replace(
+            changed,
+            captured_at=datetime(2026, 7, 14, 1, 45, tzinfo=UTC),
+            observations=(changed_observation,),
+        )
+        config = {"simulations": 20_000, "seed_mode": "forecast"}
+
+        self.assertEqual(
+            normalized_input_hash(baseline),
+            normalized_input_hash(changed),
+        )
+        self.assertEqual(
+            build_forecast_run_id(baseline, "shadow-1", config),
+            build_forecast_run_id(changed, "shadow-1", config),
+        )
+
+    def test_source_order_and_config_mapping_order_do_not_change_id(self) -> None:
+        game = complete_forecast_game()
+        second_observation = source_observation(
+            observation_id="obs:2",
+            source_name="RotoWire",
+            source_record="lineups/900001",
+            content_hash="b" * 64,
+        )
+        first = replace(
+            game,
+            observations=(game.observations[0], second_observation),
+        )
+        second = replace(
+            game,
+            observations=(second_observation, game.observations[0]),
+        )
+        first_config = {
+            "simulations": 20_000,
+            "distribution": {"away": 1, "home": 2},
+        }
+        second_config = {
+            "distribution": {"home": 2, "away": 1},
+            "simulations": 20_000,
+        }
+
+        self.assertEqual(
+            semantic_forecast_payload(first),
+            semantic_forecast_payload(second),
+        )
+        self.assertEqual(
+            build_forecast_run_id(first, "shadow-1", first_config),
+            build_forecast_run_id(second, "shadow-1", second_config),
+        )
+
+    def test_behavior_changing_inputs_change_forecast_id(self) -> None:
+        game = complete_forecast_game()
+        config = {"simulations": 20_000, "seed_mode": "forecast"}
+        baseline_id = build_forecast_run_id(game, "shadow-1", config)
+
+        changed_line = replace(
+            game,
+            markets=(replace(game.markets[0], line=8.5),),
+        )
+        changed_price = replace(
+            game,
+            markets=(replace(game.markets[0], selected_decimal_price=1.87),),
+        )
+        old_slot = game.away_lineup.slots[3]
+        replacement_batter_id = "batter:SEA:replacement"
+        replacement_slot = replace(
+            old_slot,
+            batter_id=replacement_batter_id,
+            batter_name="Replacement Batter",
+            responses=tuple(
+                replace(response, batter_id=replacement_batter_id)
+                for response in old_slot.responses
+            ),
+        )
+        changed_lineup = replace(
+            game,
+            away_lineup=replace_lineup_slot(
+                game.away_lineup,
+                3,
+                replacement_slot,
+            ),
+        )
+        changed_source = replace(
+            game,
+            observations=(
+                replace(game.observations[0], content_hash="c" * 64),
+            ),
+        )
+        cases = (
+            ("line", changed_line, "shadow-1", config),
+            ("price", changed_price, "shadow-1", config),
+            ("lineup batter", changed_lineup, "shadow-1", config),
+            ("source content hash", changed_source, "shadow-1", config),
+            ("model version", game, "shadow-2", config),
+            (
+                "simulation config",
+                game,
+                "shadow-1",
+                {"simulations": 40_000, "seed_mode": "forecast"},
+            ),
+        )
+
+        for label, changed_game, model_version, changed_config in cases:
+            with self.subTest(label=label):
+                self.assertNotEqual(
+                    baseline_id,
+                    build_forecast_run_id(
+                        changed_game,
+                        model_version,
+                        changed_config,
+                    ),
+                )
+
+    def test_forecast_id_validates_version_and_config(self) -> None:
+        game = complete_forecast_game()
+        for model_version in ("", "   ", None):
+            with self.subTest(model_version=model_version):
+                with self.assertRaisesRegex(ValueError, "model_version"):
+                    build_forecast_run_id(game, model_version, {})
+
+        with self.assertRaises(TypeError):
+            build_forecast_run_id(game, "shadow-1", {"invalid": object()})
+        with self.assertRaisesRegex(ValueError, "finite"):
+            build_forecast_run_id(game, "shadow-1", {"rate": math.nan})
+
+    def test_capture_payload_retains_audit_fields_semantic_payload_excludes(self) -> None:
+        game = complete_forecast_game()
+        capture = capture_payload(game)
+        semantic = semantic_forecast_payload(game)
+
+        self.assertEqual(capture["captured_at"], "2026-07-14T01:30:00Z")
+        capture_observation = capture["observations"][0]
+        for field_name in (
+            "observation_id",
+            "observed_at",
+            "available_at",
+            "fetched_at",
+        ):
+            self.assertIn(field_name, capture_observation)
+        capture_provenance = capture["away_lineup"]["state_provenance"]
+        for field_name in (
+            "observation_ids",
+            "latest_available_at",
+            "lookback_end",
+        ):
+            self.assertIn(field_name, capture_provenance)
+
+        def nested_keys(value: object) -> set[str]:
+            if isinstance(value, dict):
+                keys = set(value)
+                for nested in value.values():
+                    keys.update(nested_keys(nested))
+                return keys
+            if isinstance(value, list):
+                keys: set[str] = set()
+                for nested in value:
+                    keys.update(nested_keys(nested))
+                return keys
+            return set()
+
+        semantic_keys = nested_keys(semantic)
+        for excluded in (
+            "captured_at",
+            "observation_id",
+            "observation_ids",
+            "observed_at",
+            "available_at",
+            "fetched_at",
+            "latest_available_at",
+            "lookback_end",
+        ):
+            self.assertNotIn(excluded, semantic_keys)
+
+        self.assertEqual(
+            set(semantic["observations"][0]),
+            {"source_name", "source_record", "effective_date", "content_hash"},
+        )
+        semantic_market = semantic["markets"][0]
+        for retained in (
+            "market_key",
+            "market_type",
+            "settlement_format",
+            "selected_side",
+            "line",
+            "selected_decimal_price",
+            "opposing_decimal_price",
+        ):
+            self.assertIn(retained, semantic_market)
+
+    def test_complete_valid_game_is_out_of_sample_eligible(self) -> None:
+        result = validate_pregame_input(complete_forecast_game())
+
+        self.assertTrue(result.out_of_sample_eligible)
+        self.assertEqual(result.flags, ())
+
+    def test_iter_feature_provenance_yields_every_reference(self) -> None:
+        provenances = tuple(iter_feature_provenance(complete_forecast_game()))
+
+        self.assertEqual(len(provenances), 131)
+        self.assertTrue(
+            all(isinstance(item, FeatureProvenance) for item in provenances)
+        )
+
+    def test_capture_at_or_after_first_pitch_is_rejected(self) -> None:
+        game = complete_forecast_game()
+        for captured_at in (
+            game.identity.first_pitch,
+            game.identity.first_pitch + timedelta(seconds=1),
+        ):
+            with self.subTest(captured_at=captured_at):
+                with self.assertRaisesRegex(ValueError, "captured_at.*first_pitch"):
+                    validate_pregame_input(replace(game, captured_at=captured_at))
+
+    def test_feature_latest_available_at_after_capture_is_rejected(self) -> None:
+        game = complete_forecast_game()
+        late = replace(
+            game.away_lineup.state_provenance,
+            latest_available_at=game.captured_at + timedelta(seconds=1),
+        )
+        changed = replace(
+            game,
+            away_lineup=replace(game.away_lineup, state_provenance=late),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "latest_available_at.*after captured_at",
+        ):
+            validate_pregame_input(changed)
+
+    def test_feature_lookback_end_after_capture_is_rejected(self) -> None:
+        game = complete_forecast_game()
+        late = replace(
+            game.away_lineup.state_provenance,
+            lookback_end=game.captured_at + timedelta(seconds=1),
+        )
+        changed = replace(
+            game,
+            away_lineup=replace(game.away_lineup, state_provenance=late),
+        )
+
+        with self.assertRaisesRegex(ValueError, "lookback_end.*after captured_at"):
+            validate_pregame_input(changed)
+
+    def test_referenced_observation_available_after_capture_is_rejected(self) -> None:
+        game = complete_forecast_game()
+        changed = replace(
+            game,
+            observations=(
+                replace(
+                    game.observations[0],
+                    available_at=game.captured_at + timedelta(seconds=1),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "observation.*available_at.*after captured_at",
+        ):
+            validate_pregame_input(changed)
+
+    def test_missing_and_duplicate_observation_ids_are_rejected(self) -> None:
+        game = complete_forecast_game()
+        duplicate = replace(
+            game.observations[0],
+            source_record="duplicate-record",
+        )
+        cases = (
+            ("missing", replace(game, observations=()), "missing observation_id"),
+            (
+                "duplicate",
+                replace(game, observations=(game.observations[0], duplicate)),
+                "duplicate observation_id",
+            ),
+        )
+
+        for label, changed, message in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_pregame_input(changed)
+
+    def test_unknown_available_at_returns_one_stable_flag(self) -> None:
+        game = complete_forecast_game()
+        unknown_provenance = replace(
+            game.away_lineup.state_provenance,
+            latest_available_at=None,
+        )
+        unknown_feature = replace(
+            game,
+            away_lineup=replace(
+                game.away_lineup,
+                state_provenance=unknown_provenance,
+                projected_runs_per_9=replace(
+                    game.away_lineup.projected_runs_per_9,
+                    provenance=unknown_provenance,
+                ),
+            ),
+        )
+        unknown_observation = replace(
+            game,
+            observations=(replace(game.observations[0], available_at=None),),
+        )
+        both_unknown = replace(
+            unknown_feature,
+            observations=(replace(game.observations[0], available_at=None),),
+        )
+
+        for label, changed in (
+            ("feature", unknown_feature),
+            ("observation", unknown_observation),
+            ("deduplicated", both_unknown),
+        ):
+            with self.subTest(label=label):
+                result = validate_pregame_input(changed)
+                self.assertFalse(result.out_of_sample_eligible)
+                self.assertEqual(result.flags, ("unknown available_at",))
+
+    def test_post_capture_audit_timestamps_do_not_prove_leakage(self) -> None:
+        game = complete_forecast_game()
+        observation = replace(
+            game.observations[0],
+            observed_at=game.identity.first_pitch + timedelta(minutes=5),
+            fetched_at=game.identity.first_pitch + timedelta(minutes=10),
+        )
+
+        result = validate_pregame_input(
+            replace(game, observations=(observation,))
+        )
+
+        self.assertTrue(result.out_of_sample_eligible)
+        self.assertEqual(result.flags, ())
+
+    def test_unreferenced_unknown_observation_does_not_change_eligibility(self) -> None:
+        game = complete_forecast_game()
+        unreferenced = source_observation(
+            observation_id="obs:unreferenced",
+            source_name="manual",
+            source_record="unused",
+            available_at=None,
+            content_hash="d" * 64,
+        )
+
+        result = validate_pregame_input(
+            replace(game, observations=game.observations + (unreferenced,))
+        )
+
+        self.assertTrue(result.out_of_sample_eligible)
+        self.assertEqual(result.flags, ())
+
+    def test_every_explicit_provenance_branch_is_leakage_checked(self) -> None:
+        game = complete_forecast_game()
+        late = FeatureProvenance(
+            observation_ids=("obs:1",),
+            latest_available_at=game.captured_at + timedelta(seconds=1),
+            lookback_end=AVAILABLE_AT,
+        )
+
+        cases: list[tuple[str, NormalizedGameInput]] = []
+        cases.append(
+            (
+                "away lineup state",
+                replace(
+                    game,
+                    away_lineup=replace(
+                        game.away_lineup,
+                        state_provenance=late,
+                    ),
+                ),
+            )
+        )
+        lineup_feature_names = (
+            "projected_runs_per_9",
+            "projected_traffic_per_9",
+            "projected_extra_base_hits_per_9",
+            "walk_rate",
+            "strikeout_rate",
+            "isolated_power",
+            "barrel_rate",
+            "recent_form_index",
+            "lower_order_continuity",
+            "log_standard_error",
+            "recent_form_included",
+        )
+        for field_name in lineup_feature_names:
+            feature = getattr(game.away_lineup, field_name)
+            cases.append(
+                (
+                    f"away lineup {field_name}",
+                    replace(
+                        game,
+                        away_lineup=replace(
+                            game.away_lineup,
+                            **{field_name: replace(feature, provenance=late)},
+                        ),
+                    ),
+                )
+            )
+
+        response_slot = game.away_lineup.slots[-1]
+        late_response = replace(response_slot.responses[0], provenance=late)
+        cases.append(
+            (
+                "away lineup response",
+                replace(
+                    game,
+                    away_lineup=replace_lineup_slot(
+                        game.away_lineup,
+                        8,
+                        replace(response_slot, responses=(late_response,)),
+                    ),
+                ),
+            )
+        )
+        cases.append(
+            (
+                "home lineup",
+                replace(
+                    game,
+                    home_lineup=replace(
+                        game.home_lineup,
+                        projected_runs_per_9=replace(
+                            game.home_lineup.projected_runs_per_9,
+                            provenance=late,
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        chain = game.away_pitching
+        chain_pitcher = chain.pitchers[1]
+
+        def game_with_away_pitcher(changed_pitcher: PitcherInput) -> NormalizedGameInput:
+            return replace(
+                game,
+                away_pitching=replace_chain_pitcher(chain, 1, changed_pitcher),
+            )
+
+        pitcher_feature_names = (
+            "projected_ra9",
+            "log_standard_error",
+            "pitch_limit",
+            "command_risk",
+            "home_run_risk",
+            "injury_return",
+            "recent_short_exit",
+        )
+        for field_name in pitcher_feature_names:
+            feature = getattr(chain_pitcher, field_name)
+            self.assertIsNotNone(feature)
+            cases.append(
+                (
+                    f"pitcher {field_name}",
+                    game_with_away_pitcher(
+                        replace(
+                            chain_pitcher,
+                            **{field_name: replace(feature, provenance=late)},
+                        )
+                    ),
+                )
+            )
+
+        component_names = (
+            "strikeout_minus_walk_rate",
+            "walk_rate",
+            "home_runs_per_contact",
+            "pitches_per_inning",
+            "recent_pitch_count",
+            "recent_workload_outs",
+        )
+        for field_name in component_names:
+            component = getattr(chain_pitcher.projection_components, field_name)
+            changed_components = replace(
+                chain_pitcher.projection_components,
+                **{field_name: replace(component, provenance=late)},
+            )
+            cases.append(
+                (
+                    f"projection component {field_name}",
+                    game_with_away_pitcher(
+                        replace(
+                            chain_pitcher,
+                            projection_components=changed_components,
+                        )
+                    ),
+                )
+            )
+
+        for field_name in ("eligible_workload", "league_prior_workload"):
+            history = getattr(chain_pitcher, field_name)
+            cases.append(
+                (
+                    f"pitcher {field_name}",
+                    game_with_away_pitcher(
+                        replace(
+                            chain_pitcher,
+                            **{field_name: replace(history, provenance=late)},
+                        )
+                    ),
+                )
+            )
+        cases.append(
+            (
+                "pitch usage",
+                game_with_away_pitcher(
+                    replace(
+                        chain_pitcher,
+                        pitch_mix=(
+                            replace(chain_pitcher.pitch_mix[0], provenance=late),
+                        ),
+                    )
+                ),
+            )
+        )
+        home_pitcher = game.home_pitching.pitchers[0]
+        cases.append(
+            (
+                "home pitcher",
+                replace(
+                    game,
+                    home_pitching=replace_chain_pitcher(
+                        game.home_pitching,
+                        0,
+                        replace(
+                            home_pitcher,
+                            projected_ra9=replace(
+                                home_pitcher.projected_ra9,
+                                provenance=late,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        chain_feature_names = (
+            "starter_confirmed",
+            "starter_source_conflict",
+            "handoff_verified",
+            "timing_uncertain",
+            "combined_pitch_limit",
+        )
+        for field_name in chain_feature_names:
+            feature = getattr(chain, field_name)
+            self.assertIsNotNone(feature)
+            cases.append(
+                (
+                    f"chain {field_name}",
+                    replace(
+                        game,
+                        away_pitching=replace(
+                            chain,
+                            **{field_name: replace(feature, provenance=late)},
+                        ),
+                    ),
+                )
+            )
+        for field_name in (
+            "eligible_combined_workload",
+            "league_prior_combined_workload",
+        ):
+            history = getattr(chain, field_name)
+            self.assertIsNotNone(history)
+            cases.append(
+                (
+                    f"chain {field_name}",
+                    replace(
+                        game,
+                        away_pitching=replace(
+                            chain,
+                            **{field_name: replace(history, provenance=late)},
+                        ),
+                    ),
+                )
+            )
+
+        segment = game.away_bullpen.segments[0]
+        bullpen_feature_names = (
+            "projected_ra9",
+            "log_standard_error",
+            "available",
+            "limited_performance_or_use_risk",
+        )
+        for field_name in bullpen_feature_names:
+            feature = getattr(segment, field_name)
+            changed_segment = replace(
+                segment,
+                **{field_name: replace(feature, provenance=late)},
+            )
+            cases.append(
+                (
+                    f"bullpen {field_name}",
+                    replace(
+                        game,
+                        away_bullpen=replace(
+                            game.away_bullpen,
+                            segments=(changed_segment,),
+                        ),
+                    ),
+                )
+            )
+        late_appearance = replace(segment.appearances[0], provenance=late)
+        cases.append(
+            (
+                "bullpen appearance",
+                replace(
+                    game,
+                    away_bullpen=replace(
+                        game.away_bullpen,
+                        segments=(
+                            replace(segment, appearances=(late_appearance,)),
+                        ),
+                    ),
+                ),
+            )
+        )
+        home_segment = game.home_bullpen.segments[0]
+        cases.append(
+            (
+                "home bullpen",
+                replace(
+                    game,
+                    home_bullpen=replace(
+                        game.home_bullpen,
+                        segments=(
+                            replace(
+                                home_segment,
+                                available=replace(
+                                    home_segment.available,
+                                    provenance=late,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        cases.append(
+            (
+                "market",
+                replace(
+                    game,
+                    markets=(replace(game.markets[0], provenance=late),),
+                ),
+            )
+        )
+
+        for label, changed in cases:
+            with self.subTest(branch=label):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "latest_available_at.*after captured_at",
+                ):
+                    validate_pregame_input(changed)
+
+    def test_duplicate_markets_and_team_relationship_errors_are_rejected(self) -> None:
+        game = complete_forecast_game()
+        cases = (
+            (
+                "duplicate market",
+                replace(game, markets=(game.markets[0], game.markets[0])),
+                "duplicate market_key",
+            ),
+            (
+                "away lineup",
+                replace(
+                    game,
+                    away_lineup=replace(game.away_lineup, team="OAK"),
+                ),
+                "away team relationship",
+            ),
+            (
+                "away bullpen",
+                replace(
+                    game,
+                    away_bullpen=replace(game.away_bullpen, team="OAK"),
+                ),
+                "away team relationship",
+            ),
+            (
+                "home lineup",
+                replace(
+                    game,
+                    home_lineup=replace(game.home_lineup, team="OAK"),
+                ),
+                "home team relationship",
+            ),
+            (
+                "home bullpen",
+                replace(
+                    game,
+                    home_bullpen=replace(game.home_bullpen, team="OAK"),
+                ),
+                "home team relationship",
+            ),
+            (
+                "same teams",
+                replace(
+                    game,
+                    identity=replace(
+                        game.identity,
+                        home_team=game.identity.away_team,
+                    ),
+                ),
+                "away_team and home_team must differ",
+            ),
+        )
+
+        for label, changed, message in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_pregame_input(changed)
+
+    def test_response_pitcher_and_side_relationships_are_rejected(self) -> None:
+        game = complete_forecast_game()
+        away_slot = game.away_lineup.slots[0]
+        home_slot = game.home_lineup.slots[0]
+        away_wrong_pitcher = replace(
+            away_slot,
+            responses=(
+                replace(away_slot.responses[0], pitcher_id="pitcher:missing"),
+            ),
+        )
+        home_wrong_pitcher = replace(
+            home_slot,
+            responses=(
+                replace(home_slot.responses[0], pitcher_id="pitcher:missing"),
+            ),
+        )
+        away_wrong_side = replace(
+            away_slot,
+            responses=(
+                replace(away_slot.responses[0], expected_side="R"),
+            ),
+        )
+        home_wrong_side = replace(
+            home_slot,
+            responses=(
+                replace(home_slot.responses[0], expected_side="R"),
+            ),
+        )
+        cases = (
+            (
+                "away pitcher",
+                replace(
+                    game,
+                    away_lineup=replace_lineup_slot(
+                        game.away_lineup,
+                        0,
+                        away_wrong_pitcher,
+                    ),
+                ),
+                "away lineup response pitcher_id",
+            ),
+            (
+                "home pitcher",
+                replace(
+                    game,
+                    home_lineup=replace_lineup_slot(
+                        game.home_lineup,
+                        0,
+                        home_wrong_pitcher,
+                    ),
+                ),
+                "home lineup response pitcher_id",
+            ),
+            (
+                "away side",
+                replace(
+                    game,
+                    away_lineup=replace_lineup_slot(
+                        game.away_lineup,
+                        0,
+                        away_wrong_side,
+                    ),
+                ),
+                "away lineup response expected_side",
+            ),
+            (
+                "home side",
+                replace(
+                    game,
+                    home_lineup=replace_lineup_slot(
+                        game.home_lineup,
+                        0,
+                        home_wrong_side,
+                    ),
+                ),
+                "home lineup response expected_side",
+            ),
+        )
+
+        for label, changed, message in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_pregame_input(changed)
