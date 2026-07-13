@@ -121,9 +121,12 @@ def weighted_choice(
     if len(values) != len(weights):
         raise ValueError("values and weights must have the same length")
 
-    for weight in weights:
+    last_positive_index = -1
+    for index, weight in enumerate(weights):
         if not _is_finite_number(weight) or weight < 0:
             raise ValueError("weights must be finite nonnegative numbers")
+        if weight > 0:
+            last_positive_index = index
     try:
         total = math.fsum(weights)
     except OverflowError as error:
@@ -140,7 +143,7 @@ def weighted_choice(
         cumulative += weight
         if threshold < cumulative:
             return value
-    return values[-1]
+    return values[last_positive_index]
 
 
 def central_interval(

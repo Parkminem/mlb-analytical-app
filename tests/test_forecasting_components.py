@@ -478,6 +478,30 @@ class ForecastRandomnessTests(unittest.TestCase):
 
         self.assertIs(result, final_value)
 
+    def test_weighted_choice_rounding_fallback_skips_trailing_zero_weights(self):
+        last_positive = object()
+        largest_sub_one = math.nextafter(1.0, 0.0)
+
+        result = weighted_choice(
+            FixedRandomRng(largest_sub_one),
+            ("large", "small", last_positive, "zero-tail-1", "zero-tail-2"),
+            (1e16, 1.0, 1.0, 0.0, 0.0),
+        )
+
+        self.assertIs(result, last_positive)
+
+    def test_weighted_choice_all_mass_can_precede_trailing_zero_weights(self):
+        only_positive = object()
+        largest_sub_one = math.nextafter(1.0, 0.0)
+
+        result = weighted_choice(
+            FixedRandomRng(largest_sub_one),
+            ("leading-zero", only_positive, "zero-tail-1", "zero-tail-2"),
+            (0.0, 4.0, 0.0, 0.0),
+        )
+
+        self.assertIs(result, only_positive)
+
     def test_weighted_choice_rejects_invalid_inputs(self):
         rng = FixedRandomRng(0.5)
 
