@@ -360,20 +360,45 @@ def _normalize_probabilities(values: list[float]) -> tuple[float, float, float]:
         if index != largest_index
     )
     normalized[largest_index] = 1.0 - other_total
+    residual = 1.0 - math.fsum(normalized)
+    if residual != 0.0:
+        correction_value = normalized[largest_index]
+        direction = math.inf if residual > 0.0 else -math.inf
+        normalized[largest_index] = math.nextafter(correction_value, direction)
+
+        if math.fsum(normalized) != 1.0:
+            adjacent_candidates = tuple(
+                candidate
+                for candidate in (
+                    math.nextafter(correction_value, -math.inf),
+                    math.nextafter(correction_value, math.inf),
+                )
+                if 0.0 <= candidate <= 1.0
+            )
+
+            def candidate_residual(candidate: float) -> tuple[float, float]:
+                candidate_probabilities = normalized.copy()
+                candidate_probabilities[largest_index] = candidate
+                return (
+                    abs(1.0 - math.fsum(candidate_probabilities)),
+                    candidate,
+                )
+
+            if adjacent_candidates:
+                normalized[largest_index] = min(
+                    adjacent_candidates,
+                    key=candidate_residual,
+                )
+
     if any(
         not _is_finite_number(value) or value < 0
         for value in normalized
-    ):
+    ) or not 0.0 <= normalized[largest_index] <= 1.0:
         raise ValueError(
             "normalized workload probabilities must be finite and nonnegative"
         )
-    if not math.isclose(
-        math.fsum(normalized),
-        1.0,
-        rel_tol=0.0,
-        abs_tol=_PROBABILITY_TOLERANCE,
-    ):
-        raise ValueError("normalized workload probabilities must sum to one")
+    if math.fsum(normalized) != 1.0:
+        raise ValueError("normalized workload probabilities must sum exactly to one")
     return normalized[0], normalized[1], normalized[2]
 
 

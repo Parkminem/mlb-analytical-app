@@ -923,6 +923,38 @@ class StarterForecastTests(unittest.TestCase):
         self.assertEqual(math.fsum(probabilities), 1.0)
         self.assertTrue(all(probability >= 0.0 for probability in probabilities))
 
+    def test_transfer_corrects_one_ulp_residual_in_largest_bucket(self):
+        config = SimulationConfig(
+            pitch_limit_high_bucket_transfer=0.2699789638878243,
+            pitch_limit_transfer_to_under_five=0.6548166999884969,
+        )
+        eligible_outs = (12,) * 70 + (16,) * 41 + (18,) * 13
+
+        workload = forecast_pitcher(
+            _starter_pitcher(
+                eligible_outs=eligible_outs,
+                prior_outs=(12, 16, 18),
+                pitch_limit=80,
+            ),
+            config,
+        ).workload
+
+        self.assertEqual(
+            tuple(len(support) for support in workload.supports),
+            (71, 42, 14),
+        )
+        probabilities = workload.bucket_probabilities
+        complement = 0.5785434195180372
+        self.assertEqual(
+            probabilities,
+            (
+                math.nextafter(complement, math.inf),
+                0.34098182059558113,
+                0.08047475988638157,
+            ),
+        )
+        self.assertEqual(math.fsum(probabilities), 1.0)
+
     def test_sample_outs_is_seeded_supported_and_skips_zero_probability_high(self):
         workload = forecast_pitcher(
             _starter_pitcher(
