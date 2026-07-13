@@ -143,6 +143,19 @@ def opener_bulk_chain(**overrides: object) -> PitcherChainInput:
     return PitcherChainInput(**values)
 
 
+def chain_with_roles(*roles: PitcherRole) -> PitcherChainInput:
+    role_pitchers = tuple(
+        pitcher(f"pitcher:role-{index}", role)
+        for index, role in enumerate(roles, start=1)
+    )
+    return opener_bulk_chain(
+        pitchers=role_pitchers,
+        official_pitcher_id=role_pitchers[0].pitcher_id,
+        rotowire_pitcher_id=role_pitchers[-1].pitcher_id,
+        matchup_pitcher_id=role_pitchers[-1].pitcher_id,
+    )
+
+
 def lineup_slot(order: int, *, batter_id: str | None = None) -> LineupSlot:
     resolved_id = batter_id or f"batter:{order}"
     return LineupSlot(
@@ -526,6 +539,45 @@ def test_pitcher_chain_rejects_duplicate_pitcher_ids() -> None:
 
     with pytest.raises(ValueError, match="unique pitcher_id"):
         opener_bulk_chain(pitchers=(duplicate, duplicate))
+
+
+def test_multi_pitcher_chain_rejects_reversed_bulk_opener_roles() -> None:
+    with pytest.raises(ValueError, match="first pitcher role must be opener"):
+        chain_with_roles(PitcherRole.BULK, PitcherRole.OPENER)
+
+
+def test_multi_pitcher_chain_rejects_opener_then_starter() -> None:
+    with pytest.raises(ValueError, match="later pitcher roles must be bulk or prim"):
+        chain_with_roles(PitcherRole.OPENER, PitcherRole.STARTER)
+
+
+def test_multi_pitcher_chain_rejects_multi_starter_roles() -> None:
+    with pytest.raises(ValueError, match="first pitcher role must be opener"):
+        chain_with_roles(PitcherRole.STARTER, PitcherRole.STARTER)
+
+
+@pytest.mark.parametrize("duplicate_role", [PitcherRole.BULK, PitcherRole.PRIM])
+def test_multi_pitcher_chain_rejects_duplicate_later_roles(
+    duplicate_role: PitcherRole,
+) -> None:
+    with pytest.raises(ValueError, match="later pitcher roles must be distinct"):
+        chain_with_roles(PitcherRole.OPENER, duplicate_role, duplicate_role)
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        (PitcherRole.OPENER, PitcherRole.BULK),
+        (PitcherRole.OPENER, PitcherRole.PRIM),
+        (PitcherRole.OPENER, PitcherRole.BULK, PitcherRole.PRIM),
+    ],
+)
+def test_multi_pitcher_chain_accepts_legal_role_sequences(
+    roles: tuple[PitcherRole, ...],
+) -> None:
+    chain = chain_with_roles(*roles)
+
+    assert tuple(pitcher_input.role for pitcher_input in chain.pitchers) == roles
 
 
 @pytest.mark.parametrize(

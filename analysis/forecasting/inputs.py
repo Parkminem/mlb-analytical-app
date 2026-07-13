@@ -492,11 +492,18 @@ class PitcherChainInput:
         if self.combined_pitch_limit is not None and self.combined_pitch_limit.value < 0:
             raise ValueError("combined_pitch_limit must be nonnegative")
 
-        special_roles = {PitcherRole.OPENER, PitcherRole.BULK, PitcherRole.PRIM}
-        is_multi_pitcher_special_chain = len(self.pitchers) > 1 and any(
-            pitcher.role in special_roles for pitcher in self.pitchers
-        )
-        if is_multi_pitcher_special_chain:
+        if len(self.pitchers) > 1:
+            roles = tuple(pitcher.role for pitcher in self.pitchers)
+            if roles[0] is not PitcherRole.OPENER:
+                raise ValueError("first pitcher role must be opener")
+            later_roles = roles[1:]
+            if any(
+                role not in {PitcherRole.BULK, PitcherRole.PRIM}
+                for role in later_roles
+            ):
+                raise ValueError("later pitcher roles must be bulk or prim")
+            if len(set(later_roles)) != len(later_roles):
+                raise ValueError("later pitcher roles must be distinct")
             if self.eligible_combined_workload is None:
                 raise ValueError(
                     "eligible_combined_workload is required for a multi-pitcher "
