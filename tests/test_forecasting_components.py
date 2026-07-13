@@ -8,6 +8,7 @@ import sys
 import unittest
 
 import analysis.forecasting.config as config_module
+import analysis.forecasting.offense as offense_module
 import analysis.forecasting.randomness as randomness_module
 import analysis.forecasting.starter as starter_module
 from analysis.forecasting.config import SimulationConfig
@@ -15,10 +16,15 @@ from analysis.forecasting.inputs import (
     BooleanFeature,
     FeatureProvenance,
     IntegerFeature,
+    LineupInput,
+    LineupSlot,
+    LineupState,
     NumericFeature,
     PitcherChainInput,
     PitcherInput,
     PitcherRole,
+    PitchUsage,
+    PitchVelocityResponse,
     StarterProjectionComponents,
     WorkloadHistory,
 )
@@ -27,6 +33,11 @@ from analysis.forecasting.randomness import (
     draw_bounded_lognormal,
     draw_gamma_poisson,
     weighted_choice,
+)
+from analysis.forecasting.offense import (
+    OffenseForecast,
+    SlotMatchupForecast,
+    forecast_offense,
 )
 from analysis.forecasting.starter import (
     PitcherChainForecast,
@@ -146,6 +157,154 @@ def _starter_projection_components():
         pitches_per_inning=_starter_numeric(16.0),
         recent_pitch_count=_starter_numeric(90.0),
         recent_workload_outs=_starter_numeric(16.0),
+    )
+
+
+def _offense_usage(
+    pitcher_id,
+    opposing_side="R",
+    pitch_type="FF",
+    usage=1.0,
+    average_velocity_mph=95.0,
+):
+    return PitchUsage(
+        pitcher_id=pitcher_id,
+        opposing_side=opposing_side,
+        pitch_type=pitch_type,
+        usage=usage,
+        average_velocity_mph=average_velocity_mph,
+        provenance=_starter_provenance(),
+    )
+
+
+def _offense_response(
+    order,
+    pitcher_id="pitcher:starter",
+    *,
+    expected_side="R",
+    pitch_type="FF",
+    velocity_center_mph=95.0,
+    band_width_mph=1.5,
+    plate_appearances=30,
+    adjusted_woba=0.320,
+    sample_strength="strong",
+    slot_label="중립",
+):
+    return PitchVelocityResponse(
+        batter_id=f"batter:{order}",
+        pitcher_id=pitcher_id,
+        expected_side=expected_side,
+        pitch_type=pitch_type,
+        velocity_center_mph=velocity_center_mph,
+        band_width_mph=band_width_mph,
+        plate_appearances=plate_appearances,
+        adjusted_woba=adjusted_woba,
+        sample_strength=sample_strength,
+        slot_label=slot_label,
+        provenance=_starter_provenance(),
+    )
+
+
+def _offense_slot(order, expected_side="R", responses=()):
+    return LineupSlot(
+        order=order,
+        batter_id=f"batter:{order}",
+        batter_name=f"Batter {order}",
+        bats=expected_side,
+        expected_side=expected_side,
+        responses=responses,
+    )
+
+
+def _offense_lineup(
+    *,
+    slots=None,
+    sides=("R", "L", "R", "L", "R", "L", "R", "L", "R"),
+    projected_runs_per_9=4.5,
+    projected_traffic_per_9=11.5,
+    projected_extra_base_hits_per_9=2.4,
+    walk_rate=0.08,
+    strikeout_rate=0.22,
+    isolated_power=0.16,
+    barrel_rate=0.08,
+    recent_form_index=1.0,
+    lower_order_continuity=1.0,
+    log_standard_error=0.08,
+    recent_form_included=True,
+):
+    resolved_slots = slots or tuple(
+        _offense_slot(order, sides[order - 1])
+        for order in range(1, 10)
+    )
+    return LineupInput(
+        team="SEA",
+        state=LineupState.CONFIRMED,
+        state_provenance=_starter_provenance(),
+        slots=resolved_slots,
+        projected_runs_per_9=_starter_numeric(projected_runs_per_9),
+        projected_traffic_per_9=_starter_numeric(projected_traffic_per_9),
+        projected_extra_base_hits_per_9=_starter_numeric(
+            projected_extra_base_hits_per_9
+        ),
+        walk_rate=_starter_numeric(walk_rate),
+        strikeout_rate=_starter_numeric(strikeout_rate),
+        isolated_power=_starter_numeric(isolated_power),
+        barrel_rate=_starter_numeric(barrel_rate),
+        recent_form_index=_starter_numeric(recent_form_index),
+        lower_order_continuity=_starter_numeric(lower_order_continuity),
+        log_standard_error=_starter_numeric(log_standard_error),
+        recent_form_included=_starter_boolean(recent_form_included),
+    )
+
+
+def _offense_with_responses(lineup, responses_by_order):
+    return replace(
+        lineup,
+        slots=tuple(
+            replace(
+                slot,
+                responses=tuple(responses_by_order.get(slot.order, ())),
+            )
+            for slot in lineup.slots
+        ),
+    )
+
+
+def _offense_profile(pitcher_id="pitcher:starter", pitch_mix=None):
+    resolved_mix = pitch_mix
+    if resolved_mix is None:
+        resolved_mix = (
+            _offense_usage(pitcher_id, "R", "FF", 1.0, 95.0),
+            _offense_usage(pitcher_id, "L", "FF", 1.0, 95.0),
+        )
+    return replace(
+        _starter_pitcher(pitcher_id=pitcher_id),
+        pitch_mix=resolved_mix,
+    )
+
+
+def _offense_uniform_response_lineup(
+    pitcher_id,
+    *,
+    adjusted_woba=0.320,
+    slot_label="중립",
+    **lineup_overrides,
+):
+    lineup = _offense_lineup(**lineup_overrides)
+    return _offense_with_responses(
+        lineup,
+        {
+            slot.order: (
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    expected_side=slot.expected_side,
+                    adjusted_woba=adjusted_woba,
+                    slot_label=slot_label,
+                ),
+            )
+            for slot in lineup.slots
+        },
     )
 
 
@@ -758,7 +917,12 @@ class ForecastRandomnessTests(unittest.TestCase):
                     central_interval((1.0, 2.0), mass=mass)
 
     def test_modules_use_only_standard_library_dependencies(self):
-        for module in (config_module, randomness_module, starter_module):
+        for module in (
+            config_module,
+            offense_module,
+            randomness_module,
+            starter_module,
+        ):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
             imported_roots = {
                 alias.name.split(".", 1)[0]
@@ -1661,6 +1825,853 @@ class StarterForecastTests(unittest.TestCase):
             with self.subTest(result_type=type(value).__name__, changes=changes):
                 with self.assertRaises(ValueError):
                     replace(value, **changes)
+
+
+class OffenseForecastTests(unittest.TestCase):
+    def test_all_slots_for_each_profile_are_sorted_by_order_then_profile(self):
+        opener = _offense_profile("pitcher:opener")
+        bulk = _offense_profile("pitcher:bulk")
+        ascending = _offense_lineup()
+        lineup = replace(ascending, slots=tuple(reversed(ascending.slots)))
+
+        forecast = forecast_offense(lineup, (opener, bulk), SimulationConfig())
+
+        expected_pairs = tuple(
+            (order, pitcher_id)
+            for order in range(1, 10)
+            for pitcher_id in (opener.pitcher_id, bulk.pitcher_id)
+        )
+        self.assertEqual(len(forecast.slot_forecasts), 18)
+        self.assertEqual(
+            tuple(
+                (slot.order, slot.pitcher_id)
+                for slot in forecast.slot_forecasts
+            ),
+            expected_pairs,
+        )
+        expected_sides = {
+            slot.order: slot.expected_side for slot in ascending.slots
+        }
+        self.assertEqual(
+            tuple(slot.expected_side for slot in forecast.slot_forecasts),
+            tuple(
+                expected_sides[order]
+                for order in range(1, 10)
+                for _ in range(2)
+            ),
+        )
+        for pitcher in (opener, bulk):
+            diagnostics = forecast.slot_forecasts_for(pitcher.pitcher_id)
+            self.assertEqual(len(diagnostics), 9)
+            self.assertEqual(tuple(slot.order for slot in diagnostics), tuple(range(1, 10)))
+
+    def test_only_expected_side_pitch_mix_is_evaluated(self):
+        pitcher_id = "pitcher:lefty"
+        profile = _offense_profile(
+            pitcher_id,
+            (
+                _offense_usage(pitcher_id, "R", "FF", 0.6, 94.5),
+                _offense_usage(pitcher_id, "R", "CH", 0.4, 86.0),
+                _offense_usage(pitcher_id, "L", "SL", 0.7, 84.0),
+                _offense_usage(pitcher_id, "L", "SI", 0.3, 93.0),
+            ),
+        )
+
+        forecast = forecast_offense(
+            _offense_lineup(),
+            (profile,),
+            SimulationConfig(),
+        )
+        by_order = {
+            slot.order: slot for slot in forecast.slot_forecasts_for(pitcher_id)
+        }
+
+        self.assertEqual(by_order[1].expected_side, "R")
+        self.assertEqual(by_order[1].evaluated_pitch_types, ("FF", "CH"))
+        self.assertEqual(set(by_order[1].average_velocities_mph), {"FF", "CH"})
+        self.assertEqual(by_order[2].expected_side, "L")
+        self.assertEqual(by_order[2].evaluated_pitch_types, ("SL", "SI"))
+        self.assertEqual(set(by_order[2].average_velocities_mph), {"SL", "SI"})
+
+    def test_exact_band_precedes_fallback_regardless_of_pa_or_delta(self):
+        pitcher_id = "pitcher:starter"
+        lineup = _offense_with_responses(
+            _offense_lineup(),
+            {
+                1: (
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=96.4,
+                        band_width_mph=1.5,
+                        plate_appearances=5,
+                        adjusted_woba=0.341,
+                        slot_label="플러스",
+                    ),
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=95.0,
+                        band_width_mph=3.0,
+                        plate_appearances=999,
+                        adjusted_woba=0.111,
+                        slot_label="마이너스",
+                    ),
+                ),
+            },
+        )
+
+        slot = forecast_offense(
+            lineup,
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        ).slot_forecasts[0]
+
+        self.assertEqual(slot.selected_band_widths["FF"], 1.5)
+        self.assertAlmostEqual(slot.velocity_deltas_mph["FF"], 1.4)
+        self.assertEqual(slot.plate_appearances["FF"], 5)
+        self.assertEqual(slot.adjusted_wobas["FF"], 0.341)
+        self.assertEqual(slot.labels, ("플러스",))
+
+    def test_nominal_exact_outside_band_uses_valid_fallback(self):
+        pitcher_id = "pitcher:starter"
+        lineup = _offense_with_responses(
+            _offense_lineup(),
+            {
+                1: (
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=96.500001,
+                        band_width_mph=1.5,
+                        adjusted_woba=0.600,
+                    ),
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=97.8,
+                        band_width_mph=3.0,
+                        plate_appearances=12,
+                        adjusted_woba=0.355,
+                        slot_label="플러스",
+                    ),
+                ),
+            },
+        )
+
+        slot = forecast_offense(
+            lineup,
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        ).slot_forecasts[0]
+
+        self.assertEqual(slot.selected_band_widths["FF"], 3.0)
+        self.assertAlmostEqual(slot.velocity_deltas_mph["FF"], 2.8)
+        self.assertEqual(slot.adjusted_wobas["FF"], 0.355)
+        self.assertEqual(slot.labels, ("플러스",))
+
+    def test_candidates_outside_both_bands_are_neutral_unknown(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig()
+        lineup = _offense_with_responses(
+            _offense_lineup(),
+            {
+                1: (
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=96.500001,
+                        band_width_mph=1.5,
+                        adjusted_woba=0.900,
+                    ),
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        velocity_center_mph=98.000001,
+                        band_width_mph=3.0,
+                        adjusted_woba=0.900,
+                    ),
+                ),
+            },
+        )
+
+        slot = forecast_offense(
+            lineup,
+            (_offense_profile(pitcher_id),),
+            config,
+        ).slot_forecasts[0]
+
+        self.assertIsNone(slot.selected_band_widths["FF"])
+        self.assertIsNone(slot.velocity_deltas_mph["FF"])
+        self.assertEqual(slot.plate_appearances["FF"], 0)
+        self.assertEqual(slot.adjusted_wobas["FF"], config.league_woba)
+        self.assertEqual(slot.labels, ("표본 부족",))
+        self.assertIsNone(slot.sample_strengths["FF"])
+        self.assertEqual(slot.unknown_exposure, 1.0)
+
+    def test_candidate_ties_use_delta_then_pa_then_stable_fields(self):
+        pitcher_id = "pitcher:starter"
+        profile = _offense_profile(
+            pitcher_id,
+            (
+                _offense_usage(pitcher_id, "R", "FF", 1 / 3, 95.0),
+                _offense_usage(pitcher_id, "R", "CH", 1 / 3, 85.0),
+                _offense_usage(pitcher_id, "R", "SL", 1 / 3, 85.0),
+            ),
+        )
+        responses = (
+            _offense_response(1, pitcher_id, pitch_type="FF", velocity_center_mph=95.2, plate_appearances=4, adjusted_woba=0.331),
+            _offense_response(1, pitcher_id, pitch_type="FF", velocity_center_mph=95.4, plate_appearances=100, adjusted_woba=0.399),
+            _offense_response(1, pitcher_id, pitch_type="CH", velocity_center_mph=84.5, plate_appearances=5, adjusted_woba=0.300),
+            _offense_response(1, pitcher_id, pitch_type="CH", velocity_center_mph=85.5, plate_appearances=20, adjusted_woba=0.350),
+            _offense_response(1, pitcher_id, pitch_type="SL", velocity_center_mph=86.0, plate_appearances=10, adjusted_woba=0.370),
+            _offense_response(1, pitcher_id, pitch_type="SL", velocity_center_mph=84.0, plate_appearances=10, adjusted_woba=0.290),
+        )
+        first_lineup = _offense_with_responses(_offense_lineup(), {1: responses})
+        reversed_lineup = _offense_with_responses(
+            _offense_lineup(),
+            {1: tuple(reversed(responses))},
+        )
+
+        first = forecast_offense(first_lineup, (profile,), SimulationConfig()).slot_forecasts[0]
+        reversed_result = forecast_offense(
+            reversed_lineup,
+            (profile,),
+            SimulationConfig(),
+        ).slot_forecasts[0]
+
+        self.assertEqual(first.adjusted_wobas["FF"], 0.331)
+        self.assertEqual(first.plate_appearances["CH"], 20)
+        self.assertEqual(first.adjusted_wobas["CH"], 0.350)
+        self.assertEqual(first.adjusted_wobas["SL"], 0.290)
+        self.assertEqual(first, reversed_result)
+
+    def test_usage_normalization_excludes_zero_and_zero_or_no_side_is_unknown(self):
+        config = SimulationConfig()
+        pitcher_id = "pitcher:normalized"
+        normalized = _offense_profile(
+            pitcher_id,
+            (
+                _offense_usage(pitcher_id, "R", "FF", 0.2, 95.0),
+                _offense_usage(pitcher_id, "R", "CH", 0.3, 85.0),
+                _offense_usage(pitcher_id, "R", "SL", 0.0, 84.0),
+            ),
+        )
+        zero_id = "pitcher:zero"
+        all_zero = _offense_profile(
+            zero_id,
+            (_offense_usage(zero_id, "R", "FF", 0.0, 95.0),),
+        )
+        no_side_id = "pitcher:no-side"
+        no_side = _offense_profile(
+            no_side_id,
+            (_offense_usage(no_side_id, "L", "FF", 1.0, 95.0),),
+        )
+        lineup = _offense_with_responses(
+            _offense_lineup(),
+            {
+                1: (
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        adjusted_woba=0.400,
+                        slot_label="플러스",
+                    ),
+                ),
+            },
+        )
+
+        forecast = forecast_offense(
+            lineup,
+            (normalized, all_zero, no_side),
+            config,
+        )
+        normalized_slot = forecast.slot_forecasts_for(pitcher_id)[0]
+        zero_slot = forecast.slot_forecasts_for(zero_id)[0]
+        no_side_slot = forecast.slot_forecasts_for(no_side_id)[0]
+
+        self.assertEqual(normalized_slot.evaluated_pitch_types, ("FF", "CH"))
+        self.assertEqual(
+            normalized_slot.normalized_pitch_usages,
+            {"FF": 0.4, "CH": 0.6},
+        )
+        self.assertEqual(
+            math.fsum(normalized_slot.normalized_pitch_usages.values()),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            normalized_slot.exposure_weighted_adjusted_woba,
+            0.4 * 0.400 + 0.6 * config.league_woba,
+        )
+        self.assertEqual(normalized_slot.unknown_exposure, 0.6)
+        for neutral_slot in (zero_slot, no_side_slot):
+            self.assertEqual(neutral_slot.evaluated_pitch_types, ())
+            self.assertEqual(neutral_slot.normalized_pitch_usages, {})
+            self.assertEqual(neutral_slot.exposure_weighted_adjusted_woba, config.league_woba)
+            self.assertEqual(neutral_slot.unknown_exposure, 1.0)
+            self.assertEqual(neutral_slot.labels, ("표본 부족",))
+
+    def test_all_pa_weights_apply_by_batting_order_not_input_position(self):
+        pitcher_id = "pitcher:starter"
+        raw_weights = (9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+        config = SimulationConfig(
+            pa_weights=raw_weights,
+            matchup_bounds=(0.10, 2.0),
+        )
+        ascending = _offense_lineup()
+        responses = {
+            slot.order: (
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    expected_side=slot.expected_side,
+                    adjusted_woba=0.25 + slot.order * 0.01,
+                ),
+            )
+            for slot in ascending.slots
+        }
+        lineup = _offense_with_responses(ascending, responses)
+        lineup = replace(lineup, slots=tuple(reversed(lineup.slots)))
+
+        forecast = forecast_offense(
+            lineup,
+            (_offense_profile(pitcher_id),),
+            config,
+        )
+        expected_woba = math.fsum(
+            raw_weights[order - 1] * (0.25 + order * 0.01)
+            for order in range(1, 10)
+        ) / math.fsum(raw_weights)
+
+        self.assertAlmostEqual(
+            forecast.matchup_multipliers[pitcher_id],
+            expected_woba / config.league_woba,
+        )
+        self.assertEqual(
+            tuple(slot.order for slot in forecast.slot_forecasts),
+            tuple(range(1, 10)),
+        )
+
+    def test_missing_sample_is_neutral_and_only_widens_sigma_exactly(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig()
+        profile = _offense_profile(
+            pitcher_id,
+            tuple(
+                usage
+                for side in ("R", "L")
+                for usage in (
+                    _offense_usage(pitcher_id, side, "FF", 0.25, 95.0),
+                    _offense_usage(pitcher_id, side, "CH", 0.75, 85.0),
+                )
+            ),
+        )
+        base = _offense_lineup(log_standard_error=0.09)
+        missing_responses = {
+            slot.order: (
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    expected_side=slot.expected_side,
+                    pitch_type="FF",
+                    adjusted_woba=config.league_woba,
+                ),
+            )
+            for slot in base.slots
+        }
+        complete_responses = {
+            slot.order: missing_responses[slot.order]
+            + (
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    expected_side=slot.expected_side,
+                    pitch_type="CH",
+                    velocity_center_mph=85.0,
+                    adjusted_woba=config.league_woba,
+                ),
+            )
+            for slot in base.slots
+        }
+
+        missing = forecast_offense(
+            _offense_with_responses(base, missing_responses),
+            (profile,),
+            config,
+        )
+        complete = forecast_offense(
+            _offense_with_responses(base, complete_responses),
+            (profile,),
+            config,
+        )
+
+        self.assertEqual(missing.matchup_multipliers[pitcher_id], 1.0)
+        self.assertEqual(complete.matchup_multipliers[pitcher_id], 1.0)
+        self.assertEqual(missing.matchup_unknown_exposures[pitcher_id], 0.75)
+        self.assertEqual(complete.matchup_unknown_exposures[pitcher_id], 0.0)
+        self.assertAlmostEqual(
+            missing.matchup_log_standard_errors[pitcher_id],
+            math.hypot(0.09, 0.75 * config.sample_shortage_log_se_penalty),
+        )
+        self.assertEqual(complete.matchup_log_standard_errors[pitcher_id], 0.09)
+        self.assertGreater(missing.log_standard_error, complete.log_standard_error)
+
+    def test_selected_values_and_fixed_labels_are_carried_without_reshrinking(self):
+        pitcher_id = "pitcher:starter"
+        pitches = ("FF", "CH", "SL", "SI")
+        velocities = (95.0, 85.0, 84.0, 93.0)
+        wobas = (0.111, 0.222, 0.333, 0.444)
+        labels = ("플러스", "중립", "마이너스", "표본 부족")
+        strengths = ("s1", "s2", "s3", "s4")
+        profile = _offense_profile(
+            pitcher_id,
+            tuple(
+                _offense_usage(pitcher_id, "R", pitch, 0.25, velocity)
+                for pitch, velocity in zip(pitches, velocities)
+            ),
+        )
+        lineup = _offense_with_responses(
+            _offense_lineup(),
+            {
+                1: tuple(
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        pitch_type=pitch,
+                        velocity_center_mph=velocity,
+                        plate_appearances=index,
+                        adjusted_woba=woba,
+                        sample_strength=strength,
+                        slot_label=label,
+                    )
+                    for index, (pitch, velocity, woba, strength, label) in enumerate(
+                        zip(pitches, velocities, wobas, strengths, labels),
+                        start=11,
+                    )
+                ),
+            },
+        )
+
+        slot = forecast_offense(lineup, (profile,), SimulationConfig()).slot_forecasts[0]
+
+        self.assertEqual(slot.adjusted_wobas, dict(zip(pitches, wobas)))
+        self.assertEqual(slot.labels, labels)
+        self.assertEqual(slot.sample_strengths, dict(zip(pitches, strengths)))
+        self.assertEqual(slot.plate_appearances, dict(zip(pitches, range(11, 15))))
+        self.assertAlmostEqual(
+            slot.exposure_weighted_adjusted_woba,
+            math.fsum(wobas) / len(wobas),
+        )
+        self.assertEqual(slot.unknown_exposure, 0.0)
+
+    def test_base_and_matchup_multipliers_clip_high_and_low(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig()
+        cases = (
+            (0.001, 0.001, config.offense_bounds[0], config.matchup_bounds[0]),
+            (100.0, 0.999, config.offense_bounds[1], config.matchup_bounds[1]),
+        )
+
+        for projected_runs, woba, expected_base, expected_matchup in cases:
+            with self.subTest(projected_runs=projected_runs, woba=woba):
+                lineup = _offense_uniform_response_lineup(
+                    pitcher_id,
+                    projected_runs_per_9=projected_runs,
+                    adjusted_woba=woba,
+                )
+                forecast = forecast_offense(
+                    lineup,
+                    (_offense_profile(pitcher_id),),
+                    config,
+                )
+                self.assertEqual(forecast.base_offense_multiplier, expected_base)
+                self.assertEqual(
+                    forecast.matchup_multipliers[pitcher_id],
+                    expected_matchup,
+                )
+
+    def test_forecast_rejects_wrong_types_and_invalid_numeric_domains(self):
+        profile = _offense_profile()
+        config = SimulationConfig()
+        wrong_calls = (
+            lambda: forecast_offense(None, (profile,), config),
+            lambda: forecast_offense(_offense_lineup(), [profile], config),
+            lambda: forecast_offense(_offense_lineup(), (object(),), config),
+            lambda: forecast_offense(_offense_lineup(), (profile,), object()),
+        )
+        for call in wrong_calls:
+            with self.subTest(call=call):
+                with self.assertRaises(TypeError):
+                    call()
+        with self.assertRaisesRegex(ValueError, "opposing_profiles.*nonempty"):
+            forecast_offense(_offense_lineup(), (), config)
+
+        invalid_lineup_values = (
+            ("projected_runs_per_9", 0.0),
+            ("projected_runs_per_9", -0.1),
+            ("projected_traffic_per_9", -0.1),
+            ("projected_extra_base_hits_per_9", -0.1),
+            ("log_standard_error", -0.1),
+            ("projected_runs_per_9", math.nan),
+            ("projected_traffic_per_9", math.inf),
+            ("projected_extra_base_hits_per_9", -math.inf),
+            ("log_standard_error", math.nan),
+        )
+        for field_name, value in invalid_lineup_values:
+            with self.subTest(field_name=field_name, value=value):
+                lineup = _offense_lineup()
+                object.__setattr__(getattr(lineup, field_name), "value", value)
+                with self.assertRaisesRegex(ValueError, field_name):
+                    forecast_offense(lineup, (profile,), config)
+
+        for adjusted_woba in (-0.1, math.nan, math.inf):
+            with self.subTest(adjusted_woba=adjusted_woba):
+                response = _offense_response(1, profile.pitcher_id)
+                object.__setattr__(response, "adjusted_woba", adjusted_woba)
+                lineup = _offense_with_responses(
+                    _offense_lineup(),
+                    {1: (response,)},
+                )
+                with self.assertRaisesRegex(ValueError, "adjusted_woba"):
+                    forecast_offense(lineup, (profile,), config)
+
+    def test_multiple_profiles_keep_independent_points_sigmas_and_diagnostics(self):
+        first_id = "pitcher:first"
+        second_id = "pitcher:second"
+        first = _offense_profile(first_id)
+        second = _offense_profile(
+            second_id,
+            tuple(
+                usage
+                for side in ("R", "L")
+                for usage in (
+                    _offense_usage(second_id, side, "FF", 0.5, 95.0),
+                    _offense_usage(second_id, side, "CH", 0.5, 85.0),
+                )
+            ),
+        )
+        base = _offense_lineup(log_standard_error=0.10)
+        lineup = _offense_with_responses(
+            base,
+            {
+                slot.order: (
+                    _offense_response(
+                        slot.order,
+                        first_id,
+                        expected_side=slot.expected_side,
+                        adjusted_woba=0.400,
+                        slot_label="플러스",
+                    ),
+                    _offense_response(
+                        slot.order,
+                        second_id,
+                        expected_side=slot.expected_side,
+                        adjusted_woba=0.320,
+                    ),
+                )
+                for slot in base.slots
+            },
+        )
+        config = SimulationConfig(matchup_bounds=(0.5, 1.5))
+
+        forecast = forecast_offense(lineup, (first, second), config)
+
+        self.assertEqual(forecast.matchup_multipliers[first_id], 1.25)
+        self.assertEqual(forecast.matchup_multipliers[second_id], 1.0)
+        self.assertEqual(forecast.matchup_unknown_exposures[first_id], 0.0)
+        self.assertEqual(forecast.matchup_unknown_exposures[second_id], 0.5)
+        self.assertEqual(forecast.matchup_log_standard_errors[first_id], 0.10)
+        self.assertAlmostEqual(
+            forecast.matchup_log_standard_errors[second_id],
+            math.hypot(0.10, 0.5 * config.sample_shortage_log_se_penalty),
+        )
+        self.assertEqual(len(forecast.slot_forecasts_for(first_id)), 9)
+        self.assertEqual(len(forecast.slot_forecasts_for(second_id)), 9)
+        self.assertEqual(set(forecast.matchup_multipliers), {first_id, second_id})
+        self.assertEqual(set(forecast.matchup_log_standard_errors), {first_id, second_id})
+
+    def test_unknown_bullpen_is_neutral_and_adds_penalty_in_quadrature(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig()
+        forecast = forecast_offense(
+            _offense_uniform_response_lineup(
+                pitcher_id,
+                adjusted_woba=0.400,
+                log_standard_error=0.11,
+            ),
+            (_offense_profile(pitcher_id),),
+            config,
+        )
+
+        self.assertNotEqual(forecast.multiplier_for(pitcher_id), 1.0)
+        self.assertEqual(forecast.multiplier_for("bullpen:unknown"), 1.0)
+        self.assertEqual(
+            forecast.log_standard_error_for(pitcher_id),
+            forecast.matchup_log_standard_errors[pitcher_id],
+        )
+        self.assertAlmostEqual(
+            forecast.log_standard_error_for("bullpen:unknown"),
+            math.hypot(
+                forecast.log_standard_error,
+                config.unknown_bullpen_matchup_log_se_penalty,
+            ),
+        )
+        self.assertEqual(forecast.slot_forecasts_for("bullpen:unknown"), ())
+
+    def test_preblended_component_fields_are_not_multiplied_again(self):
+        pitcher_id = "pitcher:starter"
+        baseline = _offense_uniform_response_lineup(pitcher_id)
+        altered = _offense_uniform_response_lineup(
+            pitcher_id,
+            walk_rate=0.99,
+            strikeout_rate=0.01,
+            isolated_power=0.88,
+            barrel_rate=0.77,
+            recent_form_index=4.0,
+            lower_order_continuity=0.01,
+            recent_form_included=False,
+        )
+        profile = _offense_profile(pitcher_id)
+
+        first = forecast_offense(baseline, (profile,), SimulationConfig())
+        second = forecast_offense(altered, (profile,), SimulationConfig())
+
+        self.assertEqual(first, second)
+        result_fields = {field.name for field in fields(OffenseForecast)}
+        self.assertNotIn("recent_form_multiplier", result_fields)
+        self.assertFalse(hasattr(first, "recent_form_multiplier"))
+
+    def test_result_mappings_are_defensively_immutable_and_instances_frozen(self):
+        pitcher_id = "pitcher:starter"
+        result = forecast_offense(
+            _offense_uniform_response_lineup(pitcher_id),
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        )
+        slot = result.slot_forecasts[0]
+
+        for field_name in (
+            "normalized_pitch_usages",
+            "average_velocities_mph",
+            "selected_band_widths",
+            "velocity_deltas_mph",
+            "plate_appearances",
+            "adjusted_wobas",
+            "sample_strengths",
+        ):
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(TypeError):
+                    getattr(slot, field_name)["FF"] = None
+        for field_name in (
+            "matchup_multipliers",
+            "matchup_log_standard_errors",
+            "matchup_unknown_exposures",
+        ):
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(TypeError):
+                    getattr(result, field_name)[pitcher_id] = 99.0
+
+        usages = dict(slot.normalized_pitch_usages)
+        direct_slot = replace(slot, normalized_pitch_usages=usages)
+        usages["FF"] = 0.5
+        self.assertEqual(direct_slot.normalized_pitch_usages["FF"], 1.0)
+
+        multipliers = dict(result.matchup_multipliers)
+        direct_result = replace(result, matchup_multipliers=multipliers)
+        multipliers[pitcher_id] = 99.0
+        self.assertEqual(direct_result.matchup_multipliers[pitcher_id], 1.0)
+
+        with self.assertRaises(FrozenInstanceError):
+            direct_slot.order = 2
+        with self.assertRaises(FrozenInstanceError):
+            direct_result.base_offense_multiplier = 2.0
+
+    def test_direct_result_constructors_reject_invalid_invariants(self):
+        pitcher_id = "pitcher:starter"
+        result = forecast_offense(
+            _offense_uniform_response_lineup(pitcher_id),
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        )
+        slot = result.slot_forecasts[0]
+        invalid_slot_changes = (
+            {"order": 0},
+            {"expected_side": "S"},
+            {"evaluated_pitch_types": ("FF", "FF")},
+            {"normalized_pitch_usages": {}},
+            {"average_velocities_mph": {}},
+            {"selected_band_widths": {"FF": 2.0}},
+            {"velocity_deltas_mph": {"FF": -0.1}},
+            {"plate_appearances": {"FF": -1}},
+            {"adjusted_wobas": {"FF": -0.1}},
+            {"adjusted_wobas": {"FF": math.nan}},
+            {"labels": ()},
+            {"labels": ("invented",)},
+            {"sample_strengths": {"FF": ""}},
+            {"exposure_weighted_adjusted_woba": math.inf},
+            {"unknown_exposure": 1.1},
+        )
+        for changes in invalid_slot_changes:
+            with self.subTest(slot_changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(slot, **changes)
+
+        duplicate_slots = list(result.slot_forecasts)
+        duplicate_slots[1] = duplicate_slots[0]
+        duplicate_batters = list(result.slot_forecasts)
+        duplicate_batters[1] = replace(
+            duplicate_batters[1],
+            batter_id=duplicate_batters[0].batter_id,
+        )
+        invalid_result_changes = (
+            {"base_offense_multiplier": 0.0},
+            {"base_offense_multiplier": math.nan},
+            {"matchup_multipliers": {}},
+            {"matchup_multipliers": {pitcher_id: 0.0}},
+            {"matchup_log_standard_errors": {}},
+            {"matchup_log_standard_errors": {pitcher_id: -0.1}},
+            {"matchup_unknown_exposures": {}},
+            {"matchup_unknown_exposures": {pitcher_id: 1.1}},
+            {"projected_traffic_per_9": -0.1},
+            {"projected_extra_base_hits_per_9": math.inf},
+            {"log_standard_error": -0.1},
+            {"log_standard_error": 0.01},
+            {"slot_forecasts": list(result.slot_forecasts)},
+            {"slot_forecasts": tuple(duplicate_slots)},
+            {"slot_forecasts": tuple(duplicate_batters)},
+            {"slot_forecasts": result.slot_forecasts[:-1]},
+            {"unknown_bullpen_matchup_log_se_penalty": -0.1},
+        )
+        for changes in invalid_result_changes:
+            with self.subTest(result_changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(result, **changes)
+
+    def test_duplicate_profiles_and_duplicate_side_pitch_usage_are_rejected(self):
+        profile = _offense_profile()
+        with self.assertRaisesRegex(ValueError, "unique pitcher_id"):
+            forecast_offense(
+                _offense_lineup(),
+                (profile, profile),
+                SimulationConfig(),
+            )
+
+        pitcher_id = "pitcher:duplicate-mix"
+        duplicate_mix = _offense_profile(
+            pitcher_id,
+            (
+                _offense_usage(pitcher_id, "R", "FF", 0.5, 95.0),
+                _offense_usage(pitcher_id, "R", "FF", 0.0, 96.0),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate pitch usage"):
+            forecast_offense(
+                _offense_lineup(),
+                (duplicate_mix,),
+                SimulationConfig(),
+            )
+
+    def test_output_is_deterministic_and_profile_order_only_changes_diagnostics(self):
+        first_id = "pitcher:first"
+        second_id = "pitcher:second"
+        profiles = (_offense_profile(first_id), _offense_profile(second_id))
+        base = _offense_lineup()
+        lineup = _offense_with_responses(
+            base,
+            {
+                slot.order: (
+                    _offense_response(
+                        slot.order,
+                        first_id,
+                        expected_side=slot.expected_side,
+                        adjusted_woba=0.340,
+                    ),
+                    _offense_response(
+                        slot.order,
+                        second_id,
+                        expected_side=slot.expected_side,
+                        adjusted_woba=0.300,
+                    ),
+                )
+                for slot in base.slots
+            },
+        )
+        config = SimulationConfig()
+
+        first = forecast_offense(lineup, profiles, config)
+        repeat = forecast_offense(lineup, profiles, config)
+        reversed_profiles = forecast_offense(lineup, tuple(reversed(profiles)), config)
+
+        self.assertEqual(first, repeat)
+        self.assertEqual(first.matchup_multipliers, reversed_profiles.matchup_multipliers)
+        self.assertEqual(
+            first.matchup_log_standard_errors,
+            reversed_profiles.matchup_log_standard_errors,
+        )
+        self.assertEqual(
+            first.matchup_unknown_exposures,
+            reversed_profiles.matchup_unknown_exposures,
+        )
+        self.assertEqual(
+            tuple(
+                (slot.order, slot.pitcher_id)
+                for slot in reversed_profiles.slot_forecasts[:4]
+            ),
+            ((1, second_id), (1, first_id), (2, second_id), (2, first_id)),
+        )
+        for pitcher_id in (first_id, second_id):
+            self.assertEqual(
+                first.slot_forecasts_for(pitcher_id),
+                reversed_profiles.slot_forecasts_for(pitcher_id),
+            )
+
+    def test_responses_for_other_identity_dimensions_do_not_leak(self):
+        pitcher_id = "pitcher:starter"
+        profile = _offense_profile(
+            pitcher_id,
+            (_offense_usage(pitcher_id, "R", "FF", 1.0, 95.0),),
+        )
+        base = _offense_lineup(sides=("R",) * 9)
+        lineup = _offense_with_responses(
+            base,
+            {
+                1: (
+                    _offense_response(1, "pitcher:other", adjusted_woba=0.900),
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        expected_side="L",
+                        adjusted_woba=0.900,
+                    ),
+                    _offense_response(
+                        1,
+                        pitcher_id,
+                        pitch_type="CH",
+                        adjusted_woba=0.900,
+                    ),
+                ),
+                2: (
+                    _offense_response(
+                        2,
+                        pitcher_id,
+                        adjusted_woba=0.500,
+                        slot_label="플러스",
+                    ),
+                ),
+            },
+        )
+
+        diagnostics = forecast_offense(
+            lineup,
+            (profile,),
+            SimulationConfig(),
+        ).slot_forecasts_for(pitcher_id)
+
+        self.assertEqual(diagnostics[0].adjusted_wobas["FF"], 0.320)
+        self.assertEqual(diagnostics[0].unknown_exposure, 1.0)
+        self.assertEqual(diagnostics[0].labels, ("표본 부족",))
+        self.assertEqual(diagnostics[1].adjusted_wobas["FF"], 0.500)
+        self.assertEqual(diagnostics[1].unknown_exposure, 0.0)
 
 
 if __name__ == "__main__":
