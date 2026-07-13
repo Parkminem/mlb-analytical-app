@@ -2290,6 +2290,22 @@ class OffenseForecastTests(unittest.TestCase):
                     expected_matchup,
                 )
 
+    def test_traffic_and_extra_base_hit_projections_are_carried_exactly(self):
+        pitcher_id = "pitcher:starter"
+        lineup = _offense_lineup(
+            projected_traffic_per_9=13.75,
+            projected_extra_base_hits_per_9=3.125,
+        )
+
+        forecast = forecast_offense(
+            lineup,
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        )
+
+        self.assertEqual(forecast.projected_traffic_per_9, 13.75)
+        self.assertEqual(forecast.projected_extra_base_hits_per_9, 3.125)
+
     def test_forecast_rejects_wrong_types_and_invalid_numeric_domains(self):
         profile = _offense_profile()
         config = SimulationConfig()
