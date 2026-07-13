@@ -283,6 +283,8 @@ class LineupSlot:
         _require_nonempty_string(self.batter_name, "batter_name")
         _require_side(self.bats, _BATTING_SIDES, "bats")
         _require_side(self.expected_side, _EXPECTED_SIDES, "expected_side")
+        if self.bats in _EXPECTED_SIDES and self.expected_side != self.bats:
+            raise ValueError("expected_side must match bats for R/L batters")
         _require_tuple_of(self.responses, PitchVelocityResponse, "responses")
         for response in self.responses:
             if response.batter_id != self.batter_id:
@@ -320,6 +322,9 @@ class LineupInput:
             raise ValueError("lineup must contain exactly nine slots")
         if {slot.order for slot in self.slots} != set(range(1, 10)):
             raise ValueError("lineup order values must be unique and cover 1 through 9")
+        batter_ids = tuple(slot.batter_id for slot in self.slots)
+        if len(set(batter_ids)) != len(batter_ids):
+            raise ValueError("lineup slots must have unique batter_id values")
         numeric_fields = (
             "projected_runs_per_9",
             "projected_traffic_per_9",
@@ -504,6 +509,15 @@ class PitcherChainInput:
                 raise ValueError("later pitcher roles must be bulk or prim")
             if len(set(later_roles)) != len(later_roles):
                 raise ValueError("later pitcher roles must be distinct")
+            matchup_pitcher = next(
+                pitcher
+                for pitcher in self.pitchers
+                if pitcher.pitcher_id == self.matchup_pitcher_id
+            )
+            if matchup_pitcher.role not in {PitcherRole.BULK, PitcherRole.PRIM}:
+                raise ValueError(
+                    "matchup_pitcher_id must reference a bulk or prim pitcher"
+                )
             if self.eligible_combined_workload is None:
                 raise ValueError(
                     "eligible_combined_workload is required for a multi-pitcher "
