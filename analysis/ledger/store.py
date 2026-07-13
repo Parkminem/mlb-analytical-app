@@ -313,17 +313,35 @@ class LedgerStore:
     """A JSONL ledger whose file is the sole authoritative state."""
 
     def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
+        self.path = Path(path).resolve(strict=False)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._reject_existing_hard_links()
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(descriptor)
 
+    @staticmethod
+    def _reject_hard_links(link_count: int) -> None:
+        if link_count > 1:
+            raise LedgerCorruptionError(
+                "ledger file has multiple hard links; path aliases are unsafe"
+            )
+
+    def _reject_existing_hard_links(self) -> None:
+        try:
+            link_count = self.path.stat().st_nlink
+        except FileNotFoundError:
+            return
+        self._reject_hard_links(link_count)
+
     def _read_records(self) -> tuple[_RecordT, ...]:
-        if not self.path.exists():
+        try:
+            with self.path.open("rb") as ledger:
+                self._reject_hard_links(os.fstat(ledger.fileno()).st_nlink)
+                raw_content = ledger.read()
+        except FileNotFoundError:
             return ()
         try:
-            raw_content = self.path.read_bytes()
             content = raw_content.decode("utf-8")
         except UnicodeError as error:
             raise LedgerCorruptionError(
@@ -340,6 +358,8 @@ class LedgerStore:
         forecast_run_ids: set[str] = set()
         review_ids: set[str] = set()
         idempotency_keys: set[tuple[str, str]] = set()
+        capture_supersession_targets: set[str] = set()
+        market_supersession_targets: set[str] = set()
         captures_by_id: dict[str, CaptureRecord] = {}
         forecasts_by_id: dict[str, ForecastRecord] = {}
         markets_by_record_id: dict[str, MarketObservationRecord] = {}
@@ -380,14 +400,30 @@ class LedgerStore:
                             raise ValueError("capture supersedes a different game")
                         if superseded.capture_id == record.capture_id:
                             raise ValueError("capture cannot supersede itself")
+                        if (
+                            record.supersedes_capture_id
+                            in capture_supersession_targets
+                        ):
+                            raise ValueError(
+                                "capture supersession target already has a successor"
+                            )
                 elif isinstance(record, ForecastRecord):
                     if record.forecast_run_id in forecast_run_ids:
                         raise ValueError("duplicate forecast_run_id")
                 elif isinstance(record, CaptureForecastLink):
-                    if record.capture_id not in captures_by_id:
+                    capture = captures_by_id.get(record.capture_id)
+                    if capture is None:
                         raise ValueError("link references missing capture")
-                    if record.forecast_run_id not in forecasts_by_id:
+                    forecast = forecasts_by_id.get(record.forecast_run_id)
+                    if forecast is None:
                         raise ValueError("link references missing forecast")
+                    if (
+                        capture.normalized_input_hash
+                        != forecast.normalized_input_hash
+                    ):
+                        raise ValueError(
+                            "link capture and forecast normalized_input_hash must match"
+                        )
                 elif isinstance(record, MarketObservationRecord):
                     if record.supersedes_record_id is not None:
                         superseded = markets_by_record_id.get(
@@ -404,6 +440,13 @@ class LedgerStore:
                         ):
                             raise ValueError(
                                 "market supersession must stay in one source market"
+                            )
+                        if (
+                            record.supersedes_record_id
+                            in market_supersession_targets
+                        ):
+                            raise ValueError(
+                                "market supersession target already has a successor"
                             )
                 elif isinstance(record, OfficialResultRecord):
                     prior_results = results_by_game.get(record.game_pk, [])
@@ -428,7 +471,13 @@ class LedgerStore:
                     )
                     if relationship_error is not None:
                         raise ValueError(relationship_error)
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            except (
+                KeyError,
+                RecursionError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
                 raise LedgerCorruptionError(
                     f"invalid ledger row at line {line_number}: {error}"
                 ) from error
@@ -438,11 +487,17 @@ class LedgerStore:
             if isinstance(record, CaptureRecord):
                 capture_ids.add(record.capture_id)
                 captures_by_id[record.capture_id] = record
+                if record.supersedes_capture_id is not None:
+                    capture_supersession_targets.add(
+                        record.supersedes_capture_id
+                    )
             elif isinstance(record, ForecastRecord):
                 forecast_run_ids.add(record.forecast_run_id)
                 forecasts_by_id[record.forecast_run_id] = record
             elif isinstance(record, MarketObservationRecord):
                 markets_by_record_id[record.envelope.record_id] = record
+                if record.supersedes_record_id is not None:
+                    market_supersession_targets.add(record.supersedes_record_id)
             elif isinstance(record, OfficialResultRecord):
                 results_by_game.setdefault(record.game_pk, []).append(record)
             elif isinstance(record, ReviewRecord):
@@ -487,6 +542,7 @@ class LedgerStore:
                 )
                 record = build(envelope)
                 with self.path.open("a", encoding="utf-8", newline="") as ledger:
+                    self._reject_hard_links(os.fstat(ledger.fileno()).st_nlink)
                     ledger.write(f"{canonical_json(record)}\n")
                     ledger.flush()
                     os.fsync(ledger.fileno())
@@ -508,6 +564,11 @@ class LedgerStore:
                 for record in records
                 if isinstance(record, CaptureRecord)
             }
+            supersession_targets = {
+                record.supersedes_capture_id
+                for record in captures_by_id.values()
+                if record.supersedes_capture_id is not None
+            }
             if command.supersedes_capture_id is not None:
                 superseded = captures_by_id.get(command.supersedes_capture_id)
                 if superseded is None:
@@ -517,6 +578,10 @@ class LedgerStore:
                 if superseded.game_pk != command.game_pk:
                     raise LedgerReferenceError(
                         "superseded capture must concern the same game"
+                    )
+                if command.supersedes_capture_id in supersession_targets:
+                    raise LedgerReferenceError(
+                        "capture supersession target already has a successor"
                     )
 
         def build(envelope: RecordEnvelope) -> CaptureRecord:
@@ -597,11 +662,17 @@ class LedgerStore:
                 for record in records
                 if isinstance(record, ForecastRecord)
             }
-            if capture_id not in captures_by_id:
+            capture = captures_by_id.get(capture_id)
+            if capture is None:
                 raise LedgerReferenceError("capture_id must reference an existing capture")
-            if forecast_run_id not in forecasts_by_id:
+            forecast = forecasts_by_id.get(forecast_run_id)
+            if forecast is None:
                 raise LedgerReferenceError(
                     "forecast_run_id must reference an existing forecast"
+                )
+            if capture.normalized_input_hash != forecast.normalized_input_hash:
+                raise LedgerReferenceError(
+                    "capture and forecast normalized_input_hash must match"
                 )
 
         def build(envelope: RecordEnvelope) -> CaptureForecastLink:
@@ -662,6 +733,14 @@ class LedgerStore:
             ):
                 raise LedgerReferenceError(
                     "market supersession must stay in one source market"
+                )
+            if any(
+                isinstance(record, MarketObservationRecord)
+                and record.supersedes_record_id == command.supersedes_record_id
+                for record in records
+            ):
+                raise LedgerReferenceError(
+                    "market supersession target already has a successor"
                 )
 
         def build(envelope: RecordEnvelope) -> MarketObservationRecord:

@@ -5,9 +5,23 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+_LOWERCASE_HEX = frozenset("0123456789abcdef")
+
+
 def _require_nonempty(value: object, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def _require_generated_id(value: object, field_name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or any(character not in _LOWERCASE_HEX for character in value)
+    ):
+        raise ValueError(
+            f"{field_name} must be exactly 32 lowercase hexadecimal characters"
+        )
 
 
 def _require_aware_datetime(value: object, field_name: str) -> None:
@@ -31,6 +45,37 @@ def _is_finite_number(value: object) -> bool:
         and value == value
         and value not in (float("inf"), float("-inf"))
     )
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if len(left) != len(right):
+            return False
+        return all(
+            key in right and _json_values_equal(value, right[key])
+            for key, value in left.items()
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if not isinstance(left, (list, tuple)) or not isinstance(
+            right,
+            (list, tuple),
+        ):
+            return False
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if _is_finite_number(left) or _is_finite_number(right):
+        return _is_finite_number(left) and _is_finite_number(right) and left == right
+    return False
 
 
 class FrozenMapping(Mapping[str, object]):
@@ -58,6 +103,9 @@ class FrozenMapping(Mapping[str, object]):
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Mapping) and _json_values_equal(self, other)
 
     def __repr__(self) -> str:
         content = ", ".join(f"{key!r}: {value!r}" for key, value in self._items)
@@ -236,7 +284,7 @@ class RecordEnvelope:
     appended_at: datetime
 
     def __post_init__(self) -> None:
-        _require_nonempty(self.record_id, "record_id")
+        _require_generated_id(self.record_id, "record_id")
         _require_nonempty(self.record_kind, "record_kind")
         _require_nonempty(self.idempotency_key, "idempotency_key")
         _require_nonempty(self.payload_hash, "payload_hash")
@@ -295,7 +343,7 @@ class CaptureRecord:
             payload=self.payload,
             supersedes_capture_id=self.supersedes_capture_id,
         )
-        _require_nonempty(self.capture_id, "capture_id")
+        _require_generated_id(self.capture_id, "capture_id")
         object.__setattr__(self, "payload", command.payload)
 
 
@@ -603,7 +651,7 @@ class ReviewRecord:
             raise ValueError("envelope must be RecordEnvelope")
         if self.envelope.record_kind != "review":
             raise ValueError("review envelope record_kind must be review")
-        _require_nonempty(self.review_id, "review_id")
+        _require_generated_id(self.review_id, "review_id")
         command = ReviewCommand(
             capture_forecast_link_record_id=(
                 self.capture_forecast_link_record_id

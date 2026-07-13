@@ -1,13 +1,16 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 from analysis.ledger import (
     CaptureCommand,
@@ -160,11 +163,51 @@ def append_review_context(store: LedgerStore):
     return capture, forecast, link, market, result, command
 
 
+def _logical_payload_hash(value: object) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def append_forged_record(
+    path: Path,
+    record_kind: str,
+    idempotency_key: str,
+    logical_payload: object,
+    **record_fields: object,
+) -> None:
+    row = json.loads(canonical_json(logical_payload))
+    if not isinstance(row, dict):
+        raise AssertionError("forged logical payload must serialize as an object")
+    row.update(record_fields)
+    row["envelope"] = {
+        "record_id": uuid.uuid4().hex,
+        "record_kind": record_kind,
+        "idempotency_key": idempotency_key,
+        "payload_hash": _logical_payload_hash(logical_payload),
+        "appended_at": CAPTURED_AT.isoformat(),
+    }
+    with path.open("a", encoding="utf-8", newline="") as ledger:
+        ledger.write(f"{canonical_json(row)}\n")
+
+
+def write_jsonl_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as ledger:
+        for row in rows:
+            ledger.write(f"{canonical_json(row)}\n")
+
+
 def append_same_capture_in_process(path: str) -> None:
     LedgerStore(path).append_capture(
         "capture:concurrent",
         capture_command(payload={"source": "concurrent"}),
     )
+
+
+def append_same_capture_and_report_in_process(path: str, result_queue) -> None:
+    record = LedgerStore(path).append_capture(
+        "capture:concurrent-alias",
+        capture_command(payload={"source": "concurrent-alias"}),
+    )
+    result_queue.put(record.capture_id)
 
 
 class LedgerStoreTests(unittest.TestCase):
@@ -286,7 +329,7 @@ class LedgerStoreTests(unittest.TestCase):
             def open_spy(opened_path: Path, *args: object, **kwargs: object):
                 handle = real_path_open(opened_path, *args, **kwargs)
                 mode = args[0] if args else kwargs.get("mode", "r")
-                if opened_path != path or mode != "a":
+                if opened_path != store.path or mode != "a":
                     return handle
 
                 wrapped = mock.MagicMock(wraps=handle)
@@ -481,6 +524,53 @@ class LedgerStoreTests(unittest.TestCase):
             with self.assertRaises(LedgerReferenceError):
                 store.link_capture_forecast(capture.capture_id, "missing-forecast")
 
+    def test_link_rejects_mismatched_normalized_input_hash_on_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture = store.append_capture("capture:1", capture_command())
+            forecast = store.append_forecast(
+                forecast_command(normalized_input_hash="different-input-hash")
+            )
+
+            with self.assertRaisesRegex(
+                LedgerReferenceError,
+                "normalized_input_hash",
+            ):
+                store.link_capture_forecast(
+                    capture.capture_id,
+                    forecast.forecast_run_id,
+                )
+
+            self.assertEqual(
+                tuple(store.iter_records("capture_forecast_link")),
+                (),
+            )
+
+    def test_mismatched_link_is_corruption_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            capture = store.append_capture("capture:1", capture_command())
+            forecast = store.append_forecast(
+                forecast_command(normalized_input_hash="different-input-hash")
+            )
+            logical_payload = {
+                "capture_id": capture.capture_id,
+                "forecast_run_id": forecast.forecast_run_id,
+            }
+            append_forged_record(
+                path,
+                "capture_forecast_link",
+                f"capture-forecast:{capture.capture_id}:{forecast.forecast_run_id}",
+                logical_payload,
+            )
+
+            with self.assertRaisesRegex(
+                LedgerCorruptionError,
+                "normalized_input_hash",
+            ):
+                tuple(LedgerStore(path).iter_records())
+
     def test_capture_supersession_requires_existing_same_game_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")
@@ -515,6 +605,84 @@ class LedgerStoreTests(unittest.TestCase):
                     ),
                 )
 
+    def test_capture_supersession_rejects_direct_branch_on_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            original = store.append_capture("capture:1", capture_command())
+            store.append_capture(
+                "capture:2",
+                capture_command(
+                    payload={"revision": 2},
+                    supersedes_capture_id=original.capture_id,
+                ),
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "successor"):
+                store.append_capture(
+                    "capture:branch",
+                    capture_command(
+                        payload={"revision": "branch"},
+                        supersedes_capture_id=original.capture_id,
+                    ),
+                )
+
+    def test_capture_supersession_branch_is_corruption_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            original = store.append_capture("capture:1", capture_command())
+            store.append_capture(
+                "capture:2",
+                capture_command(
+                    payload={"revision": 2},
+                    supersedes_capture_id=original.capture_id,
+                ),
+            )
+            branch = capture_command(
+                payload={"revision": "forged-branch"},
+                supersedes_capture_id=original.capture_id,
+            )
+            append_forged_record(
+                path,
+                "capture",
+                "capture:forged-branch",
+                branch,
+                capture_id=uuid.uuid4().hex,
+            )
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "successor"):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_capture_supersession_allows_linear_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            original = store.append_capture("capture:1", capture_command())
+            second = store.append_capture(
+                "capture:2",
+                capture_command(
+                    payload={"revision": 2},
+                    supersedes_capture_id=original.capture_id,
+                ),
+            )
+            third = store.append_capture(
+                "capture:3",
+                capture_command(
+                    payload={"revision": 3},
+                    supersedes_capture_id=second.capture_id,
+                ),
+            )
+
+            relationships = LedgerStore(path).records_superseded_by("capture")
+            self.assertEqual(
+                relationships[original.envelope.record_id],
+                second.envelope.record_id,
+            )
+            self.assertEqual(
+                relationships[second.envelope.record_id],
+                third.envelope.record_id,
+            )
+
     def test_commands_records_and_nested_snapshots_are_immutable(self) -> None:
         command = forecast_command(outputs={"nested": [{"value": 1.0}]})
         self.assertTrue(is_dataclass(command))
@@ -539,6 +707,28 @@ class LedgerStoreTests(unittest.TestCase):
                 self.assertTrue(is_dataclass(dataclass_type))
                 self.assertTrue(dataclass_type.__dataclass_params__.frozen)
                 self.assertGreater(len(fields(dataclass_type)), 0)
+
+    def test_frozen_mapping_equality_preserves_nested_json_scalar_types(self) -> None:
+        boolean_mapping = capture_command(
+            payload={"nested": {"values": [True, {"value": False}]}}
+        ).payload
+        numeric_mapping = capture_command(
+            payload={"nested": {"values": [1, {"value": 0}]}}
+        ).payload
+        same_boolean_mapping = capture_command(
+            payload={"nested": {"values": [True, {"value": False}]}}
+        ).payload
+
+        self.assertNotEqual(boolean_mapping, numeric_mapping)
+        self.assertNotEqual(
+            boolean_mapping["nested"],
+            numeric_mapping["nested"],
+        )
+        self.assertNotEqual(
+            boolean_mapping,
+            {"nested": {"values": [1, {"value": 0}]}},
+        )
+        self.assertEqual(boolean_mapping, same_boolean_mapping)
 
     def test_forecast_outputs_reject_noncanonical_and_nonfinite_values(self) -> None:
         invalid_outputs = (
@@ -629,6 +819,86 @@ class LedgerStoreTests(unittest.TestCase):
                     self.assertFalse(
                         store.market_observations_match(entry, candidate)
                     )
+
+    def test_market_supersession_rejects_direct_branch_on_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            original = store.append_market_observation(market_command())
+            store.append_market_observation(
+                market_command(
+                    source_revision="2",
+                    selected_decimal_price=1.90,
+                    supersedes_record_id=original.envelope.record_id,
+                )
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "successor"):
+                store.append_market_observation(
+                    market_command(
+                        source_revision="branch",
+                        selected_decimal_price=1.89,
+                        supersedes_record_id=original.envelope.record_id,
+                    )
+                )
+
+    def test_market_supersession_branch_is_corruption_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            original = store.append_market_observation(market_command())
+            store.append_market_observation(
+                market_command(
+                    source_revision="2",
+                    selected_decimal_price=1.90,
+                    supersedes_record_id=original.envelope.record_id,
+                )
+            )
+            branch = market_command(
+                source_revision="forged-branch",
+                selected_decimal_price=1.89,
+                supersedes_record_id=original.envelope.record_id,
+            )
+            append_forged_record(
+                path,
+                "market_observation",
+                "market:forged-branch",
+                branch,
+            )
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "successor"):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_market_supersession_allows_linear_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            original = store.append_market_observation(market_command())
+            second = store.append_market_observation(
+                market_command(
+                    source_revision="2",
+                    selected_decimal_price=1.90,
+                    supersedes_record_id=original.envelope.record_id,
+                )
+            )
+            third = store.append_market_observation(
+                market_command(
+                    source_revision="3",
+                    selected_decimal_price=1.89,
+                    supersedes_record_id=second.envelope.record_id,
+                )
+            )
+
+            relationships = LedgerStore(path).records_superseded_by(
+                "market_observation"
+            )
+            self.assertEqual(
+                relationships[original.envelope.record_id],
+                second.envelope.record_id,
+            )
+            self.assertEqual(
+                relationships[second.envelope.record_id],
+                third.envelope.record_id,
+            )
 
     def test_result_correction_supersedes_latest_without_mutating_original(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1026,6 +1296,66 @@ class LedgerStoreTests(unittest.TestCase):
                 self.assertTrue(is_dataclass(dataclass_type))
                 self.assertTrue(dataclass_type.__dataclass_params__.frozen)
 
+    def test_generated_ledger_ids_are_lowercase_32_hex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture, forecast, _, _, _, command = append_review_context(store)
+            review = store.append_review(command)
+            pattern = r"\A[0-9a-f]{32}\Z"
+
+            for record in store.iter_records():
+                with self.subTest(record_kind=record.envelope.record_kind):
+                    self.assertRegex(record.envelope.record_id, pattern)
+            self.assertRegex(capture.capture_id, pattern)
+            self.assertRegex(review.review_id, pattern)
+            self.assertEqual(forecast.forecast_run_id, "forecast-run-1")
+
+    def test_tampered_generated_ids_are_corruption_on_reopen(self) -> None:
+        tampered_values = {
+            "record_id": "a" * 31,
+            "capture_id": "g" * 32,
+        }
+        for field_name, tampered_value in tampered_values.items():
+            with self.subTest(field_name=field_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "ledger.jsonl"
+                    LedgerStore(path).append_capture(
+                        "capture:tampered-id",
+                        capture_command(),
+                    )
+                    row = json.loads(path.read_text(encoding="utf-8"))
+                    if field_name == "record_id":
+                        row["envelope"]["record_id"] = tampered_value
+                    else:
+                        row["capture_id"] = tampered_value
+                    write_jsonl_rows(path, [row])
+
+                    with self.assertRaisesRegex(
+                        LedgerCorruptionError,
+                        field_name,
+                    ):
+                        tuple(LedgerStore(path).iter_records())
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            *_, command = append_review_context(store)
+            store.append_review(command)
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            review_row = next(
+                row
+                for row in rows
+                if row["envelope"]["record_kind"] == "review"
+            )
+            review_row["review_id"] = "A" * 32
+            write_jsonl_rows(path, rows)
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "review_id"):
+                tuple(LedgerStore(path).iter_records())
+
     def test_supersession_helpers_survive_reopen_for_capture_and_market(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.jsonl"
@@ -1092,6 +1422,25 @@ class LedgerStoreTests(unittest.TestCase):
             with self.assertRaises(LedgerCorruptionError):
                 tuple(LedgerStore(tampered_path).iter_records())
 
+    def test_deep_malformed_json_raises_line_scoped_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deep-malformed.jsonl"
+            LedgerStore(path).append_capture("capture:deep", capture_command())
+            valid_row = path.read_text(encoding="utf-8")
+            depth = sys.getrecursionlimit() * 2
+            original_payload = '"payload":{"away_team":"SEA","home_team":"MIN"}'
+            deep_payload = (
+                '"payload":{"nested":'
+                f"{'[' * depth}0{']' * depth}"
+                "}"
+            )
+            malformed_row = valid_row.replace(original_payload, deep_payload)
+            self.assertNotEqual(malformed_row, valid_row)
+            path.write_text(malformed_row, encoding="utf-8")
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "line 1"):
+                tuple(LedgerStore(path).iter_records())
+
     def test_optional_availability_and_classification_remain_canonical(self) -> None:
         market = market_command(available_at=None)
         review = review_command(classification=None)
@@ -1125,6 +1474,60 @@ class LedgerStoreTests(unittest.TestCase):
             records = tuple(LedgerStore(path).iter_records("capture"))
             self.assertEqual(len(records), 1)
             self.assertEqual(path.read_bytes().count(b"\n"), 1)
+
+    def test_path_aliases_share_one_lock_and_concurrent_capture_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            symlink_path = Path(directory) / "ledger-alias.jsonl"
+            symlink_path.symlink_to(path)
+            relative_path = os.path.relpath(path, start=Path.cwd())
+
+            real_store = LedgerStore(path)
+            symlink_store = LedgerStore(symlink_path)
+            relative_store = LedgerStore(relative_path)
+
+            self.assertEqual(real_store.path, symlink_store.path)
+            self.assertEqual(real_store.path, relative_store.path)
+            self.assertEqual(real_store.lock_path, symlink_store.lock_path)
+            self.assertEqual(real_store.lock_path, relative_store.lock_path)
+
+            context = multiprocessing.get_context("fork")
+            result_queue = context.Queue()
+            aliases = [str(path), str(symlink_path)] * 4
+            processes = [
+                context.Process(
+                    target=append_same_capture_and_report_in_process,
+                    args=(alias, result_queue),
+                )
+                for alias in aliases
+            ]
+
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=10)
+
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+            capture_ids = [result_queue.get(timeout=10) for _ in processes]
+            result_queue.close()
+            result_queue.join_thread()
+            records = tuple(real_store.iter_records("capture"))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(set(capture_ids), {records[0].capture_id})
+            self.assertEqual(path.read_bytes().count(b"\n"), 1)
+
+    def test_hard_linked_ledger_is_rejected_on_construction_and_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            hard_link_path = Path(directory) / "ledger-hard-link.jsonl"
+            store = LedgerStore(path)
+            store.append_capture("capture:hard-link", capture_command())
+            os.link(path, hard_link_path)
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "hard link"):
+                LedgerStore(hard_link_path)
+            with self.assertRaisesRegex(LedgerCorruptionError, "hard link"):
+                tuple(store.iter_records())
 
     def test_invalid_utf8_and_duplicate_json_keys_raise_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
