@@ -323,13 +323,16 @@ class LedgerStore:
         if not self.path.exists():
             return ()
         try:
-            content = self.path.read_text(encoding="utf-8")
+            raw_content = self.path.read_bytes()
+            content = raw_content.decode("utf-8")
         except UnicodeError as error:
             raise LedgerCorruptionError(
                 f"ledger is not valid UTF-8: {error}"
             ) from error
-        if content and not content.endswith("\n"):
-            raise LedgerCorruptionError("ledger must end with a newline")
+        if raw_content and not raw_content.endswith(b"\n"):
+            raise LedgerCorruptionError(
+                "ledger must end with a newline byte (ASCII LF)"
+            )
 
         records: list[_RecordT] = []
         record_ids: set[str] = set()
@@ -344,6 +347,10 @@ class LedgerStore:
         for line_number, line in enumerate(content.split("\n")[:-1], start=1):
             if not line:
                 raise LedgerCorruptionError(f"empty ledger row at line {line_number}")
+            if line.endswith("\r"):
+                raise LedgerCorruptionError(
+                    f"ledger row {line_number} uses CRLF framing; ASCII LF is required"
+                )
             try:
                 record = _deserialize_record(
                     json.loads(

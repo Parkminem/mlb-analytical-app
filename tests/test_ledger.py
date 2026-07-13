@@ -218,6 +218,45 @@ class LedgerStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(LedgerCorruptionError, "empty ledger row"):
                 tuple(LedgerStore(path).iter_records())
 
+    def test_jsonl_framing_rejects_raw_cr_terminator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            LedgerStore(path).append_capture("capture:cr", capture_command())
+            valid_row = path.read_bytes()
+
+            path.write_bytes(valid_row[:-1] + b"\r")
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "ASCII LF"):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_jsonl_framing_rejects_crlf_terminator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            LedgerStore(path).append_capture("capture:crlf", capture_command())
+            valid_row = path.read_bytes()
+
+            path.write_bytes(valid_row[:-1] + b"\r\n")
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "ASCII LF"):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_escaped_carriage_return_payload_reopens_and_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            command = capture_command(payload={"note": "before\rafter"})
+            first = LedgerStore(path).append_capture("capture:escaped-cr", command)
+            raw_after_first = path.read_bytes()
+
+            reopened = LedgerStore(path)
+            records = tuple(reopened.iter_records("capture"))
+            replayed = reopened.append_capture("capture:escaped-cr", command)
+
+            self.assertIn(b"before\\rafter", raw_after_first)
+            self.assertNotIn(b"\r", raw_after_first)
+            self.assertEqual(records[0].payload["note"], "before\rafter")
+            self.assertEqual(replayed.capture_id, first.capture_id)
+            self.assertEqual(path.read_bytes(), raw_after_first)
+
     def test_append_orders_lock_rebuild_write_flush_fsync_and_unlock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.jsonl"
