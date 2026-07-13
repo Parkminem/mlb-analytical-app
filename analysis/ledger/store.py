@@ -341,7 +341,7 @@ class LedgerStore:
         forecasts_by_id: dict[str, ForecastRecord] = {}
         markets_by_record_id: dict[str, MarketObservationRecord] = {}
         results_by_game: dict[int, list[OfficialResultRecord]] = {}
-        for line_number, line in enumerate(content.splitlines(), start=1):
+        for line_number, line in enumerate(content.split("\n")[:-1], start=1):
             if not line:
                 raise LedgerCorruptionError(f"empty ledger row at line {line_number}")
             try:

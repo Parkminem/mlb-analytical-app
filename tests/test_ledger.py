@@ -1,10 +1,13 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from datetime import datetime, timezone
+import fcntl
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from analysis.ledger import (
     CaptureCommand,
@@ -165,6 +168,141 @@ def append_same_capture_in_process(path: str) -> None:
 
 
 class LedgerStoreTests(unittest.TestCase):
+    def _assert_unicode_separator_reopens_and_replays(
+        self,
+        separator: str,
+        idempotency_key: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            command = capture_command(
+                payload={"note": f"before{separator}after"}
+            )
+            first = LedgerStore(path).append_capture(idempotency_key, command)
+            raw_after_first = path.read_bytes()
+
+            reopened = LedgerStore(path)
+            records = tuple(reopened.iter_records("capture"))
+            replayed = reopened.append_capture(idempotency_key, command)
+
+            self.assertEqual(raw_after_first.count(b"\n"), 1)
+            self.assertIn(separator.encode("utf-8"), raw_after_first)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].payload["note"], f"before{separator}after")
+            self.assertEqual(replayed.capture_id, first.capture_id)
+            self.assertEqual(path.read_bytes(), raw_after_first)
+
+    def test_u2028_payload_reopens_and_replays_as_one_jsonl_row(self) -> None:
+        self._assert_unicode_separator_reopens_and_replays(
+            "\u2028",
+            "capture:unicode:u2028",
+        )
+
+    def test_u2029_payload_reopens_and_replays_as_one_jsonl_row(self) -> None:
+        self._assert_unicode_separator_reopens_and_replays(
+            "\u2029",
+            "capture:unicode:u2029",
+        )
+
+    def test_jsonl_framing_rejects_missing_final_lf_and_empty_lf_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            LedgerStore(path).append_capture("capture:1", capture_command())
+            valid_row = path.read_bytes()
+
+            path.write_bytes(valid_row[:-1])
+            with self.assertRaisesRegex(LedgerCorruptionError, "end with a newline"):
+                tuple(LedgerStore(path).iter_records())
+
+            path.write_bytes(valid_row + b"\n")
+            with self.assertRaisesRegex(LedgerCorruptionError, "empty ledger row"):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_append_orders_lock_rebuild_write_flush_fsync_and_unlock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            events: list[str] = []
+            real_flock = fcntl.flock
+            real_fsync = os.fsync
+            real_read_records = LedgerStore._read_records
+            real_path_open = Path.open
+
+            def flock_spy(file_descriptor: int, operation: int) -> None:
+                real_flock(file_descriptor, operation)
+                if operation == fcntl.LOCK_EX:
+                    events.append("lock_ex")
+                elif operation == fcntl.LOCK_UN:
+                    events.append("lock_un")
+
+            def rebuild_spy(instance: LedgerStore):
+                records = real_read_records(instance)
+                events.append("rebuild")
+                return records
+
+            def fsync_spy(file_descriptor: int) -> None:
+                real_fsync(file_descriptor)
+                events.append("fsync")
+
+            def open_spy(opened_path: Path, *args: object, **kwargs: object):
+                handle = real_path_open(opened_path, *args, **kwargs)
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if opened_path != path or mode != "a":
+                    return handle
+
+                wrapped = mock.MagicMock(wraps=handle)
+
+                def enter_spy():
+                    handle.__enter__()
+                    return wrapped
+
+                def write_spy(value: str) -> int:
+                    written = handle.write(value)
+                    events.append("write")
+                    return written
+
+                def flush_spy() -> None:
+                    handle.flush()
+                    events.append("flush")
+
+                wrapped.__enter__.side_effect = enter_spy
+                wrapped.__exit__.side_effect = handle.__exit__
+                wrapped.write.side_effect = write_spy
+                wrapped.flush.side_effect = flush_spy
+                wrapped.fileno.side_effect = handle.fileno
+                return wrapped
+
+            with (
+                mock.patch(
+                    "analysis.ledger.store.fcntl.flock",
+                    side_effect=flock_spy,
+                ),
+                mock.patch.object(
+                    LedgerStore,
+                    "_read_records",
+                    autospec=True,
+                    side_effect=rebuild_spy,
+                ),
+                mock.patch(
+                    "analysis.ledger.store.os.fsync",
+                    side_effect=fsync_spy,
+                ),
+                mock.patch.object(
+                    Path,
+                    "open",
+                    autospec=True,
+                    side_effect=open_spy,
+                ),
+            ):
+                store.append_capture("capture:ordered", capture_command())
+
+            self.assertNotEqual(store.lock_path, store.path)
+            self.assertTrue(store.lock_path.is_file())
+            self.assertEqual(
+                events,
+                ["lock_ex", "rebuild", "write", "flush", "fsync", "lock_un"],
+            )
+
     def test_same_capture_retry_returns_same_capture_and_one_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.jsonl"
