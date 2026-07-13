@@ -43,6 +43,8 @@ def _canonical_value(value: object) -> object:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("canonical floats must be finite")
+        if value.is_integer():
+            return int(value)
         return value
     if is_dataclass(value) and not isinstance(value, type):
         return {
@@ -119,12 +121,25 @@ def _semantic_value(value: object) -> object:
                 continue
             field_value = getattr(value, field.name)
             if isinstance(value, NormalizedGameInput) and field.name == "observations":
-                observations = [
-                    _semantic_observation(observation)
-                    for observation in field_value
+                observations_by_payload = {}
+                for observation in field_value:
+                    semantic_observation = _semantic_observation(observation)
+                    observations_by_payload[
+                        canonical_json(semantic_observation)
+                    ] = semantic_observation
+                converted[field.name] = [
+                    observations_by_payload[payload]
+                    for payload in sorted(observations_by_payload)
                 ]
-                observations.sort(key=canonical_json)
-                converted[field.name] = observations
+                continue
+            if isinstance(value, NormalizedGameInput) and field.name == "markets":
+                converted[field.name] = [
+                    _semantic_value(market)
+                    for market in sorted(
+                        field_value,
+                        key=lambda market: market.market_key,
+                    )
+                ]
                 continue
             semantic_value = _semantic_value(field_value)
             if semantic_value is not _OMIT:

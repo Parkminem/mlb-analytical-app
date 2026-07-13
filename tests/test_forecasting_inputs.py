@@ -940,6 +940,40 @@ class ForecastIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             canonical_json(datetime(2026, 7, 14, 1, 0))
 
+    def test_canonical_json_normalizes_integral_floats_as_integers(self) -> None:
+        for integer_value, float_value in (
+            (1, 1.0),
+            (0, -0.0),
+            (-2, -2.0),
+        ):
+            with self.subTest(float_value=float_value):
+                self.assertEqual(
+                    canonical_json({"value": integer_value}),
+                    canonical_json({"value": float_value}),
+                )
+
+        self.assertEqual(canonical_json({"value": 1.25}), '{"value":1.25}')
+        self.assertNotEqual(
+            canonical_json({"value": True}),
+            canonical_json({"value": 1}),
+        )
+
+    def test_integral_float_config_does_not_change_forecast_id(self) -> None:
+        game = complete_forecast_game()
+        integer_config = {
+            "simulations": 20_000,
+            "weights": {"starter": 1},
+        }
+        float_config = {
+            "simulations": 20_000.0,
+            "weights": {"starter": 1.0},
+        }
+
+        self.assertEqual(
+            build_forecast_run_id(game, "shadow-1", integer_config),
+            build_forecast_run_id(game, "shadow-1", float_config),
+        )
+
     def test_normalized_input_hash_hashes_the_semantic_payload(self) -> None:
         game = complete_forecast_game()
         expected = hashlib.sha256(
@@ -1014,6 +1048,83 @@ class ForecastIdentityTests(unittest.TestCase):
             build_forecast_run_id(first, "shadow-1", first_config),
             build_forecast_run_id(second, "shadow-1", second_config),
         )
+
+    def test_market_tuple_order_does_not_change_semantic_identity(self) -> None:
+        game = complete_forecast_game()
+        second_market = market_input()
+        first = replace(
+            game,
+            markets=(game.markets[0], second_market),
+        )
+        reordered = replace(
+            game,
+            markets=(second_market, game.markets[0]),
+        )
+        first_capture_keys = [
+            market["market_key"] for market in capture_payload(first)["markets"]
+        ]
+        reordered_capture_keys = [
+            market["market_key"]
+            for market in capture_payload(reordered)["markets"]
+        ]
+
+        self.assertEqual(
+            first_capture_keys,
+            [game.markets[0].market_key, second_market.market_key],
+        )
+        self.assertEqual(
+            reordered_capture_keys,
+            [second_market.market_key, game.markets[0].market_key],
+        )
+        with self.subTest(result="semantic payload"):
+            self.assertEqual(
+                semantic_forecast_payload(first),
+                semantic_forecast_payload(reordered),
+            )
+        with self.subTest(result="forecast id"):
+            self.assertEqual(
+                build_forecast_run_id(first, "shadow-1", {"simulations": 20_000}),
+                build_forecast_run_id(
+                    reordered,
+                    "shadow-1",
+                    {"simulations": 20_000},
+                ),
+            )
+
+    def test_semantic_source_aliases_do_not_change_identity(self) -> None:
+        game = complete_forecast_game()
+        alias = replace(
+            game.observations[0],
+            observation_id="obs:generated-alias",
+        )
+        with_alias = replace(
+            game,
+            observations=(alias, game.observations[0]),
+        )
+        captured_observations = capture_payload(with_alias)["observations"]
+
+        self.assertEqual(
+            [observation["observation_id"] for observation in captured_observations],
+            ["obs:generated-alias", "obs:1"],
+        )
+        with self.subTest(result="semantic payload"):
+            self.assertEqual(
+                semantic_forecast_payload(game),
+                semantic_forecast_payload(with_alias),
+            )
+        with self.subTest(result="forecast id"):
+            self.assertEqual(
+                build_forecast_run_id(
+                    game,
+                    "shadow-1",
+                    {"simulations": 20_000},
+                ),
+                build_forecast_run_id(
+                    with_alias,
+                    "shadow-1",
+                    {"simulations": 20_000},
+                ),
+            )
 
     def test_behavior_changing_inputs_change_forecast_id(self) -> None:
         game = complete_forecast_game()
