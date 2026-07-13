@@ -1,7 +1,7 @@
 """All-lineup pitch and velocity matchup forecasting."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from types import MappingProxyType
 
@@ -118,6 +118,45 @@ def _normalize_to_total(
 
 
 @dataclass(frozen=True)
+class _OffenseInvariantContext:
+    league_woba: float
+    normalized_pa_weights: tuple[float, ...]
+    matchup_bounds: tuple[float, float]
+    lineup_log_standard_error: float
+    sample_shortage_log_se_penalty: float
+
+    def __post_init__(self) -> None:
+        _require_finite_positive(self.league_woba, "league_woba")
+        if (
+            not isinstance(self.normalized_pa_weights, tuple)
+            or len(self.normalized_pa_weights) != 9
+        ):
+            raise ValueError("normalized_pa_weights must contain nine values")
+        for weight in self.normalized_pa_weights:
+            _require_finite_positive(weight, "normalized_pa_weights")
+        if math.fsum(self.normalized_pa_weights) != 9.0:
+            raise ValueError("normalized_pa_weights must sum exactly to nine")
+        if (
+            not isinstance(self.matchup_bounds, tuple)
+            or len(self.matchup_bounds) != 2
+        ):
+            raise ValueError("matchup_bounds must contain lower and upper bounds")
+        lower, upper = self.matchup_bounds
+        _require_finite_positive(lower, "matchup_bounds")
+        _require_finite_positive(upper, "matchup_bounds")
+        if lower > upper:
+            raise ValueError("matchup_bounds lower bound cannot exceed upper bound")
+        _require_finite_nonnegative(
+            self.lineup_log_standard_error,
+            "lineup_log_standard_error",
+        )
+        _require_finite_nonnegative(
+            self.sample_shortage_log_se_penalty,
+            "sample_shortage_log_se_penalty",
+        )
+
+
+@dataclass(frozen=True)
 class SlotMatchupForecast:
     order: int
     batter_id: str
@@ -135,8 +174,17 @@ class SlotMatchupForecast:
     sample_strengths: Mapping[str, str | None]
     exposure_weighted_adjusted_woba: float
     unknown_exposure: float
+    _context: _OffenseInvariantContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self._context, _OffenseInvariantContext):
+            raise ValueError(
+                "SlotMatchupForecast must be constructed by forecast_offense"
+            )
         if isinstance(self.order, bool) or not isinstance(self.order, int):
             raise ValueError("order must be an integer")
         if not 1 <= self.order <= 9:
@@ -256,6 +304,16 @@ class SlotMatchupForecast:
                     raise ValueError(
                         "missing responses must use the 표본 부족 label"
                     )
+                if not math.isclose(
+                    adjusted_wobas[pitch_type],
+                    self._context.league_woba,
+                    rel_tol=0.0,
+                    abs_tol=_FLOAT_TOLERANCE,
+                ):
+                    raise ValueError(
+                        "missing response adjusted_woba must equal construction "
+                        "league_woba"
+                    )
             else:
                 _require_nonempty_string(sample_strength, "sample_strengths")
 
@@ -295,8 +353,21 @@ class SlotMatchupForecast:
                 raise ValueError(
                     "unknown_exposure is inconsistent with missing pitch usage"
                 )
-        elif self.unknown_exposure != 1.0:
-            raise ValueError("an unevaluated slot must have unknown_exposure 1.0")
+        else:
+            if self.unknown_exposure != 1.0:
+                raise ValueError(
+                    "an unevaluated slot must have unknown_exposure 1.0"
+                )
+            if not math.isclose(
+                self.exposure_weighted_adjusted_woba,
+                self._context.league_woba,
+                rel_tol=0.0,
+                abs_tol=_FLOAT_TOLERANCE,
+            ):
+                raise ValueError(
+                    "an unevaluated slot point value must equal construction "
+                    "league_woba"
+                )
 
         for field_name, frozen in frozen_mappings.items():
             object.__setattr__(self, field_name, frozen)
@@ -313,8 +384,15 @@ class OffenseForecast:
     matchup_log_standard_errors: Mapping[str, float]
     matchup_unknown_exposures: Mapping[str, float]
     unknown_bullpen_matchup_log_se_penalty: float
+    _context: _OffenseInvariantContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self._context, _OffenseInvariantContext):
+            raise ValueError("OffenseForecast must be constructed by forecast_offense")
         _require_finite_positive(
             self.base_offense_multiplier,
             "base_offense_multiplier",
@@ -386,6 +464,10 @@ class OffenseForecast:
                 raise ValueError(
                     "slot_forecasts must contain SlotMatchupForecast values"
                 )
+            if slot_forecast._context != self._context:
+                raise ValueError(
+                    "slot_forecasts must share the offense invariant context"
+                )
         slot_pairs = tuple(
             (slot.order, slot.pitcher_id) for slot in self.slot_forecasts
         )
@@ -423,6 +505,42 @@ class OffenseForecast:
                 if previous != signature:
                     raise ValueError(
                         "lineup slot identity must agree across pitcher profiles"
+                    )
+
+        for pitcher_id in pitcher_ids:
+            expected_multiplier, expected_sigma, expected_unknown = (
+                _summarize_pitcher_slots(
+                    self.slot_forecasts,
+                    pitcher_id,
+                    self._context,
+                )
+            )
+            expected_values = (
+                (
+                    "matchup_multipliers",
+                    multipliers[pitcher_id],
+                    expected_multiplier,
+                ),
+                (
+                    "matchup_unknown_exposures",
+                    unknowns[pitcher_id],
+                    expected_unknown,
+                ),
+                (
+                    "matchup_log_standard_errors",
+                    sigmas[pitcher_id],
+                    expected_sigma,
+                ),
+            )
+            for field_name, actual, expected in expected_values:
+                if not math.isclose(
+                    actual,
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=_FLOAT_TOLERANCE,
+                ):
+                    raise ValueError(
+                        f"{field_name} is inconsistent with slot diagnostics"
                     )
 
         object.__setattr__(self, "matchup_multipliers", multipliers)
@@ -520,6 +638,7 @@ def _forecast_slot(
     slot: LineupSlot,
     pitcher: PitcherInput,
     config: SimulationConfig,
+    context: _OffenseInvariantContext,
 ) -> SlotMatchupForecast:
     matching_positive_mix = tuple(
         pitch_usage
@@ -545,6 +664,7 @@ def _forecast_slot(
             sample_strengths={},
             exposure_weighted_adjusted_woba=config.league_woba,
             unknown_exposure=1.0,
+            _context=context,
         )
 
     normalized_values = _normalize_to_total(
@@ -623,6 +743,7 @@ def _forecast_slot(
         sample_strengths=strengths,
         exposure_weighted_adjusted_woba=exposure_woba,
         unknown_exposure=unknown_exposure,
+        _context=context,
     )
 
 
@@ -660,6 +781,53 @@ def _weighted_average(
         normalized_pa_weights[order - 1] * values_by_order[order]
         for order in range(1, 10)
     ) / 9.0
+
+
+def _canonical_unknown_exposure(value: float) -> float:
+    if math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-15):
+        return 0.0
+    if math.isclose(value, 1.0, rel_tol=0.0, abs_tol=1e-15):
+        return 1.0
+    return value
+
+
+def _summarize_pitcher_slots(
+    slot_forecasts: tuple[SlotMatchupForecast, ...],
+    pitcher_id: str,
+    context: _OffenseInvariantContext,
+) -> tuple[float, float, float]:
+    slots_by_order = {
+        slot.order: slot
+        for slot in slot_forecasts
+        if slot.pitcher_id == pitcher_id
+    }
+    if set(slots_by_order) != set(range(1, 10)):
+        raise ValueError("slot diagnostics must contain batting orders 1 through 9")
+    exposure_woba = _weighted_average(
+        {
+            order: slots_by_order[order].exposure_weighted_adjusted_woba
+            for order in range(1, 10)
+        },
+        context.normalized_pa_weights,
+    )
+    unknown_exposure = _canonical_unknown_exposure(
+        _weighted_average(
+            {
+                order: slots_by_order[order].unknown_exposure
+                for order in range(1, 10)
+            },
+            context.normalized_pa_weights,
+        )
+    )
+    matchup_multiplier = _clip(
+        exposure_woba / context.league_woba,
+        context.matchup_bounds,
+    )
+    matchup_sigma = math.hypot(
+        context.lineup_log_standard_error,
+        unknown_exposure * context.sample_shortage_log_se_penalty,
+    )
+    return matchup_multiplier, matchup_sigma, unknown_exposure
 
 
 def forecast_offense(
@@ -711,55 +879,35 @@ def forecast_offense(
         9.0,
         "pa_weights",
     )
+    context = _OffenseInvariantContext(
+        league_woba=config.league_woba,
+        normalized_pa_weights=normalized_pa_weights,
+        matchup_bounds=config.matchup_bounds,
+        lineup_log_standard_error=lineup_log_standard_error,
+        sample_shortage_log_se_penalty=(
+            config.sample_shortage_log_se_penalty
+        ),
+    )
     ordered_slots = tuple(sorted(lineup.slots, key=lambda slot: slot.order))
     slot_forecasts = tuple(
-        _forecast_slot(slot, profile, config)
+        _forecast_slot(slot, profile, config, context)
         for slot in ordered_slots
         for profile in opposing_profiles
     )
-    slots_by_pair = {
-        (slot.order, slot.pitcher_id): slot for slot in slot_forecasts
-    }
 
     matchup_multipliers: dict[str, float] = {}
     matchup_sigmas: dict[str, float] = {}
     matchup_unknowns: dict[str, float] = {}
     for profile in opposing_profiles:
         pitcher_id = profile.pitcher_id
-        exposure_woba = _weighted_average(
-            {
-                order: slots_by_pair[
-                    (order, pitcher_id)
-                ].exposure_weighted_adjusted_woba
-                for order in range(1, 10)
-            },
-            normalized_pa_weights,
+        multiplier, sigma, unknown_exposure = _summarize_pitcher_slots(
+            slot_forecasts,
+            pitcher_id,
+            context,
         )
-        unknown_exposure = _weighted_average(
-            {
-                order: slots_by_pair[(order, pitcher_id)].unknown_exposure
-                for order in range(1, 10)
-            },
-            normalized_pa_weights,
-        )
-        if math.isclose(unknown_exposure, 0.0, rel_tol=0.0, abs_tol=1e-15):
-            unknown_exposure = 0.0
-        elif math.isclose(
-            unknown_exposure,
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1e-15,
-        ):
-            unknown_exposure = 1.0
         matchup_unknowns[pitcher_id] = unknown_exposure
-        matchup_multipliers[pitcher_id] = _clip(
-            exposure_woba / config.league_woba,
-            config.matchup_bounds,
-        )
-        matchup_sigmas[pitcher_id] = math.hypot(
-            lineup_log_standard_error,
-            unknown_exposure * config.sample_shortage_log_se_penalty,
-        )
+        matchup_multipliers[pitcher_id] = multiplier
+        matchup_sigmas[pitcher_id] = sigma
 
     base_offense_multiplier = _clip(
         projected_runs / config.league_runs_per_team_game,
@@ -777,4 +925,5 @@ def forecast_offense(
         unknown_bullpen_matchup_log_se_penalty=(
             config.unknown_bullpen_matchup_log_se_penalty
         ),
+        _context=context,
     )

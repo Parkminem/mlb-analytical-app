@@ -2502,6 +2502,86 @@ class OffenseForecastTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             direct_result.base_offense_multiplier = 2.0
 
+    def test_missing_pitch_response_requires_league_woba_point_value(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig(league_woba=0.333)
+        result = forecast_offense(
+            _offense_lineup(),
+            (_offense_profile(pitcher_id),),
+            config,
+        )
+        slot = result.slot_forecasts[0]
+        forged_woba = 0.401
+
+        self.assertIsNone(slot.selected_band_widths["FF"])
+        self.assertEqual(slot.adjusted_wobas["FF"], config.league_woba)
+        with self.assertRaisesRegex(ValueError, "missing.*league_woba"):
+            replace(
+                slot,
+                adjusted_wobas={"FF": forged_woba},
+                exposure_weighted_adjusted_woba=forged_woba,
+            )
+
+    def test_direct_offense_maps_must_match_slot_diagnostics(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig(matchup_bounds=(0.5, 1.5))
+        result = forecast_offense(
+            _offense_uniform_response_lineup(
+                pitcher_id,
+                adjusted_woba=0.400,
+                log_standard_error=0.10,
+            ),
+            (_offense_profile(pitcher_id),),
+            config,
+        )
+        inconsistent_changes = (
+            (
+                "matchup_multipliers",
+                {"matchup_multipliers": {pitcher_id: 0.5}},
+            ),
+            (
+                "matchup_unknown_exposures",
+                {"matchup_unknown_exposures": {pitcher_id: 0.5}},
+            ),
+            (
+                "matchup_log_standard_errors",
+                {
+                    "matchup_log_standard_errors": {pitcher_id: 0.9},
+                    "log_standard_error": 0.9,
+                },
+            ),
+        )
+
+        self.assertEqual(result.matchup_multipliers[pitcher_id], 1.25)
+        self.assertEqual(result.matchup_unknown_exposures[pitcher_id], 0.0)
+        self.assertEqual(result.matchup_log_standard_errors[pitcher_id], 0.10)
+        for field_name, changes in inconsistent_changes:
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{field_name}.*slot diagnostics",
+                ):
+                    replace(result, **changes)
+
+    def test_public_field_only_construction_requires_factory_context(self):
+        pitcher_id = "pitcher:starter"
+        result = forecast_offense(
+            _offense_uniform_response_lineup(pitcher_id),
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        )
+        values = (result.slot_forecasts[0], result)
+
+        for value in values:
+            with self.subTest(result_type=type(value).__name__):
+                public_values = {
+                    result_field.name: getattr(value, result_field.name)
+                    for result_field in fields(value)
+                    if not result_field.name.startswith("_")
+                }
+                with self.assertRaisesRegex(ValueError, "forecast_offense"):
+                    type(value)(**public_values)
+
     def test_direct_result_constructors_reject_invalid_invariants(self):
         pitcher_id = "pitcher:starter"
         result = forecast_offense(
