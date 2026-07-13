@@ -834,7 +834,19 @@ class StarterForecastTests(unittest.TestCase):
         )
 
         self.assertEqual(forecast.workload.supports, ((7,), (16,), (20,)))
-        self.assertEqual(forecast.workload.bucket_probabilities, (1 / 3, 1 / 3, 1 / 3))
+        expected_probabilities = (
+            1.0 - math.fsum((1 / 3, 1 / 3)),
+            1 / 3,
+            1 / 3,
+        )
+        self.assertEqual(
+            forecast.workload.bucket_probabilities,
+            expected_probabilities,
+        )
+        self.assertEqual(
+            math.fsum(forecast.workload.bucket_probabilities),
+            1.0,
+        )
 
     def test_missing_required_league_prior_bucket_raises_clearly(self):
         with self.assertRaisesRegex(ValueError, "league_prior_workload.*six_plus"):
@@ -879,6 +891,38 @@ class StarterForecastTests(unittest.TestCase):
             all(0.0 <= probability <= 1.0 for probability in forecast.workload.bucket_probabilities)
         )
 
+    def test_non_dyadic_transfer_assigns_largest_bucket_as_exact_complement(self):
+        config = SimulationConfig(
+            pitch_limit_high_bucket_transfer=1 / 3,
+            pitch_limit_transfer_to_under_five=1 / 3,
+        )
+
+        probabilities = forecast_pitcher(
+            _starter_pitcher(pitch_limit=80),
+            config,
+        ).workload.bucket_probabilities
+
+        self.assertEqual(
+            probabilities,
+            (
+                0.37037037037037035,
+                0.40740740740740744,
+                0.2222222222222222,
+            ),
+        )
+        largest_index = max(range(3), key=probabilities.__getitem__)
+        other_probabilities = tuple(
+            probability
+            for index, probability in enumerate(probabilities)
+            if index != largest_index
+        )
+        self.assertEqual(
+            probabilities[largest_index],
+            1.0 - math.fsum(other_probabilities),
+        )
+        self.assertEqual(math.fsum(probabilities), 1.0)
+        self.assertTrue(all(probability >= 0.0 for probability in probabilities))
+
     def test_sample_outs_is_seeded_supported_and_skips_zero_probability_high(self):
         workload = forecast_pitcher(
             _starter_pitcher(
@@ -922,6 +966,24 @@ class StarterForecastTests(unittest.TestCase):
             SampledPitcherPlan,
         ):
             self.assertNotIn("projected_runs", {field.name for field in fields(result_type)})
+
+    def test_projected_ra9_must_be_positive_before_clipping(self):
+        for projected_ra9 in (0.0, -0.01):
+            with self.subTest(projected_ra9=projected_ra9):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "projected_ra9.value.*positive",
+                ):
+                    forecast_pitcher(
+                        _starter_pitcher(projected_ra9=projected_ra9),
+                        SimulationConfig(),
+                    )
+
+        forecast = forecast_pitcher(
+            _starter_pitcher(projected_ra9=0.001),
+            SimulationConfig(),
+        )
+        self.assertEqual(forecast.run_prevention_multiplier, 0.55)
 
     def test_injury_and_short_exit_penalties_are_added_in_exact_quadrature(self):
         config = SimulationConfig()
@@ -1147,6 +1209,83 @@ class StarterForecastTests(unittest.TestCase):
             plan.combined_outs,
         )
 
+    def test_low_total_three_pitcher_plans_preserve_combined_first_allocation(self):
+        component_workload = WorkloadDistribution(
+            probabilities=(1.0, 0.0, 0.0),
+            supports=((0, 1, 2), (15,), (18,)),
+            source="pitcher_history",
+            notes=(),
+        )
+        combined_workload = replace(
+            component_workload,
+            source="combined_chain_history",
+        )
+        opener = PitcherForecast(
+            pitcher_id="pitcher:opener",
+            role="opener",
+            workload=component_workload,
+            run_prevention_multiplier=1.0,
+            log_standard_error=0.2,
+            command_risk=False,
+            home_run_risk=False,
+            diagnostics=(),
+        )
+        bulk = replace(
+            opener,
+            pitcher_id="pitcher:bulk",
+            role="bulk",
+        )
+        prim = replace(
+            opener,
+            pitcher_id="pitcher:prim",
+            role="prim",
+        )
+        forecast = PitcherChainForecast(
+            pitchers=(opener, bulk, prim),
+            combined_workload=combined_workload,
+            log_standard_error=0.2,
+            diagnostics=(),
+        )
+        cases = (
+            (0, (0.0, 0.0, 0.0, 0.99, 0.0, 0.99), (0, 0, 0)),
+            (1, (0.0, 0.50, 0.0, 0.0, 0.0, 0.99), (0, 1, 0)),
+            (2, (0.0, 0.99, 0.0, 0.50, 0.0, 0.0), (1, 0, 1)),
+        )
+
+        for total_outs, random_values, expected_segment_outs in cases:
+            with self.subTest(total_outs=total_outs):
+                rng = SequenceRandomRng(random_values)
+
+                plan = forecast.sample_plan(rng)
+
+                self.assertEqual(rng.calls, list(random_values))
+                self.assertEqual(plan.combined_outs, total_outs)
+                self.assertEqual(
+                    tuple(segment.role for segment in plan.segments),
+                    ("opener", "bulk", "prim"),
+                )
+                self.assertEqual(
+                    tuple(segment.outs for segment in plan.segments),
+                    expected_segment_outs,
+                )
+                cursor = 0
+                for segment in plan.segments:
+                    self.assertEqual(segment.start_out, cursor)
+                    self.assertEqual(segment.end_out, cursor + segment.outs)
+                    cursor = segment.end_out
+                self.assertEqual(cursor, total_outs)
+                self.assertEqual(
+                    plan.segments[-1].outs,
+                    total_outs - sum(expected_segment_outs[:-1]),
+                )
+                self.assertEqual(
+                    sum(segment.outs for segment in plan.segments),
+                    total_outs,
+                )
+                self.assertTrue(
+                    any(segment.outs == 0 for segment in plan.segments)
+                )
+
     def test_combined_probabilities_come_from_history_not_component_convolution(self):
         forecast = forecast_pitcher_chain(
             _opener_chain(
@@ -1158,9 +1297,18 @@ class StarterForecastTests(unittest.TestCase):
         )
 
         self.assertEqual(forecast.combined_workload.source, "combined_chain_history")
+        expected_probabilities = (
+            1 / 6,
+            1 / 6,
+            1.0 - math.fsum((1 / 6, 1 / 6)),
+        )
         self.assertEqual(
             forecast.combined_workload.bucket_probabilities,
-            (1 / 6, 1 / 6, 4 / 6),
+            expected_probabilities,
+        )
+        self.assertEqual(
+            math.fsum(forecast.combined_workload.bucket_probabilities),
+            1.0,
         )
         convolved = _convolved_bucket_probabilities(
             forecast.pitchers[0].workload,
@@ -1230,6 +1378,209 @@ class StarterForecastTests(unittest.TestCase):
             with self.subTest(result_type=type(value).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(value, field_name, getattr(value, field_name))
+
+    def test_direct_result_constructors_accept_valid_workload_relationships(self):
+        starter_workload = WorkloadDistribution(
+            probabilities=(1 / 3, 1 / 3, 1 / 3),
+            supports=((12,), (15,), (18,)),
+            source="pitcher_history",
+            notes=(),
+        )
+        starter = PitcherForecast(
+            pitcher_id="pitcher:starter",
+            role="starter",
+            workload=starter_workload,
+            run_prevention_multiplier=1.0,
+            log_standard_error=0.2,
+            command_risk=False,
+            home_run_risk=False,
+            diagnostics=(),
+        )
+        equal_workload = replace(starter_workload)
+
+        single = PitcherChainForecast(
+            pitchers=(starter,),
+            combined_workload=equal_workload,
+            log_standard_error=0.2,
+            diagnostics=(),
+        )
+
+        self.assertIsNot(single.combined_workload, starter.workload)
+        self.assertEqual(single.combined_workload, starter.workload)
+
+        opener = replace(
+            starter,
+            pitcher_id="pitcher:opener",
+            role="opener",
+        )
+        bulk = replace(
+            starter,
+            pitcher_id="pitcher:bulk",
+            role="bulk",
+        )
+        prim = replace(
+            starter,
+            pitcher_id="pitcher:prim",
+            role="prim",
+        )
+        combined_workload = replace(
+            starter_workload,
+            source="combined_chain_history",
+        )
+
+        multi = PitcherChainForecast(
+            pitchers=(opener, bulk, prim),
+            combined_workload=combined_workload,
+            log_standard_error=0.2,
+            diagnostics=(),
+        )
+
+        self.assertEqual(
+            tuple(pitcher.role for pitcher in multi.pitchers),
+            ("opener", "bulk", "prim"),
+        )
+        self.assertEqual(multi.combined_workload.source, "combined_chain_history")
+
+    def test_pitcher_forecast_rejects_combined_chain_workload_source(self):
+        combined_workload = WorkloadDistribution(
+            probabilities=(1 / 3, 1 / 3, 1 / 3),
+            supports=((12,), (15,), (18,)),
+            source="combined_chain_history",
+            notes=(),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "workload.source.*pitcher_history",
+        ):
+            PitcherForecast(
+                pitcher_id="pitcher:starter",
+                role="starter",
+                workload=combined_workload,
+                run_prevention_multiplier=1.0,
+                log_standard_error=0.2,
+                command_risk=False,
+                home_run_risk=False,
+                diagnostics=(),
+            )
+
+    def test_pitcher_chain_forecast_rejects_invalid_direct_relationships(self):
+        starter_workload = WorkloadDistribution(
+            probabilities=(1 / 3, 1 / 3, 1 / 3),
+            supports=((12,), (15,), (18,)),
+            source="pitcher_history",
+            notes=(),
+        )
+        different_pitcher_workload = replace(
+            starter_workload,
+            probabilities=(1.0, 0.0, 0.0),
+        )
+        combined_workload = replace(
+            starter_workload,
+            source="combined_chain_history",
+        )
+        starter = PitcherForecast(
+            pitcher_id="pitcher:starter",
+            role="starter",
+            workload=starter_workload,
+            run_prevention_multiplier=1.0,
+            log_standard_error=0.2,
+            command_risk=False,
+            home_run_risk=False,
+            diagnostics=(),
+        )
+        opener = replace(
+            starter,
+            pitcher_id="pitcher:opener",
+            role="opener",
+        )
+        bulk = replace(
+            starter,
+            pitcher_id="pitcher:bulk",
+            role="bulk",
+        )
+        second_bulk = replace(bulk, pitcher_id="pitcher:bulk-2")
+        late_starter = replace(starter, pitcher_id="pitcher:late-starter")
+
+        invalid_builders = (
+            (
+                "empty",
+                "pitchers.*nonempty",
+                lambda: PitcherChainForecast(
+                    pitchers=(),
+                    combined_workload=starter_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "single role",
+                "single.*starter",
+                lambda: PitcherChainForecast(
+                    pitchers=(opener,),
+                    combined_workload=starter_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "single workload mismatch",
+                "single.*equal.*workload",
+                lambda: PitcherChainForecast(
+                    pitchers=(starter,),
+                    combined_workload=different_pitcher_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "single source",
+                "single.*pitcher_history",
+                lambda: PitcherChainForecast(
+                    pitchers=(starter,),
+                    combined_workload=combined_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "multi first role",
+                "multi.*opener",
+                lambda: PitcherChainForecast(
+                    pitchers=(bulk, opener),
+                    combined_workload=combined_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "multi duplicate later role",
+                "later.*distinct",
+                lambda: PitcherChainForecast(
+                    pitchers=(opener, bulk, second_bulk),
+                    combined_workload=combined_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "multi later starter",
+                "later.*bulk or prim",
+                lambda: PitcherChainForecast(
+                    pitchers=(opener, late_starter),
+                    combined_workload=combined_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+            (
+                "multi source",
+                "multi.*combined_chain_history",
+                lambda: PitcherChainForecast(
+                    pitchers=(opener, bulk),
+                    combined_workload=starter_workload,
+                    log_standard_error=0.2,
+                ),
+            ),
+        )
+
+        for label, message, builder in invalid_builders:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    builder()
 
     def test_invalid_direct_workload_distributions_are_rejected(self):
         valid = WorkloadDistribution(

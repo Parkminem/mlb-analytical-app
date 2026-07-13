@@ -172,6 +172,10 @@ class PitcherForecast:
             raise ValueError("role must be starter, opener, bulk, or prim")
         if not isinstance(self.workload, WorkloadDistribution):
             raise ValueError("workload must be WorkloadDistribution")
+        if self.workload.source != "pitcher_history":
+            raise ValueError(
+                "PitcherForecast workload.source must be pitcher_history"
+            )
         if (
             not _is_finite_number(self.run_prevention_multiplier)
             or self.run_prevention_multiplier <= 0
@@ -257,10 +261,27 @@ class PitcherChainForecast:
         pitcher_ids = tuple(pitcher.pitcher_id for pitcher in self.pitchers)
         if len(set(pitcher_ids)) != len(pitcher_ids):
             raise ValueError("pitchers must have unique pitcher_id values")
+        if not isinstance(self.combined_workload, WorkloadDistribution):
+            raise ValueError("combined_workload must be WorkloadDistribution")
+        if any(
+            pitcher.workload.source != "pitcher_history"
+            for pitcher in self.pitchers
+        ):
+            raise ValueError(
+                "every component workload.source must be pitcher_history"
+            )
 
         if len(self.pitchers) == 1:
             if self.pitchers[0].role != "starter":
                 raise ValueError("a single pitcher forecast must have starter role")
+            if self.combined_workload.source != "pitcher_history":
+                raise ValueError(
+                    "single chain combined_workload.source must be pitcher_history"
+                )
+            if self.combined_workload != self.pitchers[0].workload:
+                raise ValueError(
+                    "single chain combined_workload must equal the starter workload"
+                )
         else:
             roles = tuple(pitcher.role for pitcher in self.pitchers)
             if roles[0] != "opener":
@@ -269,9 +290,11 @@ class PitcherChainForecast:
                 raise ValueError("later pitcher roles must be bulk or prim")
             if len(set(roles[1:])) != len(roles[1:]):
                 raise ValueError("later pitcher roles must be distinct")
-
-        if not isinstance(self.combined_workload, WorkloadDistribution):
-            raise ValueError("combined_workload must be WorkloadDistribution")
+            if self.combined_workload.source != "combined_chain_history":
+                raise ValueError(
+                    "multi-pitcher combined_workload.source must be "
+                    "combined_chain_history"
+                )
         _require_finite_nonnegative(
             self.log_standard_error,
             "log_standard_error",
@@ -330,9 +353,27 @@ def _normalize_probabilities(values: list[float]) -> tuple[float, float, float]:
     if not math.isfinite(total) or total <= 0:
         raise ValueError("workload probability total must be finite and positive")
     normalized = [value / total for value in values]
-    correction = 1.0 - math.fsum(normalized)
-    correction_index = max(range(len(normalized)), key=normalized.__getitem__)
-    normalized[correction_index] += correction
+    largest_index = max(range(len(normalized)), key=normalized.__getitem__)
+    other_total = math.fsum(
+        value
+        for index, value in enumerate(normalized)
+        if index != largest_index
+    )
+    normalized[largest_index] = 1.0 - other_total
+    if any(
+        not _is_finite_number(value) or value < 0
+        for value in normalized
+    ):
+        raise ValueError(
+            "normalized workload probabilities must be finite and nonnegative"
+        )
+    if not math.isclose(
+        math.fsum(normalized),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=_PROBABILITY_TOLERANCE,
+    ):
+        raise ValueError("normalized workload probabilities must sum to one")
     return normalized[0], normalized[1], normalized[2]
 
 
@@ -410,6 +451,10 @@ def forecast_pitcher(
     if not isinstance(config, SimulationConfig):
         raise TypeError("config must be SimulationConfig")
 
+    projected_ra9 = pitcher.projected_ra9.value
+    if projected_ra9 <= 0:
+        raise ValueError("pitcher.projected_ra9.value must be positive")
+
     workload = _build_workload_distribution(
         eligible_outs=pitcher.eligible_workload.recorded_outs,
         league_prior_outs=pitcher.league_prior_workload.recorded_outs,
@@ -439,9 +484,7 @@ def forecast_pitcher(
     if pitcher.home_run_risk.value:
         diagnostics.append("home_run_risk")
 
-    unbounded_multiplier = (
-        pitcher.projected_ra9.value / config.league_runs_per_team_game
-    )
+    unbounded_multiplier = projected_ra9 / config.league_runs_per_team_game
     lower_bound, upper_bound = config.starter_ra9_bounds
     run_prevention_multiplier = min(
         upper_bound,
