@@ -100,6 +100,17 @@ class FixedRandomRng:
         return self.value
 
 
+class SequenceRandomRng:
+    def __init__(self, values):
+        self._values = iter(values)
+        self.calls = []
+
+    def random(self):
+        value = next(self._values)
+        self.calls.append(value)
+        return value
+
+
 def _starter_provenance():
     return FeatureProvenance(
         observation_ids=("obs:starter",),
@@ -201,6 +212,8 @@ def _opener_chain(
     opener_pitch_limit=None,
     final_pitch_limit=None,
     combined_pitch_limit=None,
+    opener_log_standard_error=0.25,
+    final_log_standard_error=0.30,
     handoff_verified=True,
     timing_uncertain=False,
 ):
@@ -211,7 +224,7 @@ def _opener_chain(
         prior_outs=component_prior_outs,
         pitch_limit=opener_pitch_limit,
         projected_ra9=4.05,
-        log_standard_error=0.25,
+        log_standard_error=opener_log_standard_error,
     )
     final = _starter_pitcher(
         f"pitcher:{final_role.value}",
@@ -220,7 +233,7 @@ def _opener_chain(
         prior_outs=component_prior_outs,
         pitch_limit=final_pitch_limit,
         projected_ra9=4.95,
-        log_standard_error=0.30,
+        log_standard_error=final_log_standard_error,
     )
     return PitcherChainInput(
         pitchers=(opener, final),
@@ -980,6 +993,65 @@ class StarterForecastTests(unittest.TestCase):
                     tuple(p.run_prevention_multiplier for p in verified.pitchers),
                 )
 
+    def test_chain_sigma_is_expected_outs_weighted_with_one_handoff_penalty(self):
+        config = SimulationConfig()
+        chain = _opener_chain(
+            opener_outs=(3, 3, 6, 9, 12),
+            final_outs=(18, 21, 24, 27, 27),
+            opener_log_standard_error=0.08,
+            final_log_standard_error=0.52,
+        )
+        verified = forecast_pitcher_chain(chain, config)
+        expected_outs = tuple(
+            pitcher.workload.expected_outs for pitcher in verified.pitchers
+        )
+
+        self.assertEqual(expected_outs, (9.375, 19.875))
+        weighted_rms = math.sqrt(
+            (
+                expected_outs[0] * 0.08 ** 2
+                + expected_outs[1] * 0.52 ** 2
+            )
+            / sum(expected_outs)
+        )
+        unweighted_rms = math.sqrt((0.08 ** 2 + 0.52 ** 2) / 2)
+        self.assertNotAlmostEqual(weighted_rms, unweighted_rms, places=6)
+        self.assertAlmostEqual(verified.log_standard_error, weighted_rms)
+
+        uncertain_chains = (
+            replace(chain, handoff_verified=_starter_boolean(False)),
+            replace(chain, timing_uncertain=_starter_boolean(True)),
+            replace(
+                chain,
+                handoff_verified=_starter_boolean(False),
+                timing_uncertain=_starter_boolean(True),
+            ),
+        )
+        one_penalty = math.hypot(
+            weighted_rms,
+            config.handoff_uncertainty_log_se_penalty,
+        )
+        double_penalty = math.sqrt(
+            weighted_rms ** 2
+            + 2 * config.handoff_uncertainty_log_se_penalty ** 2
+        )
+
+        for uncertain_chain in uncertain_chains:
+            with self.subTest(
+                handoff_verified=uncertain_chain.handoff_verified.value,
+                timing_uncertain=uncertain_chain.timing_uncertain.value,
+            ):
+                uncertain = forecast_pitcher_chain(uncertain_chain, config)
+                self.assertAlmostEqual(
+                    uncertain.log_standard_error,
+                    one_penalty,
+                )
+                self.assertNotAlmostEqual(
+                    uncertain.log_standard_error,
+                    double_penalty,
+                    places=12,
+                )
+
     def test_verified_opener_bulk_and_prim_plans_are_ordered_and_contiguous(self):
         for final_role in (PitcherRole.BULK, PitcherRole.PRIM):
             with self.subTest(final_role=final_role):
@@ -1019,6 +1091,61 @@ class StarterForecastTests(unittest.TestCase):
         self.assertEqual(plan.segments[-1].start_out, 12)
         self.assertEqual(plan.segments[-1].end_out, 12)
         self.assertEqual(plan.combined_outs, 12)
+
+    def test_sample_plan_draws_combined_total_before_component_workload(self):
+        combined_workload = WorkloadDistribution(
+            probabilities=(1.0, 0.0, 0.0),
+            supports=((4, 12), (15,), (18,)),
+            source="combined_chain_history",
+            notes=(),
+        )
+        opener_workload = WorkloadDistribution(
+            probabilities=(1.0, 0.0, 0.0),
+            supports=((2, 10), (15,), (18,)),
+            source="pitcher_history",
+            notes=(),
+        )
+        opener = PitcherForecast(
+            pitcher_id="pitcher:opener",
+            role="opener",
+            workload=opener_workload,
+            run_prevention_multiplier=0.9,
+            log_standard_error=0.2,
+            command_risk=False,
+            home_run_risk=False,
+            diagnostics=(),
+        )
+        bulk = replace(
+            opener,
+            pitcher_id="pitcher:bulk",
+            role="bulk",
+        )
+        forecast = PitcherChainForecast(
+            pitchers=(opener, bulk),
+            combined_workload=combined_workload,
+            log_standard_error=0.2,
+            diagnostics=(),
+        )
+        # Combined-first selects total 12 then opener 2; reversed order yields total 4.
+        rng = SequenceRandomRng((0.0, 0.99, 0.0, 0.01))
+
+        plan = forecast.sample_plan(rng)
+
+        self.assertEqual(rng.calls, [0.0, 0.99, 0.0, 0.01])
+        self.assertEqual(plan.combined_outs, 12)
+        self.assertEqual([segment.outs for segment in plan.segments], [2, 10])
+        self.assertEqual(
+            [(segment.start_out, segment.end_out) for segment in plan.segments],
+            [(0, 2), (2, 12)],
+        )
+        self.assertEqual(
+            plan.segments[-1].outs,
+            plan.combined_outs - plan.segments[0].outs,
+        )
+        self.assertEqual(
+            sum(segment.outs for segment in plan.segments),
+            plan.combined_outs,
+        )
 
     def test_combined_probabilities_come_from_history_not_component_convolution(self):
         forecast = forecast_pitcher_chain(
