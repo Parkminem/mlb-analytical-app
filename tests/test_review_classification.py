@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError, replace
 import math
 import unittest
 
+from analysis.forecasting import MarketType
 from analysis.model import PriorityEvidencePath
 from analysis.review import (
     ComponentForecast,
@@ -25,6 +26,24 @@ INTERVAL = PredictiveInterval(
     p80=4.0,
     p90=5.0,
     p95=6.0,
+)
+POSITIVE_COUNT_INTERVAL = PredictiveInterval(
+    p05=1.0,
+    p10=2.0,
+    p20=3.0,
+    median=4.0,
+    p80=5.0,
+    p90=6.0,
+    p95=7.0,
+)
+BINARY_RANGE_INTERVAL = PredictiveInterval(
+    p05=0.0,
+    p10=0.0,
+    p20=0.0,
+    median=0.5,
+    p80=1.0,
+    p90=1.0,
+    p95=1.0,
 )
 BINARY_TRUE_INTERVAL = PredictiveInterval(
     p05=1.0,
@@ -52,6 +71,7 @@ def candidate(
     intervals=None,
     evidence_paths=None,
     market_key="game:1:full_total:over:8.0",
+    market_type=MarketType.FULL_TOTAL,
     market_result="win",
     recommended=True,
     events=(),
@@ -89,6 +109,7 @@ def candidate(
         forecast_run_id="forecast:1",
         official_result_record_id="result:1",
         market_key=market_key,
+        market_type=market_type,
         recommended=recommended,
         market_result=market_result,
         component_forecasts=forecasts,
@@ -128,7 +149,7 @@ class ReviewClassificationTests(unittest.TestCase):
     def test_a_requires_win_and_at_least_seventy_five_percent_inside_80(self):
         result = classify_review(
             candidate(
-                values=standard_values(xbh=5.5),
+                values=standard_values(xbh=6.0),
                 principal_paths=standard_paths(),
                 market_result="win",
             )
@@ -151,7 +172,7 @@ class ReviewClassificationTests(unittest.TestCase):
             candidate(
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
-                    "home_bullpen_runs_allowed": 5.5,
+                    "home_bullpen_runs_allowed": 6.0,
                     "home_protected_bullpen_close_entry": 1.0,
                 },
                 intervals={
@@ -237,8 +258,8 @@ class ReviewClassificationTests(unittest.TestCase):
         result = classify_review(
             candidate(
                 values={
-                    **standard_values(xbh=5.5),
-                    "home_bullpen_runs_allowed": 5.5,
+                    **standard_values(xbh=6.0),
+                    "home_bullpen_runs_allowed": 6.0,
                     "home_protected_bullpen_close_entry": 1.0,
                 },
                 principal_paths=paths,
@@ -254,11 +275,16 @@ class ReviewClassificationTests(unittest.TestCase):
 
     def test_shared_component_across_two_paths_is_accepted_and_counted_once(self):
         paths = (
-            standard_paths()[0],
             binding(
                 PriorityEvidencePath.STARTER_COLLAPSE,
                 ContradictionRule.STARTER_COLLAPSE,
                 "away_pitcher_chain_runs_allowed",
+                "away_pitcher_chain_workload_outs",
+            ),
+            binding(
+                PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+                ContradictionRule.LATE_BULLPEN_EXPOSURE,
+                "away_bullpen_segment_bridge:1_exposed",
                 "away_pitcher_chain_workload_outs",
             ),
         )
@@ -267,7 +293,13 @@ class ReviewClassificationTests(unittest.TestCase):
             review_candidate = candidate(
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
-                    "away_pitcher_chain_workload_outs": 5.5,
+                    "away_pitcher_chain_workload_outs": 6.0,
+                    "away_bullpen_segment_bridge:1_exposed": 0.0,
+                },
+                intervals={
+                    "away_bullpen_segment_bridge:1_exposed": (
+                        BINARY_TRUE_INTERVAL
+                    ),
                 },
                 principal_paths=paths,
                 market_result="loss",
@@ -277,13 +309,13 @@ class ReviewClassificationTests(unittest.TestCase):
 
         result = classify_review(review_candidate)
 
-        self.assertEqual(result.inside_80_ratio, 0.5)
+        self.assertAlmostEqual(result.inside_80_ratio, 1 / 3)
         self.assertEqual(
             tuple(
                 (review.component_count, review.inside_80_count)
                 for review in result.path_reviews
             ),
-            ((1, 1), (2, 1)),
+            ((2, 1), (2, 0)),
         )
         self.assertEqual(result.classification, "C")
 
@@ -325,8 +357,8 @@ class ReviewClassificationTests(unittest.TestCase):
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
                     "home_pitcher_chain_runs_allowed": 3.0,
-                    "home_pitcher_chain_workload_outs": 5.5,
-                    "away_bullpen_runs_allowed": 5.5,
+                    "home_pitcher_chain_workload_outs": 6.0,
+                    "away_bullpen_runs_allowed": 6.0,
                     "away_protected_bullpen_close_entry": 1.0,
                 },
                 principal_paths=paths,
@@ -340,12 +372,49 @@ class ReviewClassificationTests(unittest.TestCase):
         self.assertEqual(result.inside_80_ratio, 0.6)
         self.assertEqual(result.classification, "B")
 
+    def test_path_outputs_are_independent_of_principal_path_input_order(self):
+        intervals = {
+            "home_full_runs": POSITIVE_COUNT_INTERVAL,
+            "home_full_traffic": POSITIVE_COUNT_INTERVAL,
+            "home_full_extra_base_hits": POSITIVE_COUNT_INTERVAL,
+        }
+        values = standard_values(
+            chain_runs=7.0,
+            runs=0.0,
+            traffic=0.0,
+            xbh=0.0,
+        )
+
+        forward = classify_review(
+            candidate(
+                values=values,
+                intervals=intervals,
+                principal_paths=standard_paths(),
+            )
+        )
+        reverse = classify_review(
+            candidate(
+                values=values,
+                intervals=intervals,
+                principal_paths=tuple(reversed(standard_paths())),
+            )
+        )
+
+        self.assertEqual(forward, reverse)
+        self.assertEqual(
+            forward.contradicted_paths,
+            (
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            ),
+        )
+
 
 class ContradictionRuleTests(unittest.TestCase):
     def test_starter_suppression_requires_runs_above_p90_and_outside_p95(self):
         inside_90 = classify_review(
             candidate(
-                values=standard_values(chain_runs=5.5),
+                values=standard_values(chain_runs=6.0),
                 principal_paths=standard_paths(),
                 market_result="loss",
             )
@@ -374,11 +443,14 @@ class ContradictionRuleTests(unittest.TestCase):
         contradicted = classify_review(
             candidate(
                 values={
-                    "away_pitcher_chain_runs_allowed": -1.0,
+                    "away_pitcher_chain_runs_allowed": 0.0,
                     "away_pitcher_chain_workload_outs": 3.0,
                     "home_full_runs": 3.0,
                     "home_full_traffic": 3.0,
                     "home_full_extra_base_hits": 3.0,
+                },
+                intervals={
+                    "away_pitcher_chain_runs_allowed": POSITIVE_COUNT_INTERVAL,
                 },
                 principal_paths=paths,
             )
@@ -386,11 +458,14 @@ class ContradictionRuleTests(unittest.TestCase):
         short_workload = classify_review(
             candidate(
                 values={
-                    "away_pitcher_chain_runs_allowed": -1.0,
-                    "away_pitcher_chain_workload_outs": 2.5,
+                    "away_pitcher_chain_runs_allowed": 0.0,
+                    "away_pitcher_chain_workload_outs": 2.0,
                     "home_full_runs": 3.0,
                     "home_full_traffic": 3.0,
                     "home_full_extra_base_hits": 3.0,
+                },
+                intervals={
+                    "away_pitcher_chain_runs_allowed": POSITIVE_COUNT_INTERVAL,
                 },
                 principal_paths=paths,
             )
@@ -400,21 +475,29 @@ class ContradictionRuleTests(unittest.TestCase):
         self.assertFalse(short_workload.path_reviews[0].contradicted)
 
     def test_top_order_rule_requires_all_three_low_and_one_outside_90(self):
+        intervals = {
+            "home_full_runs": POSITIVE_COUNT_INTERVAL,
+            "home_full_traffic": POSITIVE_COUNT_INTERVAL,
+            "home_full_extra_base_hits": POSITIVE_COUNT_INTERVAL,
+        }
         all_low_with_tail = classify_review(
             candidate(
-                values=standard_values(runs=-1.0, traffic=0.5, xbh=0.5),
+                values=standard_values(runs=0.0, traffic=0.0, xbh=0.0),
+                intervals=intervals,
                 principal_paths=standard_paths(),
             )
         )
         all_low_inside_90 = classify_review(
             candidate(
-                values=standard_values(runs=0.5, traffic=0.5, xbh=0.5),
+                values=standard_values(runs=1.0, traffic=1.0, xbh=1.0),
+                intervals=intervals,
                 principal_paths=standard_paths(),
             )
         )
         one_not_low = classify_review(
             candidate(
-                values=standard_values(runs=-1.0, traffic=1.0, xbh=0.5),
+                values=standard_values(runs=0.0, traffic=2.0, xbh=1.0),
+                intervals=intervals,
                 principal_paths=standard_paths(),
             )
         )
@@ -506,6 +589,7 @@ class ContradictionRuleTests(unittest.TestCase):
             (
                 "starter suppression extra",
                 "game:1:full_total:over:8.0",
+                MarketType.FULL_TOTAL,
                 binding(
                     PriorityEvidencePath.STARTER_SUPPRESSION,
                     ContradictionRule.STARTER_SUPPRESSION,
@@ -516,6 +600,7 @@ class ContradictionRuleTests(unittest.TestCase):
             (
                 "starter collapse cross-team",
                 "game:1:full_total:over:8.0",
+                MarketType.FULL_TOTAL,
                 binding(
                     PriorityEvidencePath.STARTER_COLLAPSE,
                     ContradictionRule.STARTER_COLLAPSE,
@@ -526,6 +611,7 @@ class ContradictionRuleTests(unittest.TestCase):
             (
                 "top order cross-team",
                 "game:1:full_total:over:8.0",
+                MarketType.FULL_TOTAL,
                 binding(
                     PriorityEvidencePath.TOP_ORDER_MATCHUP,
                     ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
@@ -536,7 +622,8 @@ class ContradictionRuleTests(unittest.TestCase):
             ),
             (
                 "top order F5 horizon",
-                "game:1:f5_total:over:4.5",
+                "opaque-market-key",
+                MarketType.F5_TOTAL,
                 binding(
                     PriorityEvidencePath.TOP_ORDER_MATCHUP,
                     ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
@@ -548,6 +635,7 @@ class ContradictionRuleTests(unittest.TestCase):
             (
                 "late bullpen cross-team",
                 "game:1:full_total:over:8.0",
+                MarketType.FULL_TOTAL,
                 binding(
                     PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
                     ContradictionRule.LATE_BULLPEN_EXPOSURE,
@@ -558,6 +646,7 @@ class ContradictionRuleTests(unittest.TestCase):
             (
                 "bullpen protection cross-team",
                 "game:1:full_total:over:8.0",
+                MarketType.FULL_TOTAL,
                 binding(
                     PriorityEvidencePath.BULLPEN_PROTECTION,
                     ContradictionRule.BULLPEN_PROTECTION,
@@ -566,19 +655,114 @@ class ContradictionRuleTests(unittest.TestCase):
                 ),
             ),
         )
-        for label, market_key, path in cases:
+        for label, market_key, market_type, path in cases:
             with self.subTest(label=label):
-                values = {component_id: 3.0 for component_id in path.component_ids}
+                binary_ids = {
+                    component_id
+                    for component_id in path.component_ids
+                    if component_id.endswith("_exposed")
+                    or component_id.endswith("_protected_bullpen_close_entry")
+                }
+                values = {
+                    component_id: 1.0 if component_id in binary_ids else 3.0
+                    for component_id in path.component_ids
+                }
                 with self.assertRaisesRegex(ValueError, "binding shape"):
                     candidate(
                         values=values,
+                        intervals={
+                            component_id: BINARY_TRUE_INTERVAL
+                            for component_id in binary_ids
+                        },
                         principal_paths=(path,),
                         market_key=market_key,
+                        market_type=market_type,
+                        recommended=False,
+                    )
+
+    def test_conversion_binding_horizon_uses_market_type_only(self):
+        cases = (
+            (MarketType.F5_SIDE, "f5", "looks:like:full_total"),
+            (MarketType.F5_TOTAL, "f5", "looks:like:full_total"),
+            (MarketType.ML, "full", "looks:like:f5_total"),
+            (MarketType.PLUS_1_5, "full", "looks:like:f5_total"),
+            (MarketType.FULL_TOTAL, "full", "looks:like:f5_total"),
+        )
+        for market_type, expected_horizon, market_key in cases:
+            with self.subTest(market_type=market_type):
+                component_ids = (
+                    f"home_{expected_horizon}_runs",
+                    f"home_{expected_horizon}_traffic",
+                    f"home_{expected_horizon}_extra_base_hits",
+                )
+                path = binding(
+                    PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                    ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+                    *component_ids,
+                )
+                try:
+                    candidate(
+                        values={component_id: 3.0 for component_id in component_ids},
+                        principal_paths=(path,),
+                        market_key=market_key,
+                        market_type=market_type,
+                        recommended=False,
+                    )
+                except (TypeError, ValueError) as error:
+                    self.fail(f"market_type should define the horizon: {error}")
+
+                wrong_horizon = "full" if expected_horizon == "f5" else "f5"
+                wrong_component_ids = (
+                    f"home_{wrong_horizon}_runs",
+                    f"home_{wrong_horizon}_traffic",
+                    f"home_{wrong_horizon}_extra_base_hits",
+                )
+                wrong_path = binding(
+                    PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                    ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+                    *wrong_component_ids,
+                )
+                with self.assertRaisesRegex(ValueError, "binding shape"):
+                    candidate(
+                        values={
+                            component_id: 3.0
+                            for component_id in wrong_component_ids
+                        },
+                        principal_paths=(wrong_path,),
+                        market_key=market_key,
+                        market_type=market_type,
                         recommended=False,
                     )
 
 
 class ExogenousEventTests(unittest.TestCase):
+    def test_event_type_must_be_a_canonical_supported_string(self):
+        supported_types = (
+            "injury",
+            "ejection",
+            "defensive_error",
+            "defensive_error_cluster",
+            "predeclared",
+        )
+        for event_type in supported_types:
+            with self.subTest(event_type=event_type):
+                ExogenousEvent(
+                    event_type=event_type,
+                    affected_component_id="away_pitcher_chain_runs_allowed",
+                    documented_source_observation_id="official:event:1",
+                )
+
+        for event_type in ("Injury", "defensive-error", "injruy", "weather"):
+            with self.subTest(event_type=event_type):
+                with self.assertRaisesRegex(ValueError, "event_type"):
+                    ExogenousEvent(
+                        event_type=event_type,
+                        affected_component_id=(
+                            "away_pitcher_chain_runs_allowed"
+                        ),
+                        documented_source_observation_id="official:event:1",
+                    )
+
     def test_event_must_affect_component_strictly_outside_p05_p95(self):
         for boundary in (0.0, 6.0):
             with self.subTest(boundary=boundary):
@@ -597,25 +781,33 @@ class ExogenousEventTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.classification, "D")
 
-    def test_defensive_error_requires_at_least_three_unearned_runs(self):
-        for unearned_runs, expected in ((2, "C"), (3, "D")):
-            with self.subTest(unearned_runs=unearned_runs):
-                result = classify_review(
-                    candidate(
-                        values=standard_values(chain_runs=7.0),
-                        principal_paths=standard_paths(),
-                        market_result="win",
-                        events=(
-                            ExogenousEvent(
-                                event_type="defensive_error",
-                                affected_component_id="away_pitcher_chain_runs_allowed",
-                                documented_source_observation_id="official:error:1",
-                                unearned_runs=unearned_runs,
+    def test_defensive_error_forms_require_at_least_three_unearned_runs(self):
+        for event_type in ("defensive_error", "defensive_error_cluster"):
+            for unearned_runs, expected in ((2, "C"), (3, "D")):
+                with self.subTest(
+                    event_type=event_type,
+                    unearned_runs=unearned_runs,
+                ):
+                    result = classify_review(
+                        candidate(
+                            values=standard_values(chain_runs=7.0),
+                            principal_paths=standard_paths(),
+                            market_result="win",
+                            events=(
+                                ExogenousEvent(
+                                    event_type=event_type,
+                                    affected_component_id=(
+                                        "away_pitcher_chain_runs_allowed"
+                                    ),
+                                    documented_source_observation_id=(
+                                        "official:error:1"
+                                    ),
+                                    unearned_runs=unearned_runs,
+                                ),
                             ),
-                        ),
+                        )
                     )
-                )
-                self.assertEqual(result.classification, expected)
+                    self.assertEqual(result.classification, expected)
 
     def test_event_component_must_exist_in_forecast_and_observation(self):
         with self.assertRaisesRegex(ValueError, "affected component"):
@@ -626,6 +818,26 @@ class ExogenousEventTests(unittest.TestCase):
                     ExogenousEvent(
                         event_type="injury",
                         affected_component_id="home_pitcher_chain_workload_outs",
+                        documented_source_observation_id="official:injury:1",
+                    ),
+                ),
+            )
+
+    def test_event_component_must_be_bound_to_a_principal_path(self):
+        values = standard_values()
+        values["away_full_runs"] = 7.0
+
+        with self.assertRaisesRegex(ValueError, "principal-bound"):
+            candidate(
+                values=values,
+                principal_paths=standard_paths(),
+                evidence_paths={
+                    "away_full_runs": PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+                },
+                events=(
+                    ExogenousEvent(
+                        event_type="injury",
+                        affected_component_id="away_full_runs",
                         documented_source_observation_id="official:injury:1",
                     ),
                 ),
@@ -683,6 +895,86 @@ class ReviewValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             ComponentObservation("away_full_runs", math.nan)
 
+    def test_known_count_components_require_nonnegative_integral_values(self):
+        component_ids = (
+            "away_pitcher_chain_runs_allowed",
+            "home_pitcher_chain_workload_outs",
+            "away_f5_runs",
+            "away_f5_traffic",
+            "away_f5_extra_base_hits",
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+            "away_bullpen_runs_allowed",
+        )
+        negative_interval = replace(INTERVAL, p05=-1.0)
+
+        for component_id in component_ids:
+            with self.subTest(component_id=component_id, value=-1):
+                with self.assertRaisesRegex(ValueError, "count observation"):
+                    ComponentObservation(component_id, -1.0)
+            with self.subTest(component_id=component_id, value=1.5):
+                with self.assertRaisesRegex(ValueError, "count observation"):
+                    ComponentObservation(component_id, 1.5)
+            with self.subTest(component_id=component_id, interval="negative"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "count forecast interval",
+                ):
+                    ComponentForecast(
+                        component_id=component_id,
+                        evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                        interval=negative_interval,
+                        direction="high_is_supportive",
+                    )
+
+            ComponentObservation(component_id, 0.0)
+            ComponentForecast(
+                component_id=component_id,
+                evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                interval=INTERVAL,
+                direction="high_is_supportive",
+            )
+
+    def test_binary_components_stay_within_the_binary_domain(self):
+        component_ids = (
+            "away_bullpen_segment_bridge:1_exposed",
+            "home_protected_bullpen_close_entry",
+        )
+        invalid_intervals = (
+            replace(BINARY_RANGE_INTERVAL, p05=-0.1),
+            replace(BINARY_RANGE_INTERVAL, p95=1.1),
+        )
+
+        for component_id in component_ids:
+            for value in (-1.0, 0.5, 2.0):
+                with self.subTest(component_id=component_id, value=value):
+                    with self.assertRaisesRegex(ValueError, "binary observation"):
+                        ComponentObservation(component_id, value)
+            for interval in invalid_intervals:
+                with self.subTest(component_id=component_id, interval=interval):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "binary forecast interval",
+                    ):
+                        ComponentForecast(
+                            component_id=component_id,
+                            evidence_path=(
+                                PriorityEvidencePath.LATE_BULLPEN_EXPOSURE
+                            ),
+                            interval=interval,
+                            direction="high_is_supportive",
+                        )
+
+            for value in (0.0, 1.0):
+                ComponentObservation(component_id, value)
+            ComponentForecast(
+                component_id=component_id,
+                evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+                interval=BINARY_RANGE_INTERVAL,
+                direction="high_is_supportive",
+            )
+
     def test_direction_rejects_unhashable_non_string_values_cleanly(self):
         with self.assertRaisesRegex(ValueError, "direction"):
             ComponentForecast(
@@ -739,6 +1031,12 @@ class ReviewValidationTests(unittest.TestCase):
                 ),
             )
 
+    def test_recommended_candidate_requires_a_market_result(self):
+        base = candidate(values=standard_values(), principal_paths=standard_paths())
+
+        with self.assertRaisesRegex(ValueError, "recommended.*market_result"):
+            replace(base, market_result=None)
+
     def test_principal_paths_and_rules_reject_string_aliases(self):
         with self.assertRaisesRegex(ValueError, "canonical PriorityEvidencePath"):
             PrincipalPathBinding(
@@ -752,6 +1050,43 @@ class ReviewValidationTests(unittest.TestCase):
                 component_ids=("away_pitcher_chain_runs_allowed",),
                 contradiction_rule="starter_suppression",
             )
+
+    def test_each_evidence_path_requires_its_canonical_contradiction_rule(self):
+        allowed_rules = {
+            PriorityEvidencePath.STARTER_SUPPRESSION: (
+                ContradictionRule.STARTER_SUPPRESSION
+            ),
+            PriorityEvidencePath.STARTER_COLLAPSE: (
+                ContradictionRule.STARTER_COLLAPSE
+            ),
+            PriorityEvidencePath.TOP_ORDER_MATCHUP: (
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+            PriorityEvidencePath.RECENT_RUN_CONVERSION: (
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+            PriorityEvidencePath.UNDERDOG_RUN_CREATION: (
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+            PriorityEvidencePath.LATE_BULLPEN_EXPOSURE: (
+                ContradictionRule.LATE_BULLPEN_EXPOSURE
+            ),
+            PriorityEvidencePath.BULLPEN_PROTECTION: (
+                ContradictionRule.BULLPEN_PROTECTION
+            ),
+        }
+
+        for evidence_path, allowed_rule in allowed_rules.items():
+            for rule in ContradictionRule:
+                with self.subTest(evidence_path=evidence_path, rule=rule):
+                    if rule is allowed_rule:
+                        binding(evidence_path, rule, "component")
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "contradiction_rule must match evidence_path",
+                        ):
+                            binding(evidence_path, rule, "component")
 
     def test_every_bound_component_must_exist_in_forecasts_and_observations(self):
         base = candidate(values=standard_values(), principal_paths=standard_paths())
@@ -769,11 +1104,16 @@ class ReviewValidationTests(unittest.TestCase):
 
     def test_shared_component_path_must_match_a_referencing_binding(self):
         paths = (
-            standard_paths()[0],
             binding(
                 PriorityEvidencePath.STARTER_COLLAPSE,
                 ContradictionRule.STARTER_COLLAPSE,
                 "away_pitcher_chain_runs_allowed",
+                "away_pitcher_chain_workload_outs",
+            ),
+            binding(
+                PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+                ContradictionRule.LATE_BULLPEN_EXPOSURE,
+                "away_bullpen_segment_bridge:1_exposed",
                 "away_pitcher_chain_workload_outs",
             ),
         )
@@ -783,10 +1123,16 @@ class ReviewValidationTests(unittest.TestCase):
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
                     "away_pitcher_chain_workload_outs": 3.0,
+                    "away_bullpen_segment_bridge:1_exposed": 1.0,
                 },
                 principal_paths=paths,
+                intervals={
+                    "away_bullpen_segment_bridge:1_exposed": (
+                        BINARY_TRUE_INTERVAL
+                    ),
+                },
                 evidence_paths={
-                    "away_pitcher_chain_runs_allowed": (
+                    "away_pitcher_chain_workload_outs": (
                         PriorityEvidencePath.TOP_ORDER_MATCHUP
                     ),
                 },
@@ -794,6 +1140,8 @@ class ReviewValidationTests(unittest.TestCase):
 
     def test_candidate_scalars_and_event_metadata_are_validated(self):
         base = candidate(values=standard_values(), principal_paths=standard_paths())
+        with self.assertRaisesRegex(ValueError, "market_type"):
+            replace(base, market_type="full_total")
         with self.assertRaisesRegex(ValueError, "recommended"):
             replace(base, recommended=1)
         with self.assertRaisesRegex(ValueError, "market_result"):
@@ -841,6 +1189,55 @@ class ReviewValidationTests(unittest.TestCase):
                 contradicted_paths=(),
                 path_reviews=(),
             )
+
+    def test_direct_classification_enforces_representable_class_invariants(self):
+        contradicted_review = PathReview(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("away_pitcher_chain_runs_allowed",),
+            contradicted=True,
+            inside_80_count=0,
+            component_count=1,
+        )
+        contradicted_paths = (PriorityEvidencePath.STARTER_SUPPRESSION,)
+        path_reviews = (contradicted_review,)
+
+        with self.assertRaisesRegex(ValueError, "A requires"):
+            ReviewClassification("A", 0.74, (), ())
+        with self.assertRaisesRegex(ValueError, "A requires"):
+            ReviewClassification(
+                "A",
+                1.0,
+                contradicted_paths,
+                path_reviews,
+            )
+        with self.assertRaisesRegex(ValueError, "B requires"):
+            ReviewClassification("B", 0.59, (), ())
+        with self.assertRaisesRegex(ValueError, "B requires"):
+            ReviewClassification(
+                "B",
+                1.0,
+                contradicted_paths,
+                path_reviews,
+            )
+        with self.assertRaisesRegex(ValueError, "C requires"):
+            ReviewClassification("C", 0.60, (), ())
+
+        valid_cases = (
+            ("A", 0.75, (), ()),
+            ("B", 0.60, (), ()),
+            ("C", 0.59, (), ()),
+            ("C", 1.0, contradicted_paths, path_reviews),
+            ("D", 1.0, contradicted_paths, path_reviews),
+            (None, 0.0, (), ()),
+        )
+        for classification, ratio, paths, reviews in valid_cases:
+            with self.subTest(classification=classification, ratio=ratio):
+                ReviewClassification(
+                    classification,
+                    ratio,
+                    paths,
+                    reviews,
+                )
 
     def test_classification_rejects_unhashable_non_string_values_cleanly(self):
         with self.assertRaisesRegex(ValueError, "classification"):
