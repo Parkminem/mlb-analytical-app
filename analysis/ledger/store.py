@@ -146,6 +146,24 @@ def _review_market_compatibility_error(
     return None
 
 
+def _forecast_market_type(
+    forecast: ForecastRecord,
+    market_key: str,
+) -> str | None:
+    market_inputs = forecast.outputs.get("market_inputs")
+    if not isinstance(market_inputs, Mapping):
+        return None
+    market_input = market_inputs.get(market_key)
+    if not isinstance(market_input, Mapping):
+        return None
+    if market_input.get("market_key") != market_key:
+        return None
+    market_type = market_input.get("market_type")
+    if not isinstance(market_type, str) or not market_type.strip():
+        return None
+    return market_type
+
+
 def _command_for_capture(record: CaptureRecord) -> CaptureCommand:
     return CaptureCommand(
         game_pk=record.game_pk,
@@ -387,25 +405,14 @@ def _review_relationship_error(
             "official result"
         )
 
-    matching_markets = [
-        record
-        for record in records
-        if isinstance(record, MarketObservationRecord)
-        and record.market_key == command.market_key
-    ]
-    if not matching_markets:
-        return "review market_key must reference an existing market observation"
-    game_markets = tuple(
-        record for record in matching_markets if record.game_pk == capture.game_pk
-    )
-    if not game_markets:
-        return "review market observation must concern the capture game"
-    market_types = frozenset(record.market_type for record in game_markets)
-    if len(market_types) != 1:
-        return "review market observations must agree on market_type"
+    market_type = _forecast_market_type(forecast, command.market_key)
+    if market_type is None:
+        return (
+            "review market_key must reference the linked forecast semantic market"
+        )
     compatibility_error = _review_market_compatibility_error(
         command,
-        next(iter(market_types)),
+        market_type,
     )
     if compatibility_error is not None:
         return compatibility_error
@@ -600,6 +607,7 @@ class LedgerStore:
         self,
         descriptor: int | None = None,
     ) -> tuple[_RecordT, ...]:
+        read_descriptor = -1
         read_locked = False
         try:
             if descriptor is None:
@@ -610,6 +618,11 @@ class LedgerStore:
                 )
                 fcntl.flock(read_descriptor, fcntl.LOCK_SH)
                 read_locked = True
+                self._validate_open_descriptor(
+                    read_descriptor,
+                    self._ledger_name,
+                    "ledger",
+                )
             else:
                 self._validate_open_descriptor(
                     descriptor,
@@ -617,9 +630,16 @@ class LedgerStore:
                     "ledger",
                 )
                 read_descriptor = os.dup(descriptor)
-            with os.fdopen(read_descriptor, "rb") as ledger:
+            ledger = os.fdopen(read_descriptor, "rb")
+            read_descriptor = -1
+            with ledger:
                 ledger.seek(0)
                 raw_content = ledger.read()
+                self._validate_open_descriptor(
+                    ledger.fileno() if descriptor is None else descriptor,
+                    self._ledger_name,
+                    "ledger",
+                )
                 if read_locked:
                     fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
                     read_locked = False
@@ -629,6 +649,9 @@ class LedgerStore:
                     "ledger file identity changed or was removed"
                 ) from error
             return ()
+        finally:
+            if read_descriptor >= 0:
+                os.close(read_descriptor)
         try:
             content = raw_content.decode("utf-8")
         except UnicodeError as error:
@@ -851,6 +874,11 @@ class LedgerStore:
                         ):
                             continue
                         if existing.envelope.payload_hash == logical_hash:
+                            self._validate_open_descriptor(
+                                descriptor,
+                                self._ledger_name,
+                                "ledger",
+                            )
                             return existing
                         raise IdempotencyConflict(
                             "idempotency key already used for another logical "

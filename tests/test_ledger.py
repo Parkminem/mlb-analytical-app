@@ -63,6 +63,17 @@ def forecast_command(**overrides: object) -> ForecastCommand:
         "simulation_config_hash": "simulation-hash-1",
         "normalized_input_hash": "input-hash-1",
         "outputs": {
+            "market_inputs": {
+                "game:900001:ml:SEA": {
+                    "market_key": "game:900001:ml:SEA",
+                    "market_type": "ml",
+                    "settlement_format": "two_way",
+                    "selected_side": "away",
+                    "line": None,
+                    "selected_decimal_price": 1.91,
+                    "opposing_decimal_price": 1.95,
+                }
+            },
             "markets": [
                 {
                     "market_key": "game:900001:ml:SEA",
@@ -1221,6 +1232,61 @@ class LedgerStoreTests(unittest.TestCase):
             )
             self.assertEqual(len(tuple(store.iter_records("review"))), 1)
 
+    def test_review_uses_frozen_forecast_market_without_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture = store.append_capture("capture:review", capture_command())
+            forecast = store.append_forecast(forecast_command())
+            link = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            result = store.append_official_result(result_command())
+            command = review_command(
+                capture_forecast_link_record_id=link.envelope.record_id,
+                capture_id=capture.capture_id,
+                forecast_run_id=forecast.forecast_run_id,
+                official_result_record_id=result.envelope.record_id,
+            )
+
+            review = store.append_review(command)
+
+            self.assertEqual(review.market_key, command.market_key)
+
+    def test_review_market_horizon_comes_from_frozen_forecast(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture = store.append_capture("capture:review", capture_command())
+            forecast = store.append_forecast(forecast_command())
+            link = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            market = store.append_market_observation(
+                market_command(market_type="f5_side")
+            )
+            result = store.append_official_result(result_command())
+            component_reviews = list(review_command().component_reviews)
+            component_reviews[1] = {
+                **dict(component_reviews[1]),
+                "component_ids": (
+                    "away_f5_runs",
+                    "away_f5_traffic",
+                    "away_f5_extra_base_hits",
+                ),
+            }
+            command = review_command(
+                capture_forecast_link_record_id=link.envelope.record_id,
+                capture_id=capture.capture_id,
+                forecast_run_id=forecast.forecast_run_id,
+                official_result_record_id=result.envelope.record_id,
+                market_key=market.market_key,
+                component_reviews=component_reviews,
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "market horizon"):
+                store.append_review(command)
+
     def test_stale_result_review_replays_but_cannot_append_under_a_new_key(
         self,
     ) -> None:
@@ -2103,7 +2169,7 @@ class LedgerStoreTests(unittest.TestCase):
                 if file_name != store._ledger_name:
                     return
                 ledger_validations += 1
-                if ledger_validations == 3:
+                if ledger_validations == 4:
                     path.rename(displaced_path)
                     replacement_path.rename(path)
 
@@ -2132,6 +2198,131 @@ class LedgerStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(LedgerCorruptionError, "identity"):
                 tuple(store.iter_records())
+
+    def test_read_revalidates_ledger_identity_after_acquiring_inode_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_path = root / "ledger-displaced.jsonl"
+            replacement_path = root / "ledger-replacement.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:trusted-read",
+                capture_command(payload={"source": "trusted"}),
+            )
+            LedgerStore(replacement_path).append_capture(
+                "capture:replacement-read",
+                capture_command(payload={"source": "replacement"}),
+            )
+            replacement_content = replacement_path.read_bytes()
+            real_validate = store._validate_open_descriptor
+            swapped = False
+
+            def swap_after_reader_open(
+                descriptor: int,
+                file_name: str,
+                path_label: str,
+            ) -> None:
+                nonlocal swapped
+                real_validate(descriptor, file_name, path_label)
+                if file_name == store._ledger_name and not swapped:
+                    path.rename(displaced_path)
+                    replacement_path.rename(path)
+                    swapped = True
+
+            with mock.patch.object(
+                store,
+                "_validate_open_descriptor",
+                side_effect=swap_after_reader_open,
+            ):
+                with self.assertRaisesRegex(LedgerCorruptionError, "changed"):
+                    tuple(store.iter_records())
+
+            self.assertEqual(path.read_bytes(), replacement_content)
+
+    def test_exact_replay_revalidates_canonical_ledger_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_path = root / "ledger-displaced.jsonl"
+            replacement_path = root / "ledger-replacement.jsonl"
+            store = LedgerStore(path)
+            command = capture_command(payload={"source": "trusted"})
+            store.append_capture("capture:trusted-replay", command)
+            LedgerStore(replacement_path).append_capture(
+                "capture:replacement-replay",
+                capture_command(payload={"source": "replacement"}),
+            )
+            replacement_content = replacement_path.read_bytes()
+            real_read_records = store._read_records
+
+            def swap_after_read(*args: object):
+                records = real_read_records(*args)
+                path.rename(displaced_path)
+                replacement_path.rename(path)
+                return records
+
+            with mock.patch.object(
+                store,
+                "_read_records",
+                side_effect=swap_after_read,
+            ):
+                with self.assertRaisesRegex(LedgerCorruptionError, "changed"):
+                    store.append_capture("capture:trusted-replay", command)
+
+            self.assertEqual(path.read_bytes(), replacement_content)
+
+    def test_shared_lock_failure_closes_opened_ledger_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:lock-failure",
+                capture_command(payload={"source": "trusted"}),
+            )
+            opened_ledger_descriptors: list[int] = []
+            real_open = store._open_no_follow
+            real_flock = fcntl.flock
+
+            def capture_ledger_descriptor(
+                file_name: str,
+                flags: int,
+                path_label: str,
+            ) -> int:
+                descriptor = real_open(file_name, flags, path_label)
+                if file_name == store._ledger_name:
+                    opened_ledger_descriptors.append(descriptor)
+                return descriptor
+
+            def fail_shared_ledger_lock(
+                descriptor: int,
+                operation: int,
+            ) -> None:
+                descriptor_stat = os.fstat(descriptor)
+                identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                if operation == fcntl.LOCK_SH and identity == store._ledger_identity:
+                    raise OSError("injected shared ledger lock failure")
+                real_flock(descriptor, operation)
+
+            with (
+                mock.patch.object(
+                    store,
+                    "_open_no_follow",
+                    side_effect=capture_ledger_descriptor,
+                ),
+                mock.patch(
+                    "analysis.ledger.store.fcntl.flock",
+                    side_effect=fail_shared_ledger_lock,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    tuple(store.iter_records())
+
+            self.assertEqual(len(opened_ledger_descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened_ledger_descriptors[0])
 
     def test_parent_symlink_swap_cannot_redirect_append_or_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

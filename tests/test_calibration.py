@@ -88,6 +88,17 @@ def forecast_outputs(
 ) -> dict[str, object]:
     key = market_key(game_pk, market_type)
     return {
+        "market_inputs": {
+            key: {
+                "market_key": key,
+                "market_type": market_type,
+                "settlement_format": "two_way",
+                "selected_side": selected_side,
+                "line": line,
+                "selected_decimal_price": selected_price,
+                "opposing_decimal_price": opposing_price,
+            }
+        },
         "forecast_output": {
             "markets": {
                 key: {
