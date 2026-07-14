@@ -600,6 +600,7 @@ class LedgerStore:
         self,
         descriptor: int | None = None,
     ) -> tuple[_RecordT, ...]:
+        read_locked = False
         try:
             if descriptor is None:
                 read_descriptor = self._open_no_follow(
@@ -607,6 +608,8 @@ class LedgerStore:
                     os.O_RDONLY,
                     "ledger",
                 )
+                fcntl.flock(read_descriptor, fcntl.LOCK_SH)
+                read_locked = True
             else:
                 self._validate_open_descriptor(
                     descriptor,
@@ -617,7 +620,14 @@ class LedgerStore:
             with os.fdopen(read_descriptor, "rb") as ledger:
                 ledger.seek(0)
                 raw_content = ledger.read()
-        except FileNotFoundError:
+                if read_locked:
+                    fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+                    read_locked = False
+        except FileNotFoundError as error:
+            if self._ledger_identity is not None:
+                raise LedgerCorruptionError(
+                    "ledger file identity changed or was removed"
+                ) from error
             return ()
         try:
             content = raw_content.decode("utf-8")
@@ -820,12 +830,18 @@ class LedgerStore:
                     self._lock_name,
                     "ledger lock",
                 )
+                ledger_flags = os.O_APPEND | os.O_RDWR
+                if self._ledger_identity is None:
+                    ledger_flags |= os.O_CREAT
                 descriptor = self._open_no_follow(
                     self._ledger_name,
-                    os.O_APPEND | os.O_CREAT | os.O_RDWR,
+                    ledger_flags,
                     "ledger",
                 )
+                ledger_locked = False
                 try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    ledger_locked = True
                     records = self._read_records(descriptor)
                     logical_hash = _payload_hash(logical_payload)
                     for existing in records:
@@ -865,9 +881,18 @@ class LedgerStore:
                         ledger.write(f"{canonical_json(record)}\n")
                         ledger.flush()
                         os.fsync(ledger.fileno())
+                        self._validate_open_descriptor(
+                            ledger.fileno(),
+                            self._ledger_name,
+                            "ledger",
+                        )
+                        fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+                        ledger_locked = False
                     return record
                 finally:
                     if descriptor >= 0:
+                        if ledger_locked:
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
                         os.close(descriptor)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

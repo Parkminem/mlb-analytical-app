@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import uuid
@@ -399,7 +400,16 @@ class LedgerStoreTests(unittest.TestCase):
             self.assertTrue(store.lock_path.is_file())
             self.assertEqual(
                 events,
-                ["lock_ex", "rebuild", "write", "flush", "fsync", "lock_un"],
+                [
+                    "lock_ex",
+                    "lock_ex",
+                    "rebuild",
+                    "write",
+                    "flush",
+                    "fsync",
+                    "lock_un",
+                    "lock_un",
+                ],
             )
 
     def test_same_capture_retry_returns_same_capture_and_one_row(self) -> None:
@@ -1983,6 +1993,145 @@ class LedgerStoreTests(unittest.TestCase):
 
             self.assertEqual(displaced_path.read_bytes(), trusted_content)
             self.assertEqual(path.read_bytes(), replacement_content)
+
+    def test_lock_swap_during_append_cannot_split_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_lock_path = root / "ledger-displaced.lock"
+            replacement_lock_path = root / "ledger-replacement.lock"
+            first_store = LedgerStore(path)
+            first_read = threading.Event()
+            release_first = threading.Event()
+            second_read = threading.Event()
+            results: list[CaptureRecord] = []
+            errors: list[BaseException] = []
+            real_first_read = first_store._read_records
+
+            def pause_first_after_read(*args: object):
+                records = real_first_read(*args)
+                first_read.set()
+                if not release_first.wait(timeout=5):
+                    raise TimeoutError("first append was not released")
+                return records
+
+            def append_capture(store: LedgerStore) -> None:
+                try:
+                    results.append(
+                        store.append_capture(
+                            "capture:shared-lock-swap",
+                            capture_command(payload={"source": "shared"}),
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            first_thread = threading.Thread(
+                target=append_capture,
+                args=(first_store,),
+            )
+            with mock.patch.object(
+                first_store,
+                "_read_records",
+                side_effect=pause_first_after_read,
+            ):
+                first_thread.start()
+                self.assertTrue(first_read.wait(timeout=5))
+                first_store.lock_path.rename(displaced_lock_path)
+                replacement_lock_path.write_bytes(b"")
+                replacement_lock_path.rename(first_store.lock_path)
+                second_store = LedgerStore(path)
+                real_second_read = second_store._read_records
+
+                def signal_second_read(*args: object):
+                    second_read.set()
+                    return real_second_read(*args)
+
+                second_thread = threading.Thread(
+                    target=append_capture,
+                    args=(second_store,),
+                )
+                try:
+                    with mock.patch.object(
+                        second_store,
+                        "_read_records",
+                        side_effect=signal_second_read,
+                    ):
+                        second_thread.start()
+                        second_bypassed_first = second_read.wait(timeout=0.5)
+                finally:
+                    release_first.set()
+                    first_thread.join(timeout=5)
+                    second_thread.join(timeout=5)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertFalse(second_bypassed_first)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len({record.capture_id for record in results}), 1)
+            self.assertEqual(path.read_bytes().count(b"\n"), 1)
+
+    def test_swap_after_final_validation_cannot_return_append_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_path = root / "ledger-displaced.jsonl"
+            replacement_path = root / "ledger-replacement.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:trusted-late-swap",
+                capture_command(payload={"source": "trusted"}),
+            )
+            LedgerStore(replacement_path).append_capture(
+                "capture:replacement-late-swap",
+                capture_command(payload={"source": "replacement"}),
+            )
+            replacement_content = replacement_path.read_bytes()
+            real_validate = store._validate_open_descriptor
+            ledger_validations = 0
+
+            def swap_after_final_validation(
+                descriptor: int,
+                file_name: str,
+                path_label: str,
+            ) -> None:
+                nonlocal ledger_validations
+                real_validate(descriptor, file_name, path_label)
+                if file_name != store._ledger_name:
+                    return
+                ledger_validations += 1
+                if ledger_validations == 3:
+                    path.rename(displaced_path)
+                    replacement_path.rename(path)
+
+            with mock.patch.object(
+                store,
+                "_validate_open_descriptor",
+                side_effect=swap_after_final_validation,
+            ):
+                with self.assertRaisesRegex(LedgerCorruptionError, "changed"):
+                    store.append_capture(
+                        "capture:must-not-report-success",
+                        capture_command(payload={"source": "late-swap"}),
+                    )
+
+            self.assertEqual(path.read_bytes(), replacement_content)
+
+    def test_deleted_bound_ledger_is_corruption_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:deleted-ledger",
+                capture_command(payload={"source": "trusted"}),
+            )
+            path.unlink()
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "identity"):
+                tuple(store.iter_records())
 
     def test_parent_symlink_swap_cannot_redirect_append_or_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
