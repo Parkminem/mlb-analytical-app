@@ -25,6 +25,7 @@ from analysis.forecasting.starter import (
     WorkloadDistribution,
 )
 from tests.test_forecasting_components import (
+    _bullpen_boolean,
     _bullpen_input,
     _bullpen_numeric,
     _offense_lineup,
@@ -192,6 +193,47 @@ class GameSimulationTests(unittest.TestCase):
         second = simulate_game_distribution(simulation_input, "b" * 64, config)
 
         self.assertNotEqual(first.games, second.games)
+
+    def test_batch_rngs_are_seeded_once_from_the_forecast_id_prefix(self):
+        config = SimulationConfig(simulations=3)
+        seed = int(("a" * 64)[:16], 16)
+        constructed_seeds = []
+        random_factory = simulation_module.random.Random
+
+        def tracked_random_factory(value):
+            constructed_seeds.append(value)
+            return random_factory(value)
+
+        with patch.object(
+            simulation_module.random,
+            "Random",
+            side_effect=tracked_random_factory,
+        ):
+            simulate_game_distribution(
+                _game_sim_input(config),
+                "a" * 64,
+                config,
+            )
+
+        self.assertEqual(constructed_seeds, [seed, seed])
+
+    def test_larger_batch_preserves_the_exact_simulation_prefix(self):
+        short_config = SimulationConfig(simulations=7)
+        long_config = replace(short_config, simulations=11)
+        simulation_input = _game_sim_input(short_config)
+
+        short = simulate_game_distribution(
+            simulation_input,
+            "b" * 64,
+            short_config,
+        )
+        long = simulate_game_distribution(
+            simulation_input,
+            "b" * 64,
+            long_config,
+        )
+
+        self.assertEqual(short.games, long.games[: short_config.simulations])
 
     def test_home_lead_skips_bottom_ninth(self):
         game, run_draws = _simulate_scripted_game([0, 1] + [0] * 15)
@@ -387,6 +429,48 @@ class GameSimulationTests(unittest.TestCase):
         self.assertNotEqual(
             strong.component_distributions["away_full_runs"].values,
             weak.component_distributions["away_full_runs"].values,
+        )
+
+    def test_f5_score_paths_ignore_late_bullpen_availability_and_quality(self):
+        config = _fast_config()
+        baseline_bullpen = forecast_bullpen(_bullpen_input(), config)
+        changed_bullpen = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "available": _bullpen_boolean(False),
+                    },
+                    BullpenRole.CLOSER: {
+                        "projected_ra9": _bullpen_numeric(40.0),
+                    },
+                }
+            ),
+            config,
+        )
+
+        baseline = simulate_game_distribution(
+            _game_sim_input(config, home_bullpen=baseline_bullpen),
+            "4" * 64,
+            config,
+        )
+        changed = simulate_game_distribution(
+            _game_sim_input(config, home_bullpen=changed_bullpen),
+            "4" * 64,
+            config,
+        )
+
+        def score_path(game, period):
+            return (
+                getattr(game, f"away_{period}_runs"),
+                getattr(game, f"home_{period}_runs"),
+            )
+
+        baseline_f5 = tuple(score_path(game, "f5") for game in baseline.games)
+        changed_f5 = tuple(score_path(game, "f5") for game in changed.games)
+        self.assertEqual(canonical_json(baseline_f5), canonical_json(changed_f5))
+        self.assertNotEqual(
+            tuple(score_path(game, "full") for game in baseline.games),
+            tuple(score_path(game, "full") for game in changed.games),
         )
 
     def test_diagnostic_projections_never_change_run_paths(self):
@@ -686,6 +770,60 @@ class GameSimulationTests(unittest.TestCase):
                     id(simulation_input.home_pitcher_chain): 1,
                 }
             ),
+        )
+
+    def test_both_pitcher_plans_are_sampled_before_any_latent(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        events = []
+        original_sample_plan = PitcherChainForecast.sample_plan
+        original_draw_offense = simulation_module._draw_offense_latents
+        original_draw_pitching = simulation_module._draw_pitching_latents
+
+        def tracked_sample_plan(chain, rng):
+            events.append("plan")
+            return original_sample_plan(chain, rng)
+
+        def tracked_draw_offense(*args, **kwargs):
+            events.append("offense_latents")
+            return original_draw_offense(*args, **kwargs)
+
+        def tracked_draw_pitching(*args, **kwargs):
+            events.append("pitching_latents")
+            return original_draw_pitching(*args, **kwargs)
+
+        with (
+            patch.object(
+                PitcherChainForecast,
+                "sample_plan",
+                new=tracked_sample_plan,
+            ),
+            patch.object(
+                simulation_module,
+                "_draw_offense_latents",
+                side_effect=tracked_draw_offense,
+            ),
+            patch.object(
+                simulation_module,
+                "_draw_pitching_latents",
+                side_effect=tracked_draw_pitching,
+            ),
+        ):
+            simulate_game_distribution(
+                simulation_input,
+                "5" * 64,
+                config,
+            )
+
+        self.assertEqual(events[:2], ["plan", "plan"])
+        self.assertEqual(
+            events[2:],
+            [
+                "offense_latents",
+                "offense_latents",
+                "pitching_latents",
+                "pitching_latents",
+            ],
         )
 
     def test_direct_game_rejects_out_of_range_sampled_workload(self):

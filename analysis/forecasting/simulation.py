@@ -380,8 +380,117 @@ def mean_runs_for_half_inning(
     return mean
 
 
+class _ScriptedGammaPoissonRng:
+    """Replay one pre-sampled Gamma-Poisson outcome through the shared helper."""
+
+    def __init__(self, latent: float, count: int) -> None:
+        self._latent = latent
+        self._count = count
+        self._random_calls = 0
+
+    def gammavariate(self, _shape: float, _scale: float) -> float:
+        return self._latent
+
+    def random(self) -> float:
+        self._random_calls += 1
+        return 1.0 if self._random_calls <= self._count else 0.0
+
+
+def _poisson_quantile(mean: float, sample: float) -> int:
+    """Invert a Poisson CDF using one uniform sample."""
+
+    if mean == 0:
+        return 0
+    probability = math.exp(-mean)
+    if probability > 0:
+        cumulative = probability
+        count = 0
+        while sample >= cumulative:
+            count += 1
+            probability *= mean / count
+            cumulative += probability
+        return count
+
+    mode = math.floor(mean)
+    if mode > 100_000:
+        raise ValueError("gamma latent is too large for a stable Poisson draw")
+    mode_probability = math.exp(
+        -mean + mode * math.log(mean) - math.lgamma(mode + 1)
+    )
+    lower_probabilities = [(mode, mode_probability)]
+    probability = mode_probability
+    for count in range(mode, 0, -1):
+        probability *= count / mean
+        lower_probabilities.append((count - 1, probability))
+    cumulative = math.fsum(
+        probability for _count, probability in lower_probabilities
+    )
+    if sample < cumulative:
+        running = 0.0
+        for count, probability in reversed(lower_probabilities):
+            running += probability
+            if sample < running:
+                return count
+        return mode
+
+    count = mode
+    probability = mode_probability
+    while sample >= cumulative:
+        count += 1
+        probability *= mean / count
+        cumulative += probability
+        if probability == 0:
+            return count
+    return count
+
+
+def _binomial_quantile(trials: int, probability: float, sample: float) -> int:
+    """Aggregate independent Bernoulli shares using one uniform sample."""
+
+    if trials == 0 or probability == 0:
+        return 0
+    if probability == 1:
+        return trials
+    mass = (1.0 - probability) ** trials
+    cumulative = mass
+    successes = 0
+    odds = probability / (1.0 - probability)
+    while sample >= cumulative and successes < trials:
+        successes += 1
+        mass *= (trials - successes + 1) / successes * odds
+        cumulative += mass
+    return successes
+
+
+def _fixed_gamma_poisson_source(
+    rng: random.Random,
+    *,
+    mean: float,
+    shape: float,
+) -> _ScriptedGammaPoissonRng:
+    if not _is_finite_number(mean) or mean < 0:
+        raise ValueError("mean must be a finite nonnegative number")
+    _require_finite_positive(shape, "shape")
+    scale = mean / shape if mean else 1.0
+    latent_draw = rng.gammavariate(shape, scale)
+    if not _is_finite_number(latent_draw) or latent_draw < 0:
+        raise ValueError("gamma latent must be finite and nonnegative")
+    sample = rng.random()
+    if not _is_finite_number(sample) or not 0.0 <= sample <= 1.0:
+        raise ValueError("rng.random result must be finite and in [0, 1]")
+    latent = latent_draw if mean else 0.0
+    return _ScriptedGammaPoissonRng(
+        latent,
+        _poisson_quantile(latent, sample),
+    )
+
+
 def _draw_run_count(rng: object, *, mean: float, shape: float) -> int:
-    return draw_gamma_poisson(rng, mean=mean, shape=shape)
+    return draw_gamma_poisson(
+        _fixed_gamma_poisson_source(rng, mean=mean, shape=shape),
+        mean=mean,
+        shape=shape,
+    )
 
 
 def _draw_diagnostic_counts(
@@ -391,9 +500,17 @@ def _draw_diagnostic_counts(
     extra_base_hit_mean: float,
     shape: float,
 ) -> tuple[int, int]:
-    traffic = draw_gamma_poisson(rng, mean=traffic_mean, shape=shape)
+    traffic = draw_gamma_poisson(
+        _fixed_gamma_poisson_source(rng, mean=traffic_mean, shape=shape),
+        mean=traffic_mean,
+        shape=shape,
+    )
     raw_extra_base_hits = draw_gamma_poisson(
-        rng,
+        _fixed_gamma_poisson_source(
+            rng,
+            mean=extra_base_hit_mean,
+            shape=shape,
+        ),
         mean=extra_base_hit_mean,
         shape=shape,
     )
@@ -425,7 +542,7 @@ def _draw_offense_latents(
         pitcher.pitcher_id for pitcher in opposing_chain.pitchers
     ) + tuple(
         segment.segment_id
-        for segment in opposing_bullpen.available_segments
+        for segment in opposing_bullpen.segments
     ) + (opposing_bullpen.unscheduled_f5_relief.segment_id,)
     matchups = {
         segment_id: draw_bounded_lognormal(
@@ -619,6 +736,7 @@ def _simulate_half_inning(
         if walkoff_runs_needed is None
         else min(raw_runs, walkoff_runs_needed)
     )
+    attribution_sample = rng.random()
 
     chain_intensity = math.fsum(
         contribution
@@ -631,7 +749,11 @@ def _simulate_half_inning(
         pitcher_chain_runs = runs
     else:
         chain_share = chain_intensity / mean_runs
-        pitcher_chain_runs = sum(rng.random() < chain_share for _ in range(runs))
+        pitcher_chain_runs = _binomial_quantile(
+            runs,
+            chain_share,
+            attribution_sample,
+        )
 
     diagnostic_matchup = math.fsum(
         effect.out_fraction * effect.matchup_multiplier for effect in effects
@@ -669,12 +791,28 @@ def _simulate_half_inning(
     )
 
 
+def _consume_unused_half_inning_draws(
+    rng: random.Random,
+    diagnostic_rng: random.Random,
+    shape: float,
+) -> None:
+    # Every possible half-inning reserves the same parent-stream footprint.
+    rng.gammavariate(shape, 1.0)
+    rng.random()
+    rng.random()
+    for _ in range(2):
+        diagnostic_rng.gammavariate(shape, 1.0)
+        diagnostic_rng.random()
+
+
 def _simulate_one_game(
     simulation_input: GameSimulationInput,
     rng: random.Random,
     diagnostic_rng: random.Random,
     config: SimulationConfig,
 ) -> SimulatedGame:
+    away_plan = simulation_input.away_pitcher_chain.sample_plan(rng)
+    home_plan = simulation_input.home_pitcher_chain.sample_plan(rng)
     away_offense_latents = _draw_offense_latents(
         simulation_input.away_offense,
         simulation_input.home_pitcher_chain,
@@ -703,8 +841,6 @@ def _simulate_one_game(
         rng,
         config,
     )
-    away_plan = simulation_input.away_pitcher_chain.sample_plan(rng)
-    home_plan = simulation_input.home_pitcher_chain.sample_plan(rng)
 
     scores = {"away": 0, "home": 0}
     traffic = {"away": 0, "home": 0}
@@ -718,8 +854,11 @@ def _simulate_one_game(
     f5_extra_base_hits = {"away": 0, "home": 0}
     bottom_ninth_played = True
     max_inning_tiebreak_used = False
+    max_tiebreak_intensities: tuple[float, float] | None = None
+    played_half_innings = 0
 
     def play_half(inning: int, batting_side: str, walkoff: bool = False):
+        nonlocal played_half_innings
         pitching_side = "home" if batting_side == "away" else "away"
         offense = getattr(simulation_input, f"{batting_side}_offense")
         offense_latents = (
@@ -752,6 +891,7 @@ def _simulate_one_game(
             config=config,
             walkoff_runs_needed=runs_needed,
         )
+        played_half_innings += 1
         scores[batting_side] += outcome.runs
         traffic[batting_side] += outcome.traffic
         extra_base_hits[batting_side] += outcome.extra_base_hits
@@ -784,13 +924,27 @@ def _simulate_one_game(
                 break
             if inning == config.max_innings:
                 max_inning_tiebreak_used = True
-                total_intensity = away_outcome.mean_runs + home_outcome.mean_runs
-                if rng.random() < away_outcome.mean_runs / total_intensity:
-                    scores["away"] += 1
-                    bullpen_runs_allowed["home"] += 1
-                else:
-                    scores["home"] += 1
-                    bullpen_runs_allowed["away"] += 1
+                max_tiebreak_intensities = (
+                    away_outcome.mean_runs,
+                    home_outcome.mean_runs,
+                )
+
+    for _ in range(config.max_innings * 2 - played_half_innings):
+        _consume_unused_half_inning_draws(
+            rng,
+            diagnostic_rng,
+            config.gamma_poisson_shape,
+        )
+    tiebreak_sample = rng.random()
+    if max_tiebreak_intensities is not None:
+        away_intensity, home_intensity = max_tiebreak_intensities
+        total_intensity = away_intensity + home_intensity
+        if tiebreak_sample < away_intensity / total_intensity:
+            scores["away"] += 1
+            bullpen_runs_allowed["home"] += 1
+        else:
+            scores["home"] += 1
+            bullpen_runs_allowed["away"] += 1
 
     return SimulatedGame(
         away_f5_runs=f5_scores["away"],
@@ -880,7 +1034,7 @@ def simulate_game_distribution(
     forecast_run_id: str,
     config: SimulationConfig,
 ) -> SimulationResult:
-    """Simulate one deterministic shared distribution for every game market."""
+    """Simulate one distribution whose seeded game prefix is batch-size stable."""
 
     if not isinstance(input, GameSimulationInput):
         raise TypeError("input must be GameSimulationInput")
@@ -894,20 +1048,18 @@ def simulate_game_distribution(
         raise ValueError("config is invalid or noncanonical")
     _validate_forecast_run_id(forecast_run_id)
     seed = int(forecast_run_id[:16], 16)
-    games_list: list[SimulatedGame] = []
-    for index in range(config.simulations):
-        game_seed = seed ^ (
-            (index * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+    score_rng = random.Random(seed)
+    # Diagnostics share the canonical seed but never consume the score stream.
+    diagnostic_rng = random.Random(seed)
+    games = tuple(
+        _simulate_one_game(
+            input,
+            score_rng,
+            diagnostic_rng,
+            config,
         )
-        games_list.append(
-            _simulate_one_game(
-                input,
-                random.Random(game_seed),
-                random.Random(game_seed ^ 0xD1A60A57D1A60A57),
-                config,
-            )
-        )
-    games = tuple(games_list)
+        for _ in range(config.simulations)
+    )
     return SimulationResult(
         forecast_run_id=forecast_run_id,
         simulation_count=config.simulations,
