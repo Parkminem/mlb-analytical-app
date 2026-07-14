@@ -1,0 +1,398 @@
+from dataclasses import FrozenInstanceError, fields, replace
+from datetime import datetime, timezone
+import inspect
+import json
+import unittest
+from unittest.mock import patch
+
+from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.identity import canonical_json
+from analysis.forecasting.inputs import (
+    BullpenInput,
+    BullpenRole,
+    BullpenSegmentInput,
+    FeatureProvenance,
+    MarketInput,
+    MarketType,
+    SettlementFormat,
+)
+from analysis.forecasting.market import MarketEvaluation
+from tests.test_forecasting_inputs import (
+    AVAILABLE_AT,
+    CAPTURED_AT,
+    boolean,
+    conventional_chain,
+    lineup_against,
+    normalized_game,
+    numeric,
+    provenance,
+    replace_all_provenance,
+)
+
+
+try:
+    import analysis.forecasting.engine as forecast_engine_module
+    from analysis.forecasting.engine import ForecastOutput, run_forecast
+except ModuleNotFoundError:
+    forecast_engine_module = None
+    ForecastOutput = None
+    run_forecast = None
+
+
+ENGINE_API_AVAILABLE = all(
+    value is not None
+    for value in (forecast_engine_module, ForecastOutput, run_forecast)
+)
+UTC = timezone.utc
+MARKET_KEYS = {
+    "sea_f5",
+    "f5_under",
+    "sea_ml",
+    "sea_plus_1_5",
+    "full_under",
+}
+COMPONENT_KEYS = {
+    "away_pitcher_chain",
+    "home_pitcher_chain",
+    "away_offense",
+    "home_offense",
+    "away_bullpen",
+    "home_bullpen",
+}
+
+
+def _fast_config():
+    return SimulationConfig(simulations=12)
+
+
+def _chain(pitcher_id):
+    chain = conventional_chain(pitcher_id)
+    profile = chain.pitchers[0]
+    right_usage = replace(
+        profile.pitch_mix[0],
+        opposing_side="R",
+        usage=1.0,
+    )
+    left_usage = replace(right_usage, opposing_side="L")
+    return replace(
+        chain,
+        pitchers=(replace(profile, pitch_mix=(right_usage, left_usage)),),
+    )
+
+
+def _bullpen(team):
+    projected_ra9 = {
+        BullpenRole.BRIDGE: 4.8,
+        BullpenRole.MIDDLE: 4.5,
+        BullpenRole.HIGH_LEVERAGE: 3.8,
+        BullpenRole.CLOSER: 3.6,
+    }
+    return BullpenInput(
+        team=team,
+        segments=tuple(
+            BullpenSegmentInput(
+                segment_id=f"bullpen:{team}:{role.value}",
+                role=role,
+                projected_ra9=numeric(projected_ra9[role]),
+                log_standard_error=numeric(0.15),
+                appearances=(),
+                available=boolean(True),
+                limited_performance_or_use_risk=boolean(False),
+            )
+            for role in (
+                BullpenRole.BRIDGE,
+                BullpenRole.MIDDLE,
+                BullpenRole.HIGH_LEVERAGE,
+                BullpenRole.CLOSER,
+            )
+        ),
+    )
+
+
+def _market(market_key, market_type, selected_side, line):
+    return MarketInput(
+        market_key=market_key,
+        market_type=market_type,
+        settlement_format=SettlementFormat.TWO_WAY,
+        selected_side=selected_side,
+        line=line,
+        selected_decimal_price=1.91,
+        opposing_decimal_price=1.91,
+        provenance=provenance(),
+    )
+
+
+def _markets():
+    return (
+        _market("sea_f5", MarketType.F5_SIDE, "away", 0.0),
+        _market("f5_under", MarketType.F5_TOTAL, "under", 4.5),
+        _market("sea_ml", MarketType.ML, "away", None),
+        _market("sea_plus_1_5", MarketType.PLUS_1_5, "away", 1.5),
+        _market("full_under", MarketType.FULL_TOTAL, "under", 8.5),
+    )
+
+
+def _complete_game(*, captured_at=CAPTURED_AT, markets=None):
+    away_pitching = _chain("pitcher:away")
+    home_pitching = _chain("pitcher:home")
+    return normalized_game(
+        captured_at=captured_at,
+        away_pitching=away_pitching,
+        home_pitching=home_pitching,
+        away_lineup=lineup_against("SEA", home_pitching.matchup_pitcher_id),
+        home_lineup=lineup_against("MIN", away_pitching.matchup_pitcher_id),
+        away_bullpen=_bullpen("SEA"),
+        home_bullpen=_bullpen("MIN"),
+        markets=_markets() if markets is None else markets,
+    )
+
+
+class ForecastEngineApiAvailabilityTests(unittest.TestCase):
+    def test_engine_api_is_available(self):
+        self.assertTrue(ENGINE_API_AVAILABLE, "forecasting engine API is missing")
+
+    @unittest.skipUnless(ENGINE_API_AVAILABLE, "forecasting engine API is missing")
+    def test_package_exports_only_the_stable_market_and_engine_interfaces(self):
+        import analysis.forecasting as forecasting_package
+
+        expected = {
+            "OutcomeProbabilities",
+            "MarketEvaluation",
+            "price_market",
+            "evaluate_market",
+            "ForecastOutput",
+            "run_forecast",
+        }
+        for name in expected:
+            with self.subTest(name=name):
+                self.assertIn(name, forecasting_package.__all__)
+                self.assertTrue(hasattr(forecasting_package, name))
+
+
+@unittest.skipUnless(ENGINE_API_AVAILABLE, "forecasting engine API is missing")
+class ForecastEngineTests(unittest.TestCase):
+    def test_engine_returns_every_verified_market_from_one_simulation(self):
+        game = _complete_game()
+        config = _fast_config()
+
+        with (
+            patch.object(
+                forecast_engine_module,
+                "forecast_pitcher_chain",
+                wraps=forecast_engine_module.forecast_pitcher_chain,
+            ) as pitcher_forecast,
+            patch.object(
+                forecast_engine_module,
+                "forecast_offense",
+                wraps=forecast_engine_module.forecast_offense,
+            ) as offense_forecast,
+            patch.object(
+                forecast_engine_module,
+                "forecast_bullpen",
+                wraps=forecast_engine_module.forecast_bullpen,
+            ) as bullpen_forecast,
+            patch.object(
+                forecast_engine_module,
+                "simulate_game_distribution",
+                wraps=forecast_engine_module.simulate_game_distribution,
+            ) as simulate,
+            patch.object(
+                forecast_engine_module,
+                "evaluate_market",
+                wraps=forecast_engine_module.evaluate_market,
+            ) as evaluate,
+        ):
+            output = run_forecast(game, config)
+
+        self.assertEqual(set(output.markets), MARKET_KEYS)
+        self.assertEqual(output.simulation_count, config.simulations)
+        self.assertEqual(pitcher_forecast.call_count, 2)
+        self.assertEqual(offense_forecast.call_count, 2)
+        self.assertEqual(bullpen_forecast.call_count, 2)
+        self.assertEqual(simulate.call_count, 1)
+        self.assertEqual(evaluate.call_count, len(game.markets))
+        shared_simulations = {id(call.args[0]) for call in evaluate.call_args_list}
+        self.assertEqual(len(shared_simulations), 1)
+
+    def test_offenses_receive_original_opposing_pitcher_profiles(self):
+        game = _complete_game()
+
+        with patch.object(
+            forecast_engine_module,
+            "forecast_offense",
+            wraps=forecast_engine_module.forecast_offense,
+        ) as offense_forecast:
+            run_forecast(game, _fast_config())
+
+        self.assertIs(
+            offense_forecast.call_args_list[0].args[1],
+            game.home_pitching.pitchers,
+        )
+        self.assertIs(
+            offense_forecast.call_args_list[1].args[1],
+            game.away_pitching.pitchers,
+        )
+
+    def test_engine_is_reproducible_when_only_captured_at_changes(self):
+        first = run_forecast(
+            _complete_game(
+                captured_at=datetime(2026, 7, 14, 1, 30, tzinfo=UTC)
+            ),
+            _fast_config(),
+        )
+        second = run_forecast(
+            _complete_game(
+                captured_at=datetime(2026, 7, 14, 1, 45, tzinfo=UTC)
+            ),
+            _fast_config(),
+        )
+
+        self.assertEqual(first.forecast_run_id, second.forecast_run_id)
+        self.assertEqual(first, second)
+
+    def test_market_order_is_semantically_stable(self):
+        markets = _markets()
+
+        first = run_forecast(_complete_game(markets=markets), _fast_config())
+        second = run_forecast(
+            _complete_game(markets=tuple(reversed(markets))),
+            _fast_config(),
+        )
+
+        self.assertEqual(first.forecast_run_id, second.forecast_run_id)
+        self.assertEqual(first, second)
+        self.assertEqual(tuple(first.markets), tuple(sorted(MARKET_KEYS)))
+
+    def test_output_preserves_all_diagnostics_distributions_and_intervals(self):
+        output = run_forecast(_complete_game(), _fast_config())
+
+        self.assertEqual(set(output.component_diagnostics), COMPONENT_KEYS)
+        self.assertIn("away_full_traffic", output.component_distributions)
+        self.assertEqual(
+            set(output.intervals),
+            set(output.component_distributions),
+        )
+        for component_id, distribution in output.component_distributions.items():
+            self.assertEqual(len(distribution.values), output.simulation_count)
+            self.assertIs(output.intervals[component_id], distribution.summary)
+        self.assertEqual(
+            output.simulation_config["simulations"],
+            output.simulation_count,
+        )
+        self.assertEqual(output.config_version, _fast_config().version)
+
+    def test_unknown_availability_propagates_validation_result(self):
+        unknown = FeatureProvenance(
+            observation_ids=("obs:1",),
+            latest_available_at=None,
+            lookback_end=AVAILABLE_AT,
+        )
+        game = replace_all_provenance(_complete_game(), unknown)
+
+        output = run_forecast(game, _fast_config())
+
+        self.assertFalse(output.out_of_sample_eligible)
+        self.assertEqual(output.validation_flags, ("unknown available_at",))
+
+    def test_validation_failure_stops_before_identity_or_component_work(self):
+        game = _complete_game()
+        invalid = replace(game, captured_at=game.identity.first_pitch)
+
+        with (
+            patch.object(forecast_engine_module, "build_forecast_run_id") as identity,
+            patch.object(forecast_engine_module, "forecast_pitcher_chain") as pitcher,
+            patch.object(forecast_engine_module, "forecast_offense") as offense,
+            patch.object(forecast_engine_module, "forecast_bullpen") as bullpen,
+            patch.object(
+                forecast_engine_module,
+                "simulate_game_distribution",
+            ) as simulate,
+        ):
+            with self.assertRaisesRegex(ValueError, "captured_at"):
+                run_forecast(invalid, _fast_config())
+
+        identity.assert_not_called()
+        pitcher.assert_not_called()
+        offense.assert_not_called()
+        bullpen.assert_not_called()
+        simulate.assert_not_called()
+
+    def test_output_is_immutable_canonical_and_directly_reconstructible(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        encoded = canonical_json(output)
+        payload = json.loads(encoded)
+        reconstructed = ForecastOutput(
+            **{field.name: getattr(output, field.name) for field in fields(output)}
+        )
+
+        self.assertEqual(reconstructed, output)
+        self.assertEqual(
+            len(
+                payload["component_distributions"]["away_full_traffic"][
+                    "values"
+                ]
+            ),
+            output.simulation_count,
+        )
+        self.assertTrue(
+            all(
+                isinstance(value, MarketEvaluation)
+                for value in output.markets.values()
+            )
+        )
+        with self.assertRaises(FrozenInstanceError):
+            output.simulation_count = 1
+        with self.assertRaises(TypeError):
+            output.markets["new"] = next(iter(output.markets.values()))
+        with self.assertRaises(TypeError):
+            output.component_distributions["new"] = next(
+                iter(output.component_distributions.values())
+            )
+        with self.assertRaises(TypeError):
+            output.simulation_config["simulations"] = 1
+
+    def test_direct_constructor_rejects_lossy_or_mismatched_intervals(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        intervals = dict(output.intervals)
+        intervals.pop(next(iter(intervals)))
+        values["intervals"] = intervals
+
+        with self.assertRaisesRegex(ValueError, "interval"):
+            ForecastOutput(**values)
+
+    def test_direct_constructor_rejects_removed_bullpen_exposure_distribution(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        component_id = next(
+            key
+            for key in output.component_distributions
+            if "_bullpen_segment_" in key
+        )
+        distributions = dict(output.component_distributions)
+        intervals = dict(output.intervals)
+        distributions.pop(component_id)
+        intervals.pop(component_id)
+        values["component_distributions"] = distributions
+        values["intervals"] = intervals
+
+        with self.assertRaisesRegex(ValueError, "component_distributions"):
+            ForecastOutput(**values)
+
+    def test_engine_does_not_import_legacy_or_ledger_decisions(self):
+        source = inspect.getsource(forecast_engine_module)
+
+        for forbidden in (
+            "recommend_full_game",
+            "evaluate_priority_admission",
+            "from analysis.model import",
+            "import analysis.model",
+            "from analysis.ledger",
+            "import analysis.ledger",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

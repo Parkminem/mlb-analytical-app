@@ -26,6 +26,13 @@ from .inputs import (
     StarterProjectionComponents,
     WorkloadHistory,
 )
+from .market import (
+    MarketEvaluation,
+    OutcomeProbabilities,
+    evaluate_market,
+    price_market,
+)
+from .engine import ForecastOutput, run_forecast
 
 __all__ = (
     "BooleanFeature",
@@ -33,15 +40,18 @@ __all__ = (
     "BullpenRole",
     "BullpenSegmentInput",
     "FeatureProvenance",
+    "ForecastOutput",
     "GameIdentity",
     "IntegerFeature",
     "LineupInput",
     "LineupSlot",
     "LineupState",
     "MarketInput",
+    "MarketEvaluation",
     "MarketType",
     "NormalizedGameInput",
     "NumericFeature",
+    "OutcomeProbabilities",
     "PitcherChainInput",
     "PitcherInput",
     "PitcherRole",
@@ -52,4 +62,7 @@ __all__ = (
     "SourceObservation",
     "StarterProjectionComponents",
     "WorkloadHistory",
+    "evaluate_market",
+    "price_market",
+    "run_forecast",
 )
