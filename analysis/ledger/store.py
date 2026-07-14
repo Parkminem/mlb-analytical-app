@@ -425,6 +425,8 @@ class LedgerStore:
         self._parent_descriptor = self._open_parent_directory()
         parent_stat = os.fstat(self._parent_descriptor)
         self._parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        self._ledger_identity: tuple[int, int] | None = None
+        self._lock_identity: tuple[int, int] | None = None
         self._parent_descriptor_finalizer = weakref.finalize(
             self,
             os.close,
@@ -529,41 +531,91 @@ class LedgerStore:
                 ) from error
             raise
         try:
+            self._validate_open_descriptor(
+                descriptor,
+                file_name,
+                path_label,
+            )
+        except Exception:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _identity_attribute(self, file_name: str) -> str:
+        if file_name == self._ledger_name:
+            return "_ledger_identity"
+        if file_name == self._lock_name:
+            return "_lock_identity"
+        raise ValueError("file_name must identify the ledger or ledger lock")
+
+    def _validate_open_descriptor(
+        self,
+        descriptor: int,
+        file_name: str,
+        path_label: str,
+    ) -> None:
+        self._validate_parent_identity()
+        try:
             descriptor_stat = os.fstat(descriptor)
             path_stat = os.stat(
                 file_name,
                 dir_fd=self._parent_descriptor,
                 follow_symlinks=False,
             )
-            if stat.S_ISLNK(path_stat.st_mode):
-                raise LedgerCorruptionError(
-                    f"{path_label} path must not be a symlink"
-                )
-            if not stat.S_ISREG(descriptor_stat.st_mode):
-                raise LedgerCorruptionError(
-                    f"{path_label} path must reference a regular file"
-                )
-            if (
-                descriptor_stat.st_dev,
-                descriptor_stat.st_ino,
-            ) != (path_stat.st_dev, path_stat.st_ino):
-                raise LedgerCorruptionError(
-                    f"{path_label} path changed while being opened"
-                )
-            self._reject_hard_links(descriptor_stat.st_nlink)
-        except Exception:
-            os.close(descriptor)
-            raise
-        return descriptor
-
-    def _read_records(self) -> tuple[_RecordT, ...]:
-        try:
-            descriptor = self._open_no_follow(
-                self._ledger_name,
-                os.O_RDONLY,
-                "ledger",
+        except OSError as error:
+            raise LedgerCorruptionError(
+                f"{path_label} path changed while being accessed"
+            ) from error
+        if stat.S_ISLNK(path_stat.st_mode):
+            raise LedgerCorruptionError(
+                f"{path_label} path must not be a symlink"
             )
-            with os.fdopen(descriptor, "rb") as ledger:
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise LedgerCorruptionError(
+                f"{path_label} path must reference a regular file"
+            )
+        descriptor_identity = (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+        path_identity = (path_stat.st_dev, path_stat.st_ino)
+        if descriptor_identity != path_identity:
+            raise LedgerCorruptionError(
+                f"{path_label} path changed while being accessed"
+            )
+        identity_attribute = self._identity_attribute(file_name)
+        expected_identity = getattr(self, identity_attribute)
+        if (
+            expected_identity is not None
+            and descriptor_identity != expected_identity
+        ):
+            raise LedgerCorruptionError(
+                f"{path_label} file identity changed"
+            )
+        self._reject_hard_links(descriptor_stat.st_nlink)
+        if expected_identity is None:
+            setattr(self, identity_attribute, descriptor_identity)
+
+    def _read_records(
+        self,
+        descriptor: int | None = None,
+    ) -> tuple[_RecordT, ...]:
+        try:
+            if descriptor is None:
+                read_descriptor = self._open_no_follow(
+                    self._ledger_name,
+                    os.O_RDONLY,
+                    "ledger",
+                )
+            else:
+                self._validate_open_descriptor(
+                    descriptor,
+                    self._ledger_name,
+                    "ledger",
+                )
+                read_descriptor = os.dup(descriptor)
+            with os.fdopen(read_descriptor, "rb") as ledger:
+                ledger.seek(0)
                 raw_content = ledger.read()
         except FileNotFoundError:
             return ()
@@ -763,45 +815,60 @@ class LedgerStore:
         with os.fdopen(lock_descriptor, "r+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                records = self._read_records()
-                logical_hash = _payload_hash(logical_payload)
-                for existing in records:
-                    if (
-                        existing.envelope.record_kind != record_kind
-                        or existing.envelope.idempotency_key != idempotency_key
-                    ):
-                        continue
-                    if existing.envelope.payload_hash == logical_hash:
-                        return existing
-                    raise IdempotencyConflict(
-                        "idempotency key already used for another logical "
-                        f"{record_kind} payload: {idempotency_key}"
-                    )
-
-                validate(records)
-                envelope = RecordEnvelope(
-                    record_id=uuid.uuid4().hex,
-                    record_kind=record_kind,
-                    idempotency_key=idempotency_key,
-                    payload_hash=logical_hash,
-                    appended_at=datetime.now(timezone.utc),
+                self._validate_open_descriptor(
+                    lock_file.fileno(),
+                    self._lock_name,
+                    "ledger lock",
                 )
-                record = build(envelope)
                 descriptor = self._open_no_follow(
                     self._ledger_name,
-                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    os.O_APPEND | os.O_CREAT | os.O_RDWR,
                     "ledger",
                 )
-                with os.fdopen(
-                    descriptor,
-                    "a",
-                    encoding="utf-8",
-                    newline="",
-                ) as ledger:
-                    ledger.write(f"{canonical_json(record)}\n")
-                    ledger.flush()
-                    os.fsync(ledger.fileno())
-                return record
+                try:
+                    records = self._read_records(descriptor)
+                    logical_hash = _payload_hash(logical_payload)
+                    for existing in records:
+                        if (
+                            existing.envelope.record_kind != record_kind
+                            or existing.envelope.idempotency_key != idempotency_key
+                        ):
+                            continue
+                        if existing.envelope.payload_hash == logical_hash:
+                            return existing
+                        raise IdempotencyConflict(
+                            "idempotency key already used for another logical "
+                            f"{record_kind} payload: {idempotency_key}"
+                        )
+
+                    validate(records)
+                    envelope = RecordEnvelope(
+                        record_id=uuid.uuid4().hex,
+                        record_kind=record_kind,
+                        idempotency_key=idempotency_key,
+                        payload_hash=logical_hash,
+                        appended_at=datetime.now(timezone.utc),
+                    )
+                    record = build(envelope)
+                    self._validate_open_descriptor(
+                        descriptor,
+                        self._ledger_name,
+                        "ledger",
+                    )
+                    with os.fdopen(
+                        descriptor,
+                        "a",
+                        encoding="utf-8",
+                        newline="",
+                    ) as ledger:
+                        descriptor = -1
+                        ledger.write(f"{canonical_json(record)}\n")
+                        ledger.flush()
+                        os.fsync(ledger.fileno())
+                    return record
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -1283,6 +1350,11 @@ class LedgerStore:
         with os.fdopen(lock_descriptor, "r+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
             try:
+                self._validate_open_descriptor(
+                    lock_file.fileno(),
+                    self._lock_name,
+                    "ledger lock",
+                )
                 records = self._read_records()
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

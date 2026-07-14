@@ -333,8 +333,11 @@ class LedgerStoreTests(unittest.TestCase):
                 elif operation == fcntl.LOCK_UN:
                     events.append("lock_un")
 
-            def rebuild_spy(instance: LedgerStore):
-                records = real_read_records(instance)
+            def rebuild_spy(
+                instance: LedgerStore,
+                descriptor: int | None = None,
+            ):
+                records = real_read_records(instance, descriptor)
                 events.append("rebuild")
                 return records
 
@@ -1907,6 +1910,79 @@ class LedgerStoreTests(unittest.TestCase):
                 store.append_capture("capture:symlink-swap", capture_command())
 
             self.assertEqual(victim.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_regular_file_swap_between_read_and_write_cannot_receive_append(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_path = root / "ledger-displaced.jsonl"
+            replacement_path = root / "ledger-replacement.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:trusted",
+                capture_command(payload={"source": "trusted"}),
+            )
+            LedgerStore(replacement_path).append_capture(
+                "capture:replacement",
+                capture_command(payload={"source": "replacement"}),
+            )
+            trusted_content = path.read_bytes()
+            replacement_content = replacement_path.read_bytes()
+            real_read_records = store._read_records
+
+            def swap_after_read(*args: object):
+                records = real_read_records(*args)
+                path.rename(displaced_path)
+                replacement_path.rename(path)
+                return records
+
+            with mock.patch.object(
+                store,
+                "_read_records",
+                side_effect=swap_after_read,
+            ):
+                with self.assertRaisesRegex(
+                    LedgerCorruptionError,
+                    "changed",
+                ):
+                    store.append_capture(
+                        "capture:must-not-redirect",
+                        capture_command(payload={"source": "must-not-redirect"}),
+                    )
+
+            self.assertEqual(displaced_path.read_bytes(), trusted_content)
+            self.assertEqual(path.read_bytes(), replacement_content)
+
+    def test_regular_file_replacement_after_construction_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.jsonl"
+            displaced_path = root / "ledger-displaced.jsonl"
+            replacement_path = root / "ledger-replacement.jsonl"
+            store = LedgerStore(path)
+            store.append_capture(
+                "capture:trusted",
+                capture_command(payload={"source": "trusted"}),
+            )
+            LedgerStore(replacement_path).append_capture(
+                "capture:replacement",
+                capture_command(payload={"source": "replacement"}),
+            )
+            trusted_content = path.read_bytes()
+            replacement_content = replacement_path.read_bytes()
+            path.rename(displaced_path)
+            replacement_path.rename(path)
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "identity"):
+                store.append_capture(
+                    "capture:must-not-replace",
+                    capture_command(payload={"source": "must-not-replace"}),
+                )
+
+            self.assertEqual(displaced_path.read_bytes(), trusted_content)
+            self.assertEqual(path.read_bytes(), replacement_content)
 
     def test_parent_symlink_swap_cannot_redirect_append_or_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
