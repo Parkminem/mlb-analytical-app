@@ -1,9 +1,12 @@
 """Push-aware settlement and pricing for simulated betting markets."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import math
+import re
 import sys
 
+from .identity import canonical_json
 from .inputs import MarketInput, MarketType, SettlementFormat
 from .simulation import SimulatedGame, SimulationResult
 
@@ -21,6 +24,7 @@ _DERIVED_PRICING_FIELDS = (
     "edge",
     "expected_value",
 )
+_SEMANTIC_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _is_finite_number(value: object) -> bool:
@@ -48,6 +52,46 @@ def _require_optional_price(value: object, field_name: str) -> None:
 def _require_optional_finite(value: object, field_name: str) -> None:
     if value is not None and not _is_finite_number(value):
         raise ValueError(f"{field_name} must be finite when present")
+
+
+def market_semantic_fingerprint(
+    *,
+    market_key: str,
+    market_type: MarketType,
+    settlement_format: SettlementFormat,
+    selected_side: str,
+    line: float | None,
+    selected_decimal_price: float | None,
+    opposing_decimal_price: float | None,
+) -> str:
+    """Hash the complete canonical meaning of one selected market."""
+
+    _require_nonempty_string(market_key, "market_key")
+    if not isinstance(market_type, MarketType):
+        raise ValueError("market_type must be MarketType")
+    if not isinstance(settlement_format, SettlementFormat):
+        raise ValueError("settlement_format must be SettlementFormat")
+    _require_nonempty_string(selected_side, "selected_side")
+    if line is not None and not _is_finite_number(line):
+        raise ValueError("line must be finite when present")
+    _require_optional_price(
+        selected_decimal_price,
+        "selected_decimal_price",
+    )
+    _require_optional_price(
+        opposing_decimal_price,
+        "opposing_decimal_price",
+    )
+    payload = {
+        "market_key": market_key,
+        "market_type": market_type,
+        "settlement_format": settlement_format,
+        "selected_side": selected_side,
+        "line": line,
+        "selected_decimal_price": selected_decimal_price,
+        "opposing_decimal_price": opposing_decimal_price,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _canonical_derived_probability(value: float, field_name: str) -> float:
@@ -190,8 +234,16 @@ class MarketEvaluation:
     opposing_decimal_price: float | None = None
     evaluated: bool = True
     reason: str | None = None
+    semantic_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
+        if self.semantic_fingerprint is not None and (
+            not isinstance(self.semantic_fingerprint, str)
+            or _SEMANTIC_FINGERPRINT.fullmatch(self.semantic_fingerprint) is None
+        ):
+            raise ValueError(
+                "semantic_fingerprint must be exactly 64 lowercase hex characters"
+            )
         if not isinstance(self.evaluated, bool):
             raise ValueError("evaluated must be a boolean")
         if not self.evaluated:
@@ -385,6 +437,15 @@ def evaluate_market(
         raise TypeError("simulation games must contain SimulatedGame values")
 
     _require_market_contract(market_input)
+    semantic_fingerprint = market_semantic_fingerprint(
+        market_key=market_input.market_key,
+        market_type=market_input.market_type,
+        settlement_format=market_input.settlement_format,
+        selected_side=market_input.selected_side,
+        line=market_input.line,
+        selected_decimal_price=market_input.selected_decimal_price,
+        opposing_decimal_price=market_input.opposing_decimal_price,
+    )
     if (
         market_input.market_type is MarketType.F5_SIDE
         and market_input.settlement_format is SettlementFormat.THREE_WAY
@@ -398,6 +459,7 @@ def evaluate_market(
             expected_value=None,
             evaluated=False,
             reason="three-way F5 settlement is unsupported",
+            semantic_fingerprint=semantic_fingerprint,
         )
 
     counts = {"win": 0, "push": 0, "loss": 0}
@@ -410,16 +472,20 @@ def evaluate_market(
         push=counts["push"] / denominator,
         loss=counts["loss"] / denominator,
     )
-    return price_market(
-        probabilities,
-        selected_price=market_input.selected_decimal_price,
-        opposing_price=market_input.opposing_decimal_price,
+    return replace(
+        price_market(
+            probabilities,
+            selected_price=market_input.selected_decimal_price,
+            opposing_price=market_input.opposing_decimal_price,
+        ),
+        semantic_fingerprint=semantic_fingerprint,
     )
 
 
 __all__ = (
     "OutcomeProbabilities",
     "MarketEvaluation",
+    "market_semantic_fingerprint",
     "price_market",
     "evaluate_market",
 )

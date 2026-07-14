@@ -513,6 +513,66 @@ class ForecastEngineTests(unittest.TestCase):
                 ):
                     ForecastOutput(**values)
 
+    def test_forecast_rejects_evaluation_bound_to_different_selected_side(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        market_inputs = dict(output.market_inputs)
+        market_inputs["sea_ml"] = replace(
+            market_inputs["sea_ml"],
+            selected_side="home",
+        )
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        values["market_inputs"] = market_inputs
+
+        with self.assertRaisesRegex(ValueError, "fingerprint.*market_inputs"):
+            ForecastOutput(**values)
+
+    def test_forecast_rejects_unbound_unevaluated_ordinary_market(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        markets = dict(output.markets)
+        markets["sea_ml"] = MarketEvaluation(
+            probabilities=None,
+            model_conditional_win_probability=None,
+            fair_decimal_price=None,
+            market_no_vig_probability=None,
+            edge=None,
+            expected_value=None,
+            evaluated=False,
+            reason="arbitrary unevaluated replacement",
+        )
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        values["markets"] = markets
+
+        with self.assertRaisesRegex(ValueError, "fingerprint.*market_inputs"):
+            ForecastOutput(**values)
+
+    def test_forecast_rejects_nonprice_semantic_fingerprint_mismatches(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        baseline = output.market_inputs["sea_ml"]
+        mismatches = (
+            ("market_type", {"market_type": MarketType.PLUS_1_5}),
+            ("line", {"line": 1.5}),
+            (
+                "settlement_format",
+                {"settlement_format": SettlementFormat.THREE_WAY},
+            ),
+        )
+
+        for label, changes in mismatches:
+            with self.subTest(label=label):
+                market_inputs = dict(output.market_inputs)
+                market_inputs["sea_ml"] = replace(baseline, **changes)
+                values = {
+                    field.name: getattr(output, field.name)
+                    for field in fields(output)
+                }
+                values["market_inputs"] = market_inputs
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "fingerprint.*market_inputs",
+                ):
+                    ForecastOutput(**values)
+
     def test_unevaluated_market_keeps_semantic_prices_without_evaluation_prices(
         self,
     ):

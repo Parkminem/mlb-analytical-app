@@ -15,7 +15,11 @@ from .inputs import (
     NormalizedGameInput,
     SettlementFormat,
 )
-from .market import MarketEvaluation, evaluate_market
+from .market import (
+    MarketEvaluation,
+    evaluate_market,
+    market_semantic_fingerprint,
+)
 from .offense import OffenseForecast, forecast_offense
 from .simulation import (
     ComponentDistribution,
@@ -231,6 +235,18 @@ class SemanticMarketInput:
             opposing_decimal_price=market.opposing_decimal_price,
         )
 
+    @property
+    def semantic_fingerprint(self) -> str:
+        return market_semantic_fingerprint(
+            market_key=self.market_key,
+            market_type=self.market_type,
+            settlement_format=self.settlement_format,
+            selected_side=self.selected_side,
+            line=self.line,
+            selected_decimal_price=self.selected_decimal_price,
+            opposing_decimal_price=self.opposing_decimal_price,
+        )
+
 
 def build_semantic_market_inputs(
     markets: tuple[MarketInput, ...],
@@ -279,6 +295,10 @@ def _freeze_market_inputs(
                         f"{field_name} must match market_inputs for evaluated "
                         "markets"
                     )
+        if evaluation.semantic_fingerprint != market.semantic_fingerprint:
+            raise ValueError(
+                "evaluation semantic_fingerprint must match market_inputs"
+            )
     return MappingProxyType(
         {key: copied[key] for key in sorted(copied)}
     )

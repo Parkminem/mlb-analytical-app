@@ -299,10 +299,15 @@ class ShadowComparisonTests(unittest.TestCase):
         legacy_candidate = candidate()
         legacy = legacy_snapshot(candidates=(legacy_candidate,))
         markets = dict(self.forecast.markets)
-        markets["sea_ml"] = price_market(
-            OutcomeProbabilities(win=0.32, push=0.0, loss=0.68),
-            1.91,
-            1.91,
+        markets["sea_ml"] = replace(
+            price_market(
+                OutcomeProbabilities(win=0.32, push=0.0, loss=0.68),
+                1.91,
+                1.91,
+            ),
+            semantic_fingerprint=(
+                self.forecast.markets["sea_ml"].semantic_fingerprint
+            ),
         )
         low_probability_forecast = replace(self.forecast, markets=markets)
 
@@ -584,6 +589,78 @@ class ShadowRecordingTests(unittest.TestCase):
             1,
         )
 
+    def test_equivalent_binding_and_path_order_reuses_forecast_payload(self) -> None:
+        paths = principal_paths()
+        first_bindings = (
+            binding(index=0, paths=paths),
+            binding(
+                index=1,
+                market_key="full_under",
+                legacy_market="full_total",
+                paths=paths,
+            ),
+        )
+        candidates = (
+            candidate(market="ml"),
+            candidate(market="full_total"),
+        )
+        first_legacy = legacy_snapshot(
+            candidates=candidates,
+            review_bindings=first_bindings,
+        )
+        second_bindings = (
+            replace(
+                first_bindings[1],
+                principal_paths=tuple(reversed(paths)),
+            ),
+            replace(
+                first_bindings[0],
+                principal_paths=tuple(reversed(paths)),
+            ),
+        )
+        second_legacy = legacy_snapshot(
+            candidates=candidates,
+            review_bindings=second_bindings,
+        )
+        original_bindings = second_legacy.review_bindings
+        original_paths = second_legacy.review_bindings[0].principal_paths
+
+        first = self.record(
+            legacy=first_legacy,
+            keys=self.keys("canonical-order-first"),
+        )
+        second = self.record(
+            game=replace(
+                self.game,
+                captured_at=self.game.captured_at + timedelta(minutes=1),
+            ),
+            legacy=second_legacy,
+            keys=self.keys("canonical-order-second"),
+        )
+
+        self.assertEqual(
+            first.forecast.envelope.record_id,
+            second.forecast.envelope.record_id,
+        )
+        self.assertEqual(first.forecast.outputs, second.forecast.outputs)
+        self.assertEqual(len(tuple(self.store.iter_records("forecast"))), 1)
+        self.assertIs(second_legacy.review_bindings, original_bindings)
+        self.assertIs(
+            second_legacy.review_bindings[0].principal_paths,
+            original_paths,
+        )
+        self.assertEqual(
+            tuple(
+                item.legacy_candidate_index
+                for item in second_legacy.review_bindings
+            ),
+            (1, 0),
+        )
+        self.assertEqual(
+            second_legacy.review_bindings[0].principal_paths,
+            tuple(reversed(paths)),
+        )
+
     def test_second_unchanged_capture_links_to_existing_forecast(self) -> None:
         later_game = replace(
             self.game,
@@ -717,6 +794,12 @@ class ShadowRecordingTests(unittest.TestCase):
 
         self.assertEqual(tuple(self.store.iter_records()), ())
 
+    def test_non_forecast_output_is_type_error_before_any_append(self) -> None:
+        with self.assertRaisesRegex(TypeError, "forecast.*ForecastOutput"):
+            self.record(forecast=object())
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
     def test_forecast_for_another_game_is_rejected_before_any_append(self) -> None:
         other_game = replace(
             self.game,
@@ -740,9 +823,12 @@ class ShadowRecordingTests(unittest.TestCase):
             market_inputs["sea_ml"],
             selected_side="home",
         )
-        mismatched_forecast = replace(
-            self.forecast,
-            market_inputs=market_inputs,
+        mismatched_forecast = replace(self.forecast)
+        # Bypass construction only to exercise record's independent guard.
+        object.__setattr__(
+            mismatched_forecast,
+            "market_inputs",
+            market_inputs,
         )
 
         with self.assertRaisesRegex(ValueError, "market_inputs.*game_input"):

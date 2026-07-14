@@ -44,6 +44,9 @@ _INELIGIBILITY_FLAG_ORDER = (
     "missing_component_distribution",
 )
 _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
+_EVIDENCE_PATH_ORDER = {
+    path: index for index, path in enumerate(PriorityEvidencePath)
+}
 
 
 def _is_finite_number(value: object) -> bool:
@@ -454,14 +457,31 @@ def _principal_path_payload(path: PrincipalPathBinding) -> dict[str, object]:
     }
 
 
+def _principal_path_sort_key(
+    path: PrincipalPathBinding,
+) -> tuple[int, str, tuple[str, ...]]:
+    return (
+        _EVIDENCE_PATH_ORDER[path.evidence_path],
+        path.contradiction_rule.value,
+        path.component_ids,
+    )
+
+
+def _principal_paths_payload(
+    paths: tuple[PrincipalPathBinding, ...],
+) -> list[dict[str, object]]:
+    return [
+        _principal_path_payload(path)
+        for path in sorted(paths, key=_principal_path_sort_key)
+    ]
+
+
 def _binding_payload(binding: CandidateReviewBinding) -> dict[str, object]:
     return {
         "market_key": binding.market_key,
         "legacy_candidate_index": binding.legacy_candidate_index,
         "legacy_market": binding.legacy_market,
-        "principal_paths": [
-            _principal_path_payload(path) for path in binding.principal_paths
-        ],
+        "principal_paths": _principal_paths_payload(binding.principal_paths),
     }
 
 
@@ -483,7 +503,11 @@ def _legacy_payload(legacy: LegacyDecisionSnapshot) -> dict[str, object]:
         ],
         "final_priority": list(legacy.final_priority),
         "review_bindings": [
-            _binding_payload(binding) for binding in legacy.review_bindings
+            _binding_payload(binding)
+            for binding in sorted(
+                legacy.review_bindings,
+                key=lambda binding: binding.legacy_candidate_index,
+            )
         ],
         "notes": list(legacy.notes),
     }
@@ -502,10 +526,9 @@ def _market_comparison_payload(
         "fair_decimal_price": comparison.fair_decimal_price,
         "market_no_vig_probability": comparison.market_no_vig_probability,
         "edge": comparison.edge,
-        "principal_paths": [
-            _principal_path_payload(path)
-            for path in comparison.principal_paths
-        ],
+        "principal_paths": _principal_paths_payload(
+            comparison.principal_paths
+        ),
         "review_eligible": comparison.review_eligible,
         "review_ineligibility_flags": list(
             comparison.review_ineligibility_flags
@@ -578,6 +601,8 @@ def record_shadow_run(
     _require_store_interface(store)
     if not isinstance(game_input, NormalizedGameInput):
         raise TypeError("game_input must be NormalizedGameInput")
+    if not isinstance(forecast, ForecastOutput):
+        raise TypeError("forecast must be ForecastOutput")
     if not isinstance(idempotency_keys, ShadowRunIdempotencyKeys):
         raise TypeError(
             "idempotency_keys must be ShadowRunIdempotencyKeys"

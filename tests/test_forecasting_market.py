@@ -473,6 +473,48 @@ class MarketPricingTests(unittest.TestCase):
 
 @unittest.skipUnless(MARKET_API_AVAILABLE, "forecasting market API is missing")
 class MarketSettlementTests(unittest.TestCase):
+    def test_evaluate_market_binds_semantics_while_price_market_is_unbound(self):
+        market = _market(MarketType.ML, "away", line=None)
+        evaluated = evaluate_market(
+            _scores([(2, 2, 5, 4)]),
+            market,
+        )
+        unevaluated = evaluate_market(
+            _scores([(2, 2, 5, 4)]),
+            _market(
+                MarketType.F5_SIDE,
+                "away",
+                line=0.0,
+                settlement_format=SettlementFormat.THREE_WAY,
+            ),
+        )
+        unbound = price_market(
+            OutcomeProbabilities(win=0.5, push=0.0, loss=0.5),
+            selected_price=1.91,
+            opposing_price=1.91,
+        )
+
+        for result in (evaluated, unevaluated):
+            with self.subTest(evaluated=result.evaluated):
+                fingerprint = getattr(result, "semantic_fingerprint", None)
+                self.assertIsNotNone(
+                    fingerprint,
+                    "evaluate_market must bind market semantics",
+                )
+                self.assertRegex(fingerprint, r"[0-9a-f]{64}\Z")
+                reconstructed = MarketEvaluation(
+                    **{
+                        field.name: getattr(result, field.name)
+                        for field in fields(result)
+                    }
+                )
+                self.assertEqual(reconstructed, result)
+                self.assertEqual(
+                    canonical_json(reconstructed),
+                    canonical_json(result),
+                )
+        self.assertIsNone(getattr(unbound, "semantic_fingerprint", None))
+
     def test_f5_tie_is_push_for_two_way_market(self):
         result = evaluate_market(
             _scores([(2, 2, 4, 3)]),
