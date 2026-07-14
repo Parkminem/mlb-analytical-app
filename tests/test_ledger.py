@@ -1287,6 +1287,64 @@ class LedgerStoreTests(unittest.TestCase):
             valid = store.append_review(command)
             self.assertEqual(valid.capture_id, capture.capture_id)
 
+    def test_review_rejects_conversion_components_from_wrong_market_horizon(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            _, _, _, _, _, command = append_review_context(store)
+            component_reviews = list(command.component_reviews)
+            component_reviews[1] = {
+                **dict(component_reviews[1]),
+                "component_ids": (
+                    "away_f5_runs",
+                    "away_f5_traffic",
+                    "away_f5_extra_base_hits",
+                ),
+            }
+            incompatible = replace(
+                command,
+                component_reviews=component_reviews,
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "market horizon"):
+                store.append_review(incompatible)
+
+    def test_review_rejects_same_side_suppression_and_collapse_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            _, _, _, _, _, command = append_review_context(store)
+            incompatible = replace(
+                command,
+                inside_80_ratio=1.0,
+                component_reviews=(
+                    {
+                        "evidence_path": "starter_suppression",
+                        "component_ids": (
+                            "home_pitcher_chain_runs_allowed",
+                        ),
+                        "contradicted": False,
+                        "inside_80_count": 1,
+                        "component_count": 1,
+                        "notes": (),
+                    },
+                    {
+                        "evidence_path": "starter_collapse",
+                        "component_ids": (
+                            "home_pitcher_chain_runs_allowed",
+                            "home_pitcher_chain_workload_outs",
+                        ),
+                        "contradicted": False,
+                        "inside_80_count": 2,
+                        "component_count": 2,
+                        "notes": (),
+                    },
+                ),
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "same pitching side"):
+                store.append_review(incompatible)
+
     def test_review_rejects_cross_game_result_and_market_relationships(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")

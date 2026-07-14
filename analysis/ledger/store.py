@@ -55,6 +55,16 @@ class LedgerReferenceError(ValueError):
     """Raised when an append references a missing or mismatched record."""
 
 
+_F5_MARKET_TYPES = frozenset(("f5_side", "f5_total"))
+_FULL_MARKET_TYPES = frozenset(("ml", "plus_1_5", "full_total"))
+_CONVERSION_PATHS = frozenset(
+    ("top_order_matchup", "recent_run_conversion", "underdog_run_creation")
+)
+_FULL_GAME_ONLY_PATHS = frozenset(
+    ("late_bullpen_exposure", "bullpen_protection")
+)
+
+
 def _payload_hash(command: object) -> str:
     encoded = canonical_json(command).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -92,6 +102,48 @@ def _reject_duplicate_keys(
 
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"invalid JSON number: {value}")
+
+
+def _review_market_compatibility_error(
+    command: ReviewCommand,
+    market_type: str,
+) -> str | None:
+    if market_type in _F5_MARKET_TYPES:
+        horizon = "f5"
+    elif market_type in _FULL_MARKET_TYPES:
+        horizon = "full"
+    else:
+        return "review market observation has an unsupported market_type"
+
+    starter_sides: dict[str, str] = {}
+    for component_review in command.component_reviews:
+        evidence_path = component_review["evidence_path"]
+        component_ids = tuple(component_review["component_ids"])
+        if evidence_path in _CONVERSION_PATHS and any(
+            f"_{horizon}_" not in component_id
+            for component_id in component_ids
+        ):
+            return "review conversion components must match the market horizon"
+        if horizon == "f5" and evidence_path in _FULL_GAME_ONLY_PATHS:
+            return "F5 reviews cannot use full-game bullpen evidence paths"
+        if evidence_path not in ("starter_suppression", "starter_collapse"):
+            continue
+        starter_sides[evidence_path] = next(
+            side
+            for side in ("away", "home")
+            if any(
+                component_id.startswith(f"{side}_")
+                for component_id in component_ids
+            )
+        )
+    if (
+        len(starter_sides) == 2
+        and len(set(starter_sides.values())) == 1
+    ):
+        return (
+            "starter suppression and collapse cannot target the same pitching side"
+        )
+    return None
 
 
 def _command_for_capture(record: CaptureRecord) -> CaptureCommand:
@@ -343,8 +395,20 @@ def _review_relationship_error(
     ]
     if not matching_markets:
         return "review market_key must reference an existing market observation"
-    if not any(record.game_pk == capture.game_pk for record in matching_markets):
+    game_markets = tuple(
+        record for record in matching_markets if record.game_pk == capture.game_pk
+    )
+    if not game_markets:
         return "review market observation must concern the capture game"
+    market_types = frozenset(record.market_type for record in game_markets)
+    if len(market_types) != 1:
+        return "review market observations must agree on market_type"
+    compatibility_error = _review_market_compatibility_error(
+        command,
+        next(iter(market_types)),
+    )
+    if compatibility_error is not None:
+        return compatibility_error
     return None
 
 
