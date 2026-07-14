@@ -1,16 +1,20 @@
 """Deterministic forecast calibration and betting-performance reports."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import math
 
 from analysis.forecasting.identity import canonical_json
 from analysis.ledger.records import (
+    CaptureForecastLink,
     CaptureRecord,
+    ForecastRecord,
     MarketObservationRecord,
+    OfficialResultRecord,
     ReviewRecord,
 )
+from analysis.ledger.store import LedgerCorruptionError
 
 
 PROBABILITY_BUCKETS = (
@@ -29,6 +33,11 @@ GROUPING_DIMENSIONS = (
     "priority_score_bucket",
 )
 _MARKET_RESULTS = frozenset(("win", "loss", "push"))
+_MARKET_TYPES = frozenset(
+    ("f5_side", "f5_total", "ml", "plus_1_5", "full_total")
+)
+_SETTLEMENT_FORMATS = frozenset(("two_way", "three_way"))
+_TOTAL_MARKET_TYPES = frozenset(("f5_total", "full_total"))
 _PROBABILITY_TOLERANCE = 1e-12
 _AGGREGATION_TOLERANCE = 1e-12
 _UNAVAILABLE = "unavailable"
@@ -81,6 +90,33 @@ def _require_nonnegative_integer(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a nonnegative integer")
 
 
+def _validated_market_line(market_type: str, line: object) -> float | None:
+    if market_type == "ml":
+        if line is not None:
+            raise ValueError("ML line must be absent")
+        return None
+    if not _is_finite_number(line):
+        raise ValueError(f"{market_type} line must be present and finite")
+    value = float(line)
+    if market_type in _TOTAL_MARKET_TYPES and value < 0.0:
+        raise ValueError("total line must be nonnegative")
+    if market_type == "plus_1_5" and value != 1.5:
+        raise ValueError("plus_1_5 line must be exactly 1.5")
+    return value
+
+
+def _push_capable_market(
+    market_type: str,
+    settlement_format: str,
+    line: float | None,
+) -> bool:
+    if market_type == "f5_side":
+        return settlement_format == "two_way"
+    if market_type in _TOTAL_MARKET_TYPES:
+        return line is not None and line.is_integer()
+    return False
+
+
 @dataclass(frozen=True)
 class CaptureCutoffPolicy:
     name: str
@@ -121,6 +157,182 @@ class CaptureCutoffPolicy:
 LATEST_PREGAME = CaptureCutoffPolicy(name="latest_pregame")
 
 
+def _market_terms(
+    game_pk: int,
+    market_type: str,
+    settlement_format: str,
+    selected_side: str,
+    line: float | None,
+) -> tuple[int, str, str, str, float | None]:
+    return (game_pk, market_type, settlement_format, selected_side, line)
+
+
+@dataclass(frozen=True)
+class _CalibrationLedgerIndex:
+    captures_by_game: Mapping[int, tuple[CaptureRecord, ...]]
+    capture_relationships: Mapping[str, str]
+    links_by_capture: Mapping[str, tuple[CaptureForecastLink, ...]]
+    forecasts_by_run_id: Mapping[str, ForecastRecord]
+    latest_results_by_game: Mapping[int, OfficialResultRecord]
+    reviews_by_link_result: Mapping[
+        tuple[str, str],
+        Mapping[str, tuple[ReviewRecord, ...]],
+    ]
+    close_observations_by_terms: Mapping[
+        tuple[int, str, str, str, float | None],
+        tuple[MarketObservationRecord, ...],
+    ]
+    market_observations_by_record_id: Mapping[str, MarketObservationRecord]
+    market_relationships: Mapping[str, str]
+
+
+def _add_relationship(
+    relationships: dict[str, str],
+    previous_record_id: str,
+    successor_record_id: str,
+    relationship_name: str,
+) -> None:
+    existing = relationships.setdefault(previous_record_id, successor_record_id)
+    if existing != successor_record_id:
+        raise LedgerCorruptionError(
+            f"{relationship_name} supersession target has multiple successors"
+        )
+
+
+def _build_ledger_index(records: tuple[object, ...]) -> _CalibrationLedgerIndex:
+    captures_by_game: dict[int, list[CaptureRecord]] = {}
+    captures_by_capture_id: dict[str, CaptureRecord] = {}
+    captures_by_record_id: dict[str, CaptureRecord] = {}
+    links_by_capture: dict[str, list[CaptureForecastLink]] = {}
+    forecasts_by_run_id: dict[str, ForecastRecord] = {}
+    results_by_game: dict[int, list[OfficialResultRecord]] = {}
+    reviews_by_link_result: dict[
+        tuple[str, str],
+        dict[str, list[ReviewRecord]],
+    ] = {}
+    close_observations_by_terms: dict[
+        tuple[int, str, str, str, float | None],
+        list[MarketObservationRecord],
+    ] = {}
+    market_observations_by_record_id: dict[str, MarketObservationRecord] = {}
+    market_relationships: dict[str, str] = {}
+
+    for record in records:
+        if isinstance(record, CaptureRecord):
+            if record.capture_id in captures_by_capture_id:
+                raise LedgerCorruptionError("duplicate capture_id in ledger")
+            captures_by_capture_id[record.capture_id] = record
+            captures_by_record_id[record.envelope.record_id] = record
+            captures_by_game.setdefault(record.game_pk, []).append(record)
+        elif isinstance(record, CaptureForecastLink):
+            links_by_capture.setdefault(record.capture_id, []).append(record)
+        elif isinstance(record, ForecastRecord):
+            existing = forecasts_by_run_id.setdefault(
+                record.forecast_run_id,
+                record,
+            )
+            if existing != record:
+                raise LedgerCorruptionError("duplicate forecast_run_id in ledger")
+        elif isinstance(record, OfficialResultRecord):
+            results_by_game.setdefault(record.game_pk, []).append(record)
+        elif isinstance(record, ReviewRecord):
+            by_market = reviews_by_link_result.setdefault(
+                (
+                    record.capture_forecast_link_record_id,
+                    record.official_result_record_id,
+                ),
+                {},
+            )
+            by_market.setdefault(record.market_key, []).append(record)
+        elif isinstance(record, MarketObservationRecord):
+            market_observations_by_record_id[record.envelope.record_id] = record
+            if record.supersedes_record_id is not None:
+                _add_relationship(
+                    market_relationships,
+                    record.supersedes_record_id,
+                    record.envelope.record_id,
+                    "market observation",
+                )
+            if record.observation_kind == "close":
+                key = _market_terms(
+                    record.game_pk,
+                    record.market_type,
+                    record.settlement_format,
+                    record.selected_side,
+                    record.line,
+                )
+                close_observations_by_terms.setdefault(key, []).append(record)
+
+    capture_relationships: dict[str, str] = {}
+    for capture in captures_by_record_id.values():
+        if capture.supersedes_capture_id is None:
+            continue
+        previous = captures_by_capture_id.get(capture.supersedes_capture_id)
+        if previous is None:
+            raise LedgerCorruptionError(
+                "capture supersession references a missing capture_id"
+            )
+        _add_relationship(
+            capture_relationships,
+            previous.envelope.record_id,
+            capture.envelope.record_id,
+            "capture",
+        )
+
+    latest_results_by_game: dict[int, OfficialResultRecord] = {}
+    for game_pk, results in results_by_game.items():
+        superseded_record_ids = {
+            result.supersedes_record_id
+            for result in results
+            if result.supersedes_record_id is not None
+        }
+        latest_results = tuple(
+            result
+            for result in results
+            if result.envelope.record_id not in superseded_record_ids
+        )
+        if len(latest_results) != 1:
+            raise LedgerCorruptionError(
+                "official result corrections do not have one latest record"
+            )
+        latest_results_by_game[game_pk] = latest_results[0]
+
+    return _CalibrationLedgerIndex(
+        captures_by_game={
+            game_pk: tuple(captures)
+            for game_pk, captures in captures_by_game.items()
+        },
+        capture_relationships=capture_relationships,
+        links_by_capture={
+            capture_id: tuple(
+                sorted(
+                    links,
+                    key=lambda link: (
+                        link.forecast_run_id,
+                        link.envelope.record_id,
+                    ),
+                )
+            )
+            for capture_id, links in links_by_capture.items()
+        },
+        forecasts_by_run_id=forecasts_by_run_id,
+        latest_results_by_game=latest_results_by_game,
+        reviews_by_link_result={
+            link_result: {
+                market_key: tuple(reviews)
+                for market_key, reviews in reviews_by_market.items()
+            }
+            for link_result, reviews_by_market in reviews_by_link_result.items()
+        },
+        close_observations_by_terms={
+            terms: tuple(observations)
+            for terms, observations in close_observations_by_terms.items()
+        },
+        market_observations_by_record_id=market_observations_by_record_id,
+        market_relationships=market_relationships,
+    )
+
+
 @dataclass(frozen=True)
 class CalibrationRow:
     game_pk: int
@@ -129,6 +341,8 @@ class CalibrationRow:
     market_key: str
     model_version: str
     market_type: str
+    settlement_format: str
+    line: float | None
     lineup_state: str
     starter_structure: str
     legacy_priority_score: int | None
@@ -140,6 +354,7 @@ class CalibrationRow:
     closing_selected_decimal_price: float | None
     entry_no_vig_probability: float | None
     closing_no_vig_probability: float | None
+    push_capable: bool = field(init=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.game_pk, bool) or not isinstance(self.game_pk, int):
@@ -152,10 +367,28 @@ class CalibrationRow:
             "market_key",
             "model_version",
             "market_type",
+            "settlement_format",
             "lineup_state",
             "starter_structure",
         ):
             _require_nonempty_string(getattr(self, field_name), field_name)
+
+        if self.market_type not in _MARKET_TYPES:
+            raise ValueError(f"unsupported market_type: {self.market_type!r}")
+        if self.settlement_format not in _SETTLEMENT_FORMATS:
+            raise ValueError(
+                f"unsupported settlement_format: {self.settlement_format!r}"
+            )
+        if self.market_type != "f5_side" and self.settlement_format != "two_way":
+            raise ValueError(
+                "settlement_format must be two_way for this market_type"
+            )
+        line = _validated_market_line(self.market_type, self.line)
+        push_capable = _push_capable_market(
+            self.market_type,
+            self.settlement_format,
+            line,
+        )
 
         score = self.legacy_priority_score
         if score is not None and (
@@ -194,7 +427,15 @@ class CalibrationRow:
             raise ValueError("market_result must be win, loss, or push")
         if self.market_result != "push" and probabilities["p_push"] == 1.0:
             raise ValueError("a non-push result requires non-push model probability")
+        if not push_capable and (
+            probabilities["p_push"] > 0.0 or self.market_result == "push"
+        ):
+            raise ValueError(
+                "non-push-capable rows cannot contain push probability or outcomes"
+            )
 
+        object.__setattr__(self, "line", line)
+        object.__setattr__(self, "push_capable", push_capable)
         for field_name, value in probabilities.items():
             object.__setattr__(self, field_name, value)
         for field_name in (
@@ -603,7 +844,7 @@ def _metrics_for_rows(rows: tuple[CalibrationRow, ...]) -> CalibrationMetrics:
     price_clv_values: list[float] = []
 
     for row in rows:
-        if row.p_push > 0.0 or row.market_result == "push":
+        if row.push_capable:
             outcome = {
                 "win": (1.0, 0.0, 0.0),
                 "push": (0.0, 1.0, 0.0),
@@ -738,21 +979,34 @@ def _has_eligible_successor(
     record_id: str,
     relationships: Mapping[str, object],
     eligible_record_ids: frozenset[str],
+    cache: dict[str, bool] | None = None,
 ) -> bool:
-    visited = {record_id}
-    successor = relationships.get(record_id)
-    while successor is not None:
+    resolved = {} if cache is None else cache
+    path: list[str] = []
+    visited: set[str] = set()
+    current = record_id
+    while current not in resolved:
+        if current in visited:
+            raise ValueError("capture supersession relationships cannot contain cycles")
+        visited.add(current)
+        path.append(current)
+        successor = relationships.get(current)
+        if successor is None:
+            resolved[current] = False
+            break
         if not isinstance(successor, str) or not successor:
             raise ValueError(
                 "capture supersession relationships must contain record IDs"
             )
-        if successor in visited:
-            raise ValueError("capture supersession relationships cannot contain cycles")
-        if successor in eligible_record_ids:
-            return True
-        visited.add(successor)
-        successor = relationships.get(successor)
-    return False
+        current = successor
+    for current in reversed(path):
+        if current in resolved:
+            continue
+        successor = relationships[current]
+        resolved[current] = (
+            successor in eligible_record_ids or resolved[successor]
+        )
+    return resolved[record_id]
 
 
 def _has_successor_at_or_before_boundary(
@@ -760,43 +1014,63 @@ def _has_successor_at_or_before_boundary(
     relationships: Mapping[str, object],
     captures_by_record_id: Mapping[str, CaptureRecord],
     boundary: datetime,
+    cache: dict[str, bool] | None = None,
 ) -> bool:
-    visited = {record_id}
-    successor_id = relationships.get(record_id)
-    while successor_id is not None:
+    resolved = {} if cache is None else cache
+    path: list[str] = []
+    visited: set[str] = set()
+    current = record_id
+    while current not in resolved:
+        if current in visited:
+            raise ValueError("capture supersession relationships cannot contain cycles")
+        visited.add(current)
+        path.append(current)
+        successor_id = relationships.get(current)
+        if successor_id is None:
+            resolved[current] = False
+            break
         if not isinstance(successor_id, str) or not successor_id:
             raise ValueError(
                 "capture supersession relationships must contain record IDs"
             )
-        if successor_id in visited:
-            raise ValueError("capture supersession relationships cannot contain cycles")
         successor = captures_by_record_id.get(successor_id)
         if successor is None:
             raise ValueError(
                 "capture supersession relationship references missing record"
             )
-        if successor.captured_at <= boundary:
-            return True
-        visited.add(successor_id)
-        successor_id = relationships.get(successor_id)
-    return False
+        current = successor_id
+    for current in reversed(path):
+        if current in resolved:
+            continue
+        successor_id = relationships[current]
+        successor = captures_by_record_id[successor_id]
+        resolved[current] = (
+            successor.captured_at <= boundary or resolved[successor_id]
+        )
+    return resolved[record_id]
 
 
 def _select_primary_captures(
-    captures: tuple[CaptureRecord, ...],
+    captures_by_game: Mapping[int, tuple[CaptureRecord, ...]],
     relationships: Mapping[str, object],
     policy: CaptureCutoffPolicy,
 ) -> tuple[CaptureRecord, ...]:
     eligible = tuple(
-        capture for capture in captures if _capture_is_eligible(capture, policy)
+        capture
+        for captures in captures_by_game.values()
+        for capture in captures
+        if _capture_is_eligible(capture, policy)
     )
     eligible_record_ids = frozenset(
         capture.envelope.record_id for capture in eligible
     )
     if policy.include_later_superseded_captures:
         captures_by_record_id = {
-            capture.envelope.record_id: capture for capture in captures
+            capture.envelope.record_id: capture
+            for captures in captures_by_game.values()
+            for capture in captures
         }
+        caches_by_boundary: dict[datetime, dict[str, bool]] = {}
         eligible = tuple(
             capture
             for capture in eligible
@@ -806,9 +1080,15 @@ def _select_primary_captures(
                 captures_by_record_id,
                 capture.first_pitch
                 - timedelta(seconds=policy.minimum_seconds_before_first_pitch),
+                caches_by_boundary.setdefault(
+                    capture.first_pitch
+                    - timedelta(seconds=policy.minimum_seconds_before_first_pitch),
+                    {},
+                ),
             )
         )
     else:
+        successor_cache: dict[str, bool] = {}
         eligible = tuple(
             capture
             for capture in eligible
@@ -816,6 +1096,7 @@ def _select_primary_captures(
                 capture.envelope.record_id,
                 relationships,
                 eligible_record_ids,
+                successor_cache,
             )
         )
 
@@ -876,11 +1157,14 @@ def _forecast_market(
         if "markets" not in root:
             continue
         markets = _market_mappings(root["markets"], "forecast markets")
-        market = markets.get(market_key)
-        if market is not None:
-            matching_markets.append(
-                _require_mapping(market, f"forecast market {market_key}")
+        if market_key not in markets:
+            continue
+        matching_markets.append(
+            _require_mapping(
+                markets[market_key],
+                f"forecast market {market_key}",
             )
+        )
     if not matching_markets:
         raise ValueError(f"forecast output is missing market_key {market_key}")
     canonical_markets = {
@@ -1011,7 +1295,11 @@ def _starter_structure(payload: Mapping[str, object]) -> str:
 def _matching_close(
     capture: CaptureRecord,
     market: Mapping[str, object],
-    observations: tuple[MarketObservationRecord, ...],
+    observations_by_terms: Mapping[
+        tuple[int, str, str, str, float | None],
+        tuple[MarketObservationRecord, ...],
+    ],
+    observations_by_record_id: Mapping[str, MarketObservationRecord],
     relationships: Mapping[str, object],
 ) -> MarketObservationRecord | None:
     market_type = market.get("market_type")
@@ -1024,49 +1312,69 @@ def _matching_close(
         (selected_side, "selected_side"),
     ):
         _require_nonempty_string(value, field_name)
-    observations_by_record_id = {
-        observation.envelope.record_id: observation for observation in observations
-    }
+    observations = observations_by_terms.get(
+        _market_terms(
+            capture.game_pk,
+            market_type,
+            settlement_format,
+            selected_side,
+            line,
+        ),
+        (),
+    )
+    successor_cache: dict[str, bool] = {}
 
     def has_eligible_successor(record_id: str) -> bool:
-        visited = {record_id}
-        successor_id = relationships.get(record_id)
-        while successor_id is not None:
+        path: list[str] = []
+        visited: set[str] = set()
+        current = record_id
+        while current not in successor_cache:
+            if current in visited:
+                raise ValueError(
+                    "market supersession relationships cannot contain cycles"
+                )
+            visited.add(current)
+            path.append(current)
+            successor_id = relationships.get(current)
+            if successor_id is None:
+                successor_cache[current] = False
+                break
             if not isinstance(successor_id, str) or not successor_id:
                 raise ValueError(
                     "market supersession relationships must contain record IDs"
-                )
-            if successor_id in visited:
-                raise ValueError(
-                    "market supersession relationships cannot contain cycles"
                 )
             successor = observations_by_record_id.get(successor_id)
             if successor is None:
                 raise ValueError(
                     "market supersession relationship references missing record"
                 )
-            if (
-                successor.observed_at <= capture.first_pitch
+            current = successor_id
+        for current in reversed(path):
+            if current in successor_cache:
+                continue
+            successor_id = relationships[current]
+            successor = observations_by_record_id[successor_id]
+            successor_is_eligible = (
+                capture.captured_at <= successor.observed_at
+                <= capture.first_pitch
                 and successor.available_at is not None
-                and successor.available_at <= capture.first_pitch
-            ):
-                return True
-            visited.add(successor_id)
-            successor_id = relationships.get(successor_id)
-        return False
+                and capture.captured_at
+                <= successor.available_at
+                <= capture.first_pitch
+            )
+            successor_cache[current] = (
+                successor_is_eligible or successor_cache[successor_id]
+            )
+        return successor_cache[record_id]
 
     matches = [
         observation
         for observation in observations
-        if observation.observation_kind == "close"
-        and observation.game_pk == capture.game_pk
-        and observation.market_type == market_type
-        and observation.settlement_format == settlement_format
-        and observation.selected_side == selected_side
-        and observation.line == line
-        and observation.observed_at <= capture.first_pitch
+        if capture.captured_at
+        <= observation.observed_at
+        <= capture.first_pitch
         and observation.available_at is not None
-        and observation.available_at <= capture.first_pitch
+        and capture.captured_at <= observation.available_at <= capture.first_pitch
         and not has_eligible_successor(observation.envelope.record_id)
     ]
     if not matches:
@@ -1123,8 +1431,7 @@ def _row_for_review(
     capture: CaptureRecord,
     forecast,
     review: ReviewRecord,
-    observations: tuple[MarketObservationRecord, ...],
-    market_relationships: Mapping[str, object],
+    ledger_index: _CalibrationLedgerIndex,
 ) -> CalibrationRow:
     outputs = _require_mapping(forecast.outputs, "forecast outputs")
     forecast_market = _forecast_market(outputs, review.market_key)
@@ -1152,8 +1459,9 @@ def _row_for_review(
     close = _matching_close(
         capture,
         capture_market,
-        observations,
-        market_relationships,
+        ledger_index.close_observations_by_terms,
+        ledger_index.market_observations_by_record_id,
+        ledger_index.market_relationships,
     )
     closing_price = None if close is None else close.selected_decimal_price
     closing_no_vig = (
@@ -1167,6 +1475,8 @@ def _row_for_review(
     )
     market_type = capture_market.get("market_type")
     _require_nonempty_string(market_type, "market_type")
+    settlement_format = capture_market.get("settlement_format")
+    _require_nonempty_string(settlement_format, "settlement_format")
     return CalibrationRow(
         game_pk=capture.game_pk,
         capture_id=capture.capture_id,
@@ -1174,6 +1484,8 @@ def _row_for_review(
         market_key=review.market_key,
         model_version=forecast.model_version,
         market_type=market_type,
+        settlement_format=settlement_format,
+        line=capture_market.get("line"),
         lineup_state=capture.lineup_state,
         starter_structure=_starter_structure(capture_payload),
         legacy_priority_score=_legacy_priority_score(
@@ -1200,66 +1512,42 @@ def select_primary_rows(
 
     if not isinstance(cutoff_policy, CaptureCutoffPolicy):
         raise ValueError("cutoff_policy must be CaptureCutoffPolicy")
-    captures = tuple(
-        record
-        for record in store.iter_records("capture")
-        if isinstance(record, CaptureRecord)
-    )
-    capture_relationships = store.records_superseded_by("capture")
-    if not isinstance(capture_relationships, Mapping):
-        raise ValueError("capture supersession relationships must be a mapping")
+    ledger_index = _build_ledger_index(tuple(store.iter_records()))
     primary_captures = _select_primary_captures(
-        captures,
-        capture_relationships,
+        ledger_index.captures_by_game,
+        ledger_index.capture_relationships,
         cutoff_policy,
     )
 
-    reviews = tuple(
-        record
-        for record in store.iter_records("review")
-        if isinstance(record, ReviewRecord)
-    )
-    observations = tuple(
-        record
-        for record in store.iter_records("market_observation")
-        if isinstance(record, MarketObservationRecord)
-    )
-    market_relationships = store.records_superseded_by("market_observation")
-    if not isinstance(market_relationships, Mapping):
-        raise ValueError("market supersession relationships must be a mapping")
     candidate_rows: list[CalibrationRow] = []
     for capture in primary_captures:
-        latest_result = store.latest_official_result(capture.game_pk)
+        latest_result = ledger_index.latest_results_by_game.get(capture.game_pk)
         if latest_result is None:
             continue
-        links = tuple(
-            sorted(
-                store.links_for_capture(capture.capture_id),
-                key=lambda link: (
-                    link.forecast_run_id,
-                    link.envelope.record_id,
-                ),
-            )
-        )
+        links = ledger_index.links_by_capture.get(capture.capture_id, ())
         for link in links:
-            forecast = store.forecast_for_link(link.envelope.record_id)
-            matching_reviews = tuple(
-                review
-                for review in reviews
-                if review.capture_forecast_link_record_id
-                == link.envelope.record_id
-                and review.capture_id == capture.capture_id
-                and review.forecast_run_id == forecast.forecast_run_id
-                and review.official_result_record_id
-                == latest_result.envelope.record_id
+            forecast = ledger_index.forecasts_by_run_id.get(link.forecast_run_id)
+            if forecast is None:
+                raise LedgerCorruptionError("link references a missing forecast")
+            indexed_reviews = ledger_index.reviews_by_link_result.get(
+                (
+                    link.envelope.record_id,
+                    latest_result.envelope.record_id,
+                ),
+                {},
             )
-            reviews_by_market: dict[str, list[ReviewRecord]] = {}
-            for review in matching_reviews:
-                reviews_by_market.setdefault(review.market_key, []).append(review)
             exact_reviews: list[ReviewRecord] = []
-            for market_key in sorted(reviews_by_market):
+            for market_key in sorted(indexed_reviews):
+                matching_reviews = tuple(
+                    review
+                    for review in indexed_reviews[market_key]
+                    if review.capture_id == capture.capture_id
+                    and review.forecast_run_id == forecast.forecast_run_id
+                )
+                if not matching_reviews:
+                    continue
                 canonical_reviews: dict[str, ReviewRecord] = {}
-                for review in reviews_by_market[market_key]:
+                for review in matching_reviews:
                     canonical_reviews.setdefault(
                         _review_semantic_json(review),
                         review,
@@ -1275,8 +1563,7 @@ def select_primary_rows(
                     capture,
                     forecast,
                     review,
-                    observations,
-                    market_relationships,
+                    ledger_index,
                 )
                 for review in exact_reviews
             )

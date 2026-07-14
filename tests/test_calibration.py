@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import analysis.review.calibration as calibration_module
 from analysis.ledger import (
     CaptureCommand,
     ForecastCommand,
@@ -41,6 +42,8 @@ def calibration_row(**overrides: object) -> CalibrationRow:
         "market_key": "game:900001:ml:away",
         "model_version": "forecast-v1",
         "market_type": "ml",
+        "settlement_format": "two_way",
+        "line": None,
         "lineup_state": "confirmed",
         "starter_structure": "starter_vs_starter",
         "legacy_priority_score": 80,
@@ -54,6 +57,14 @@ def calibration_row(**overrides: object) -> CalibrationRow:
         "closing_no_vig_probability": 0.56,
     }
     values.update(overrides)
+    if "line" not in overrides:
+        default_lines = {
+            "f5_side": 0.0,
+            "f5_total": 8.0,
+            "plus_1_5": 1.5,
+            "full_total": 8.0,
+        }
+        values["line"] = default_lines.get(values["market_type"])
     return CalibrationRow(**values)
 
 
@@ -354,6 +365,38 @@ class ReorderedLedgerView:
         return self._store.latest_official_result(game_pk)
 
 
+class InstrumentedLedgerView:
+    def __init__(self, store: LedgerStore) -> None:
+        self._store = store
+        self.calls = {
+            "iter_records": 0,
+            "records_superseded_by": 0,
+            "latest_official_result": 0,
+            "links_for_capture": 0,
+            "forecast_for_link": 0,
+        }
+
+    def iter_records(self, kind: str | None = None):
+        self.calls["iter_records"] += 1
+        return self._store.iter_records(kind)
+
+    def records_superseded_by(self, kind: str):
+        self.calls["records_superseded_by"] += 1
+        return self._store.records_superseded_by(kind)
+
+    def latest_official_result(self, game_pk: int):
+        self.calls["latest_official_result"] += 1
+        return self._store.latest_official_result(game_pk)
+
+    def links_for_capture(self, capture_id: str):
+        self.calls["links_for_capture"] += 1
+        return self._store.links_for_capture(capture_id)
+
+    def forecast_for_link(self, link_record_id: str):
+        self.calls["forecast_for_link"] += 1
+        return self._store.forecast_for_link(link_record_id)
+
+
 class CalibrationContractTests(unittest.TestCase):
     def test_cutoff_policy_is_frozen_and_validated(self):
         self.assertEqual(LATEST_PREGAME.name, "latest_pregame")
@@ -445,6 +488,93 @@ class CalibrationContractTests(unittest.TestCase):
         for overrides, message in invalid_rows:
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, message):
+                    calibration_row(**overrides)
+
+    def test_calibration_row_derives_push_capability_from_settlement_terms(self):
+        cases = (
+            ("f5_side", "two_way", 0.0, True),
+            ("f5_side", "three_way", 0.0, False),
+            ("f5_total", "two_way", 8.0, True),
+            ("f5_total", "two_way", 8.5, False),
+            ("full_total", "two_way", 9.0, True),
+            ("full_total", "two_way", 8.5, False),
+            ("ml", "two_way", None, False),
+            ("plus_1_5", "two_way", 1.5, False),
+        )
+        for market_type, settlement_format, line, expected in cases:
+            with self.subTest(
+                market_type=market_type,
+                settlement_format=settlement_format,
+                line=line,
+            ):
+                row = calibration_row(
+                    market_type=market_type,
+                    settlement_format=settlement_format,
+                    line=line,
+                )
+                self.assertEqual(row.settlement_format, settlement_format)
+                self.assertEqual(row.line, line)
+                self.assertIs(row.push_capable, expected)
+
+        row = calibration_row(market_type="f5_side")
+        with self.assertRaises(FrozenInstanceError):
+            row.push_capable = False
+
+    def test_calibration_row_validates_authoritative_market_terms(self):
+        invalid_rows = (
+            ({"market_type": "unknown", "line": None}, "market_type"),
+            ({"settlement_format": "unknown"}, "settlement_format"),
+            ({"line": True}, "line"),
+            ({"line": float("inf")}, "line"),
+            ({"market_type": "ml", "line": 0.0}, "ML line"),
+            ({"market_type": "f5_side", "line": None}, "f5_side line"),
+            ({"market_type": "f5_total", "line": None}, "f5_total line"),
+            ({"market_type": "f5_total", "line": -0.5}, "total line"),
+            ({"market_type": "plus_1_5", "line": 1.0}, "plus_1_5 line"),
+            (
+                {
+                    "market_type": "full_total",
+                    "settlement_format": "three_way",
+                    "line": 8.0,
+                },
+                "settlement_format",
+            ),
+        )
+        for overrides, message in invalid_rows:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    calibration_row(**overrides)
+
+    def test_non_push_capable_rows_reject_push_probability_and_outcomes(self):
+        invalid_rows = (
+            {
+                "market_type": "ml",
+                "p_win": 0.5,
+                "p_push": 0.1,
+                "p_loss": 0.4,
+            },
+            {
+                "market_type": "full_total",
+                "line": 8.5,
+                "p_win": 0.5,
+                "p_push": 0.1,
+                "p_loss": 0.4,
+            },
+            {
+                "market_type": "plus_1_5",
+                "line": 1.5,
+                "market_result": "push",
+            },
+            {
+                "market_type": "f5_side",
+                "settlement_format": "three_way",
+                "line": 0.0,
+                "market_result": "push",
+            },
+        )
+        for overrides in invalid_rows:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "non-push-capable"):
                     calibration_row(**overrides)
 
     def test_metric_and_group_types_are_frozen_and_validated(self):
@@ -708,6 +838,7 @@ class CalibrationMetricTests(unittest.TestCase):
         report = build_calibration_report(
             (
                 calibration_row(
+                    market_type="f5_side",
                     p_win=0.2,
                     p_push=0.5,
                     p_loss=0.3,
@@ -731,6 +862,7 @@ class CalibrationMetricTests(unittest.TestCase):
         report = build_calibration_report(
             (
                 calibration_row(
+                    market_type="f5_side",
                     p_win=0.45,
                     p_push=0.10,
                     p_loss=0.45,
@@ -748,6 +880,7 @@ class CalibrationMetricTests(unittest.TestCase):
         report = build_calibration_report(
             (
                 calibration_row(
+                    market_type="f5_side",
                     p_win=p_win,
                     p_push=0.10,
                     p_loss=p_loss,
@@ -774,6 +907,7 @@ class CalibrationMetricTests(unittest.TestCase):
         rows = (
             calibration_row(
                 forecast_run_id="forecast-win",
+                market_type="f5_side",
                 p_win=0.6,
                 p_push=0.1,
                 p_loss=0.3,
@@ -781,6 +915,7 @@ class CalibrationMetricTests(unittest.TestCase):
             ),
             calibration_row(
                 forecast_run_id="forecast-loss",
+                market_type="f5_side",
                 p_win=0.4,
                 p_push=0.1,
                 p_loss=0.5,
@@ -795,9 +930,49 @@ class CalibrationMetricTests(unittest.TestCase):
         self.assertAlmostEqual(report.overall.multiclass_brier, expected / 2)
         self.assertEqual(report.overall.hit_rate, 0.5)
 
+    def test_multiclass_brier_includes_every_push_capable_row(self):
+        rows = (
+            calibration_row(
+                forecast_run_id="two-way-f5-side",
+                market_type="f5_side",
+                p_win=0.7,
+                p_push=0.0,
+                p_loss=0.3,
+                market_result="win",
+            ),
+            calibration_row(
+                forecast_run_id="integral-f5-total",
+                market_type="f5_total",
+                line=8.0,
+                p_win=0.4,
+                p_push=0.0,
+                p_loss=0.6,
+                market_result="loss",
+            ),
+            calibration_row(
+                forecast_run_id="moneyline",
+                market_type="ml",
+                p_win=0.9,
+                p_push=0.0,
+                p_loss=0.1,
+                market_result="win",
+            ),
+        )
+
+        metrics = build_calibration_report(rows, group_by=()).overall
+
+        f5_side_brier = (0.7 - 1.0) ** 2 + 0.0**2 + 0.3**2
+        f5_total_brier = 0.4**2 + 0.0**2 + (0.6 - 1.0) ** 2
+        self.assertEqual(metrics.multiclass_sample_size, 2)
+        self.assertAlmostEqual(
+            metrics.multiclass_brier,
+            (f5_side_brier + f5_total_brier) / 2,
+        )
+
     def test_multiclass_brier_excludes_zero_push_probability_rows(self):
         eligible = calibration_row(
             forecast_run_id="push-capable",
+            market_type="f5_side",
             p_win=0.4,
             p_push=0.2,
             p_loss=0.4,
@@ -823,6 +998,7 @@ class CalibrationMetricTests(unittest.TestCase):
         report = build_calibration_report(
             (
                 calibration_row(
+                    market_type="f5_side",
                     p_win=1.0,
                     p_push=0.0,
                     p_loss=0.0,
@@ -852,6 +1028,7 @@ class CalibrationMetricTests(unittest.TestCase):
             ),
             calibration_row(
                 forecast_run_id="push-rate-push",
+                market_type="f5_side",
                 p_win=0.2,
                 p_push=0.5,
                 p_loss=0.3,
@@ -896,6 +1073,7 @@ class CalibrationMetricTests(unittest.TestCase):
             ),
             calibration_row(
                 forecast_run_id="zero-push-actual-push",
+                market_type="f5_side",
                 p_win=0.6,
                 p_push=0.0,
                 p_loss=0.4,
@@ -906,6 +1084,7 @@ class CalibrationMetricTests(unittest.TestCase):
             ),
             calibration_row(
                 forecast_run_id="push-capable-win",
+                market_type="f5_side",
                 p_win=0.5,
                 p_push=0.2,
                 p_loss=0.3,
@@ -988,8 +1167,8 @@ class CalibrationGroupingTests(unittest.TestCase):
                 forecast_run_id="partition-ml-win",
                 market_type="ml",
                 p_win=0.6,
-                p_push=0.1,
-                p_loss=0.3,
+                p_push=0.0,
+                p_loss=0.4,
                 market_result="win",
                 selected_decimal_price=2.0,
                 closing_selected_decimal_price=1.8,
@@ -1087,6 +1266,7 @@ class CalibrationGroupingTests(unittest.TestCase):
 
     def test_unavailable_bucket_values_are_explicit(self):
         row = calibration_row(
+            market_type="f5_side",
             legacy_priority_score=None,
             p_win=0.0,
             p_push=1.0,
@@ -1241,6 +1421,34 @@ class CalibrationSelectionTests(unittest.TestCase):
                 id_suffix=str(index),
             )
         return result
+
+    def test_selector_loads_ledger_once_without_loop_time_store_queries(self):
+        for index in range(16):
+            game_pk = 920000 + index
+            context = append_capture_link(
+                self.store,
+                game_pk=game_pk,
+                captured_at=FIRST_PITCH - timedelta(hours=1),
+                lineup_state="confirmed",
+                forecast_run_id=f"scaled-run-{index}",
+                id_suffix="capture",
+            )
+            self._complete_reviews(game_pk, (context,))
+        instrumented = InstrumentedLedgerView(self.store)
+
+        rows = select_primary_rows(instrumented)
+
+        self.assertEqual(len(rows), 16)
+        self.assertEqual(
+            instrumented.calls,
+            {
+                "iter_records": 1,
+                "records_superseded_by": 0,
+                "latest_official_result": 0,
+                "links_for_capture": 0,
+                "forecast_for_link": 0,
+            },
+        )
 
     def test_unchanged_repeated_capture_counts_once_after_primary_selection(self):
         first = append_capture_link(
@@ -1620,6 +1828,24 @@ class CalibrationSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting forecast market"):
             select_primary_rows(self.store)
 
+    def test_present_null_forecast_market_cannot_fallback_to_another_root(self):
+        game_pk = 910034
+        outputs = forecast_outputs(game_pk)
+        outputs["markets"] = {market_key(game_pk): None}
+        context = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="null-forecast-market",
+            id_suffix="capture",
+            forecast_outputs_override=outputs,
+        )
+        self._complete_reviews(game_pk, (context,))
+
+        with self.assertRaisesRegex(ValueError, "forecast market.*mapping"):
+            select_primary_rows(self.store)
+
     def test_exact_duplicate_reviews_are_deduplicated_semantically(self):
         context = append_capture_link(
             self.store,
@@ -1860,6 +2086,117 @@ class CalibrationSelectionTests(unittest.TestCase):
                     if row.game_pk == game_pk
                 )
                 self.assertEqual(row.closing_selected_decimal_price, 1.95)
+
+    def test_close_chronology_starts_at_capture_timestamp(self):
+        capture_time = FIRST_PITCH - timedelta(hours=1)
+        invalid_times = (
+            (
+                "observation-before-capture",
+                capture_time - timedelta(seconds=1),
+                capture_time + timedelta(seconds=1),
+            ),
+            (
+                "availability-before-capture",
+                capture_time + timedelta(seconds=1),
+                capture_time - timedelta(seconds=1),
+            ),
+        )
+        for index, (name, observed_at, available_at) in enumerate(invalid_times):
+            with self.subTest(name=name):
+                game_pk = 910035 + index
+                context = append_capture_link(
+                    self.store,
+                    game_pk=game_pk,
+                    captured_at=capture_time,
+                    lineup_state="confirmed",
+                    forecast_run_id=f"pre-capture-close-{index}",
+                    id_suffix="capture",
+                )
+                self._complete_reviews(game_pk, (context,))
+                append_close_market(
+                    self.store,
+                    game_pk=game_pk,
+                    id_suffix="ineligible",
+                    observed_at=observed_at,
+                    available_at=available_at,
+                    selected_price=1.70,
+                    opposing_price=2.20,
+                )
+
+                row = next(
+                    row
+                    for row in select_primary_rows(self.store)
+                    if row.game_pk == game_pk
+                )
+                self.assertIsNone(row.closing_selected_decimal_price)
+
+        boundary_game_pk = 910037
+        boundary_context = append_capture_link(
+            self.store,
+            game_pk=boundary_game_pk,
+            captured_at=capture_time,
+            lineup_state="confirmed",
+            forecast_run_id="capture-boundary-close",
+            id_suffix="capture",
+        )
+        self._complete_reviews(boundary_game_pk, (boundary_context,))
+        append_close_market(
+            self.store,
+            game_pk=boundary_game_pk,
+            id_suffix="boundary",
+            observed_at=capture_time,
+            available_at=capture_time,
+            selected_price=1.88,
+            opposing_price=2.02,
+        )
+
+        boundary_row = next(
+            row
+            for row in select_primary_rows(self.store)
+            if row.game_pk == boundary_game_pk
+        )
+        self.assertEqual(boundary_row.closing_selected_decimal_price, 1.88)
+
+    def test_successor_helpers_validate_cycle_after_matching_successor(self):
+        first = append_capture_link(
+            self.store,
+            game_pk=910038,
+            captured_at=FIRST_PITCH - timedelta(hours=2),
+            lineup_state="projected",
+            forecast_run_id="cycle-first",
+            id_suffix="first",
+        )[0]
+        second = append_capture_link(
+            self.store,
+            game_pk=910038,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="cycle-second",
+            id_suffix="second",
+        )[0]
+        first_record_id = first.envelope.record_id
+        second_record_id = second.envelope.record_id
+        relationships = {
+            first_record_id: second_record_id,
+            second_record_id: first_record_id,
+        }
+
+        with self.assertRaisesRegex(ValueError, "cycles"):
+            calibration_module._has_eligible_successor(
+                first_record_id,
+                relationships,
+                frozenset((second_record_id,)),
+            )
+        with self.assertRaisesRegex(ValueError, "cycles"):
+            calibration_module._has_successor_at_or_before_boundary(
+                first_record_id,
+                relationships,
+                {
+                    first_record_id: first,
+                    second_record_id: second,
+                },
+                FIRST_PITCH,
+            )
 
     def test_post_pitch_successor_does_not_hide_eligible_close(self):
         context = append_capture_link(
