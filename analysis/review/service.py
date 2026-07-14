@@ -23,7 +23,6 @@ from analysis.model import PriorityEvidencePath
 from .classification import (
     ComponentForecast,
     ComponentObservation,
-    ContradictionRule,
     ExogenousEvent,
     PredictiveInterval,
     PrincipalPathBinding,
@@ -306,45 +305,28 @@ def _exact_shadow_comparison(
     outputs: Mapping[str, object],
     forecast_run_id: str,
     market_key: str,
-) -> Mapping[str, object]:
-    shadow = _require_mapping(
-        outputs.get("shadow_comparison"),
-        "forecast outputs shadow_comparison",
+) -> object:
+    from analysis.shadow import deserialize_shadow_comparison
+
+    shadow = deserialize_shadow_comparison(
+        outputs.get("shadow_comparison")
     )
-    if shadow.get("authority") != "legacy":
-        raise ValueError("shadow_comparison authority must be legacy")
-    if shadow.get("forecast_run_id") != forecast_run_id:
+    if shadow.forecast_run_id != forecast_run_id:
         raise ValueError(
             "shadow_comparison forecast_run_id must match ForecastRecord"
         )
-    comparisons = _require_sequence(
-        shadow.get("market_comparisons"),
-        "shadow_comparison market_comparisons",
-    )
-    parsed_comparisons = tuple(
-        _require_mapping(comparison, "shadow market comparison")
-        for comparison in comparisons
-    )
     matches = tuple(
         comparison
-        for comparison in parsed_comparisons
-        if comparison.get("market_key") == market_key
+        for comparison in shadow.market_comparisons
+        if comparison.market_key == market_key
     )
     if len(matches) != 1:
         raise ValueError(
             f"exact pregame principal-path binding is missing for {market_key}"
         )
     comparison = matches[0]
-    review_eligible = comparison.get("review_eligible")
-    if not isinstance(review_eligible, bool):
-        raise ValueError("review_eligible must be a boolean")
-    flags = _require_sequence(
-        comparison.get("review_ineligibility_flags"),
-        "review_ineligibility_flags",
-    )
-    for flag in flags:
-        _require_nonempty_string(flag, "review_ineligibility_flags")
-    if not review_eligible:
+    flags = comparison.review_ineligibility_flags
+    if not comparison.review_eligible:
         if not flags:
             raise ValueError(
                 "review-ineligible comparison must contain stored flags"
@@ -366,53 +348,25 @@ def _require_component_namespace(component_id: str) -> None:
 
 
 def _principal_paths(
-    comparison: Mapping[str, object],
+    comparison: object,
     market_type: MarketType,
 ) -> tuple[PrincipalPathBinding, ...]:
-    path_values = _require_sequence(
-        comparison.get("principal_paths"),
-        "pregame principal-path binding",
-    )
-    if not 2 <= len(path_values) <= 4:
+    from analysis.shadow import ShadowMarketComparison
+
+    if not isinstance(comparison, ShadowMarketComparison):
+        raise TypeError("comparison must be ShadowMarketComparison")
+    paths = comparison.principal_paths
+    if not 2 <= len(paths) <= 4:
         raise ValueError(
             "pregame principal-path binding requires two to four paths"
         )
-    paths = []
-    for index, value in enumerate(path_values):
-        path = _require_mapping(value, f"principal_paths[{index}]")
-        component_values = _require_sequence(
-            path.get("component_ids"),
-            f"principal_paths[{index}].component_ids",
-        )
-        component_ids = tuple(
-            _require_nonempty_string(
-                component_id,
-                f"principal_paths[{index}].component_ids",
-            )
-            for component_id in component_values
-        )
-        for component_id in component_ids:
+    for path in paths:
+        for component_id in path.component_ids:
             _require_component_namespace(component_id)
-        paths.append(
-            PrincipalPathBinding(
-                evidence_path=_parse_enum(
-                    PriorityEvidencePath,
-                    path.get("evidence_path"),
-                    "evidence_path",
-                ),
-                component_ids=component_ids,
-                contradiction_rule=_parse_enum(
-                    ContradictionRule,
-                    path.get("contradiction_rule"),
-                    "contradiction_rule",
-                ),
-            )
-        )
-    resolved = tuple(paths)
-    if len({path.evidence_path for path in resolved}) != len(resolved):
+    if len({path.evidence_path for path in paths}) != len(paths):
         raise ValueError("pregame principal paths must be unique")
-    validate_principal_path_bindings(market_type, resolved)
-    return resolved
+    validate_principal_path_bindings(market_type, paths)
+    return paths
 
 
 def _component_direction(
@@ -635,10 +589,22 @@ def build_review_candidate(
         )
     if result.game_pk != capture.game_pk:
         raise ValueError("capture and official result game_pk mismatch")
+    if result.finalized_at <= capture.captured_at:
+        raise ValueError(
+            "official result finalized_at must be strictly after captured_at"
+        )
+    if result.finalized_at <= capture.first_pitch:
+        raise ValueError(
+            "official result finalized_at must be strictly after first_pitch"
+        )
     _require_latest_result(records, result)
     away_team, home_team = _capture_identity(capture)
 
     outputs = _require_mapping(forecast.outputs, "forecast outputs")
+    if outputs.get("forecast_run_id") != forecast.forecast_run_id:
+        raise ValueError(
+            "forecast outputs forecast_run_id must match ForecastRecord"
+        )
     comparison = _exact_shadow_comparison(
         outputs,
         forecast.forecast_run_id,
@@ -657,7 +623,7 @@ def build_review_candidate(
         forecast.component_id for forecast in component_forecasts
     )
     legacy_rating = _require_nonempty_string(
-        comparison.get("legacy_rating"),
+        comparison.legacy_rating,
         "shadow comparison legacy_rating",
     )
     market_result = settle_observed_market(resolved_market, result)
@@ -714,6 +680,9 @@ def _review_command(
             path.value for path in classification.contradicted_paths
         ),
         component_reviews=_component_review_payloads(classification),
+        qualifying_exogenous_source_observation_ids=(
+            classification.qualifying_exogenous_source_observation_ids
+        ),
     )
 
 

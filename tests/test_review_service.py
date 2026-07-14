@@ -15,6 +15,7 @@ from analysis.ledger import (
     CaptureRecord,
     ForecastCommand,
     ForecastRecord,
+    LedgerReferenceError,
     LedgerStore,
     MarketObservationCommand,
     OfficialResultCommand,
@@ -119,6 +120,22 @@ class FailOnceAfterReviewAppend:
         return record
 
 
+class CorrectResultBeforeReviewAppend:
+    def __init__(self, store: LedgerStore, correction: OfficialResultCommand):
+        self.store = store
+        self.correction = correction
+        self.corrected = False
+
+    def iter_records(self, kind=None):
+        return self.store.iter_records(kind)
+
+    def append_review(self, command, idempotency_key=None):
+        if not self.corrected:
+            self.store.append_official_result(self.correction)
+            self.corrected = True
+        return self.store.append_review(command, idempotency_key)
+
+
 class ReviewServiceApiAvailabilityTests(unittest.TestCase):
     def test_review_service_api_is_available(self):
         self.assertTrue(
@@ -186,6 +203,7 @@ class ReviewServiceTests(unittest.TestCase):
         documented_events=None,
         score=(2, 1, 4, 3),
         result_game_pk=None,
+        result_finalized_at=None,
         market_observation_side="home",
     ) -> RecordedFixture:
         outputs = self._fresh_outputs()
@@ -245,7 +263,11 @@ class ReviewServiceTests(unittest.TestCase):
                     "/boxscore"
                 ),
                 source_revision="1",
-                finalized_at=self.game.identity.first_pitch + timedelta(hours=4),
+                finalized_at=(
+                    self.game.identity.first_pitch + timedelta(hours=4)
+                    if result_finalized_at is None
+                    else result_finalized_at
+                ),
                 away_f5_runs=away_f5,
                 home_f5_runs=home_f5,
                 away_full_runs=away_full,
@@ -271,30 +293,38 @@ class ReviewServiceTests(unittest.TestCase):
             caller_outputs=outputs,
         )
 
+    def correction_command(
+        self,
+        fixture: RecordedFixture,
+        *,
+        score=(2, 2, 3, 4),
+    ) -> OfficialResultCommand:
+        away_f5, home_f5, away_full, home_full = score
+        component_values = dict(fixture.result.component_values)
+        component_values["away_full_runs"] = float(away_full)
+        return OfficialResultCommand(
+            game_pk=fixture.result.game_pk,
+            source_name=fixture.result.source_name,
+            source_record=fixture.result.source_record,
+            source_revision="2",
+            finalized_at=fixture.result.finalized_at + timedelta(minutes=10),
+            away_f5_runs=away_f5,
+            home_f5_runs=home_f5,
+            away_full_runs=away_full,
+            home_full_runs=home_full,
+            component_values=component_values,
+            documented_events=fixture.result.documented_events,
+            supersedes_record_id=fixture.result.envelope.record_id,
+        )
+
     def append_correction(
         self,
         fixture: RecordedFixture,
         *,
         score=(2, 2, 3, 4),
     ) -> OfficialResultRecord:
-        away_f5, home_f5, away_full, home_full = score
-        component_values = dict(fixture.result.component_values)
-        component_values["away_full_runs"] = float(away_full)
         return self.store.append_official_result(
-            OfficialResultCommand(
-                game_pk=fixture.result.game_pk,
-                source_name=fixture.result.source_name,
-                source_record=fixture.result.source_record,
-                source_revision="2",
-                finalized_at=fixture.result.finalized_at + timedelta(minutes=10),
-                away_f5_runs=away_f5,
-                home_f5_runs=home_f5,
-                away_full_runs=away_full,
-                home_full_runs=home_full,
-                component_values=component_values,
-                documented_events=fixture.result.documented_events,
-                supersedes_record_id=fixture.result.envelope.record_id,
-            )
+            self.correction_command(fixture, score=score)
         )
 
     def test_service_joins_exact_link_capture_forecast_result_and_market(self):
@@ -348,6 +378,33 @@ class ReviewServiceTests(unittest.TestCase):
                 fixture.result.envelope.record_id,
                 MARKET_KEY,
             )
+
+    def test_service_rejects_outcome_finalized_before_capture_or_first_pitch(
+        self,
+    ):
+        cases = (
+            (self.game.captured_at, "captured_at"),
+            (
+                self.game.identity.first_pitch - timedelta(seconds=1),
+                "first_pitch",
+            ),
+        )
+
+        for finalized_at, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(
+                        result_finalized_at=finalized_at
+                    )
+
+                    with self.assertRaisesRegex(ValueError, expected):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
 
     def test_settlement_uses_frozen_semantics_not_narrative_or_market_record(self):
         fixture = self.fixture(
@@ -410,10 +467,17 @@ class ReviewServiceTests(unittest.TestCase):
 
     def test_missing_exact_pregame_binding_is_not_reconstructed(self):
         def remove_exact_comparison(outputs):
-            outputs["shadow_comparison"]["market_comparisons"] = []
+            shadow = outputs["shadow_comparison"]
+            shadow["legacy"]["review_bindings"] = []
+            comparison = shadow["market_comparisons"][0]
+            comparison["principal_paths"] = []
+            comparison["review_eligible"] = False
+            comparison["review_ineligibility_flags"] = [
+                "missing_pregame_binding"
+            ]
 
         fixture = self.fixture(mutate_outputs=remove_exact_comparison)
-        self.assertTrue(
+        self.assertFalse(
             fixture.forecast.outputs["shadow_comparison"]["legacy"][
                 "review_bindings"
             ]
@@ -421,7 +485,7 @@ class ReviewServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "pregame principal-path binding",
+            "missing_pregame_binding",
         ):
             build_review_candidate(
                 self.store,
@@ -532,10 +596,12 @@ class ReviewServiceTests(unittest.TestCase):
 
     def test_team_abbreviation_component_ids_are_rejected(self):
         def use_team_component_id(outputs):
-            paths = outputs["shadow_comparison"]["market_comparisons"][0][
-                "principal_paths"
-            ]
-            paths[1]["component_ids"][0] = "SEA_full_extra_base_hits"
+            shadow = outputs["shadow_comparison"]
+            for paths in (
+                shadow["market_comparisons"][0]["principal_paths"],
+                shadow["legacy"]["review_bindings"][0]["principal_paths"],
+            ):
+                paths[1]["component_ids"][0] = "SEA_full_extra_base_hits"
 
         fixture = self.fixture(mutate_outputs=use_team_component_id)
 
@@ -608,6 +674,74 @@ class ReviewServiceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(result.record.classification, "D")
+        expected_source_ids = (
+            "official:error:1",
+            "official:injury:1",
+        )
+        self.assertEqual(
+            result.classification.qualifying_exogenous_source_observation_ids,
+            expected_source_ids,
+        )
+        self.assertTrue(
+            hasattr(
+                result.command,
+                "qualifying_exogenous_source_observation_ids",
+            ),
+            "ReviewCommand drops qualifying exogenous source IDs",
+        )
+        self.assertEqual(
+            result.command.qualifying_exogenous_source_observation_ids,
+            expected_source_ids,
+        )
+        self.assertEqual(
+            result.record.qualifying_exogenous_source_observation_ids,
+            expected_source_ids,
+        )
+        reloaded = next(
+            LedgerStore(self.store.path).iter_records("review")
+        )
+        self.assertEqual(
+            reloaded.qualifying_exogenous_source_observation_ids,
+            expected_source_ids,
+        )
+
+    def test_event_without_source_id_cannot_persist_as_classification_d(self):
+        target = "home_pitcher_chain_runs_allowed"
+        component_values = self._default_component_values()
+        component_values[target] = 99.0
+        fixture = self.fixture(
+            component_values=component_values,
+            documented_events=(
+                {
+                    "event_type": "injury",
+                    "affected_component_id": target,
+                },
+            ),
+        )
+
+        result = build_and_record_review(
+            self.store,
+            fixture.link.envelope.record_id,
+            fixture.result.envelope.record_id,
+            MARKET_KEY,
+        )
+
+        self.assertNotEqual(result.record.classification, "D")
+        self.assertEqual(
+            result.classification.qualifying_exogenous_source_observation_ids,
+            (),
+        )
+        self.assertTrue(
+            hasattr(
+                result.record,
+                "qualifying_exogenous_source_observation_ids",
+            ),
+            "ReviewRecord drops the empty qualifying source-ID contract",
+        )
+        self.assertEqual(
+            result.record.qualifying_exogenous_source_observation_ids,
+            (),
+        )
 
     def test_same_review_retry_returns_one_immutable_record(self):
         fixture = self.fixture()
@@ -654,6 +788,27 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(
             retried.record.review_id,
             next(self.store.iter_records("review")).review_id,
+        )
+
+    def test_correction_between_build_and_append_rejects_stale_review(self):
+        fixture = self.fixture()
+        racing_store = CorrectResultBeforeReviewAppend(
+            self.store,
+            self.correction_command(fixture),
+        )
+
+        with self.assertRaisesRegex(LedgerReferenceError, "latest"):
+            build_and_record_review(
+                racing_store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+        self.assertEqual(len(tuple(self.store.iter_records("review"))), 0)
+        self.assertEqual(
+            len(tuple(self.store.iter_records("official_result"))),
+            2,
         )
 
     def test_result_correction_creates_new_review_and_keeps_old_immutable(self):
@@ -713,6 +868,120 @@ class ReviewServiceTests(unittest.TestCase):
                     self.store = LedgerStore(Path(directory) / "ledger.jsonl")
                     fixture = self.fixture(mutate_outputs=mutation)
                     with self.assertRaisesRegex(ValueError, expected):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
+    def test_shadow_schema_rejects_missing_and_additional_fields(self):
+        mutations = (
+            lambda outputs: outputs["shadow_comparison"]["legacy"].pop(
+                "notes"
+            ),
+            lambda outputs: outputs["shadow_comparison"][
+                "market_comparisons"
+            ][0].update(unexpected_field=True),
+        )
+
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(mutate_outputs=mutation)
+
+                    with self.assertRaisesRegex(ValueError, "schema"):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
+    def test_shadow_rating_must_match_the_frozen_legacy_candidate(self):
+        def change_play_to_pass(outputs):
+            outputs["shadow_comparison"]["market_comparisons"][0][
+                "legacy_rating"
+            ] = "pass"
+
+        fixture = self.fixture(mutate_outputs=change_play_to_pass)
+
+        with self.assertRaisesRegex(ValueError, "legacy candidate"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_shadow_candidate_and_comparison_order_must_match(self):
+        def change_comparison_index(outputs):
+            outputs["shadow_comparison"]["market_comparisons"][0][
+                "legacy_candidate_index"
+            ] = 1
+
+        fixture = self.fixture(mutate_outputs=change_comparison_index)
+
+        with self.assertRaisesRegex(ValueError, "candidate order"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_root_forecast_run_id_must_match_record_and_shadow(self):
+        def change_root_forecast_run_id(outputs):
+            outputs["forecast_run_id"] = "0" * 64
+
+        fixture = self.fixture(mutate_outputs=change_root_forecast_run_id)
+        self.assertEqual(
+            fixture.forecast.outputs["shadow_comparison"]["forecast_run_id"],
+            fixture.forecast.forecast_run_id,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outputs forecast_run_id"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_selected_comparison_must_match_exact_frozen_review_binding(self):
+        def change_binding_market_key(outputs):
+            outputs["shadow_comparison"]["legacy"]["review_bindings"][0][
+                "market_key"
+            ] = "other_market"
+
+        def change_binding_index(outputs):
+            outputs["shadow_comparison"]["legacy"]["review_bindings"][0][
+                "legacy_candidate_index"
+            ] = 1
+
+        def change_binding_legacy_market(outputs):
+            outputs["shadow_comparison"]["legacy"]["review_bindings"][0][
+                "legacy_market"
+            ] = "full_total"
+
+        def change_binding_paths(outputs):
+            outputs["shadow_comparison"]["legacy"]["review_bindings"][0][
+                "principal_paths"
+            ][0]["component_ids"] = ["home_f5_runs"]
+
+        for mutation in (
+            change_binding_market_key,
+            change_binding_index,
+            change_binding_legacy_market,
+            change_binding_paths,
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(mutate_outputs=mutation)
+
+                    with self.assertRaisesRegex(ValueError, "review binding"):
                         build_review_candidate(
                             self.store,
                             fixture.link.envelope.record_id,

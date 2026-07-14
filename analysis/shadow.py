@@ -30,6 +30,7 @@ from analysis.ledger.records import (
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.review.classification import (
+    ContradictionRule,
     PrincipalPathBinding,
     validate_principal_path_bindings,
 )
@@ -47,6 +48,48 @@ _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
 _EVIDENCE_PATH_ORDER = {
     path: index for index, path in enumerate(PriorityEvidencePath)
 }
+_SHADOW_COMPARISON_FIELDS = frozenset(
+    ("authority", "legacy", "forecast_run_id", "market_comparisons")
+)
+_LEGACY_FIELDS = frozenset(
+    (
+        "model_version",
+        "candidates",
+        "final_priority",
+        "review_bindings",
+        "notes",
+    )
+)
+_CANDIDATE_FIELDS = frozenset(
+    ("market", "score", "decision_rating", "evidence_paths")
+)
+_REVIEW_BINDING_FIELDS = frozenset(
+    (
+        "market_key",
+        "legacy_candidate_index",
+        "legacy_market",
+        "principal_paths",
+    )
+)
+_PRINCIPAL_PATH_FIELDS = frozenset(
+    ("evidence_path", "component_ids", "contradiction_rule")
+)
+_MARKET_COMPARISON_FIELDS = frozenset(
+    (
+        "market_key",
+        "legacy_candidate_index",
+        "legacy_market",
+        "legacy_score",
+        "legacy_rating",
+        "model_win_probability",
+        "fair_decimal_price",
+        "market_no_vig_probability",
+        "edge",
+        "principal_paths",
+        "review_eligible",
+        "review_ineligibility_flags",
+    )
+)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -317,6 +360,24 @@ class ShadowComparison:
                 raise ValueError(
                     "market comparison must copy its legacy candidate fields"
                 )
+        bindings_by_index = {
+            binding.legacy_candidate_index: binding
+            for binding in self.legacy.review_bindings
+        }
+        for comparison in self.market_comparisons:
+            if not comparison.review_eligible:
+                continue
+            binding = bindings_by_index.get(
+                comparison.legacy_candidate_index
+            )
+            if binding is None or (
+                comparison.market_key != binding.market_key
+                or comparison.legacy_market != binding.legacy_market
+                or comparison.principal_paths != binding.principal_paths
+            ):
+                raise ValueError(
+                    "eligible market comparison must match its exact review binding"
+                )
 
 
 @dataclass(frozen=True)
@@ -344,6 +405,213 @@ class ShadowRunRecords:
             raise ValueError("link capture_id must match capture")
         if self.link.forecast_run_id != self.forecast.forecast_run_id:
             raise ValueError("link forecast_run_id must match forecast")
+
+
+def _payload_mapping(
+    value: object,
+    field_name: str,
+    expected_fields: frozenset[str],
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} schema must be a mapping")
+    actual_fields = frozenset(value)
+    if actual_fields != expected_fields:
+        missing = ", ".join(sorted(expected_fields - actual_fields)) or "none"
+        additional = ", ".join(sorted(actual_fields - expected_fields)) or "none"
+        raise ValueError(
+            f"{field_name} schema mismatch; missing={missing}; "
+            f"additional={additional}"
+        )
+    return value
+
+
+def _payload_sequence(value: object, field_name: str) -> tuple[object, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} schema must be a sequence")
+    return tuple(value)
+
+
+def _payload_string_sequence(
+    value: object,
+    field_name: str,
+) -> tuple[str, ...]:
+    values = _payload_sequence(value, field_name)
+    for item in values:
+        _require_nonempty_string(item, field_name)
+    return values
+
+
+def _payload_enum(enum_type: type, value: object, field_name: str):
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a canonical string")
+    try:
+        return enum_type(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} is unsupported: {value}") from error
+
+
+def _principal_path_from_payload(value: object) -> PrincipalPathBinding:
+    payload = _payload_mapping(
+        value,
+        "principal path",
+        _PRINCIPAL_PATH_FIELDS,
+    )
+    component_ids = _payload_string_sequence(
+        payload["component_ids"],
+        "principal path component_ids",
+    )
+    path = PrincipalPathBinding(
+        evidence_path=_payload_enum(
+            PriorityEvidencePath,
+            payload["evidence_path"],
+            "principal path evidence_path",
+        ),
+        component_ids=component_ids,
+        contradiction_rule=_payload_enum(
+            ContradictionRule,
+            payload["contradiction_rule"],
+            "principal path contradiction_rule",
+        ),
+    )
+    if component_ids != path.component_ids:
+        raise ValueError(
+            "principal path component_ids must use canonical order"
+        )
+    return path
+
+
+def _principal_paths_from_payload(
+    value: object,
+) -> tuple[PrincipalPathBinding, ...]:
+    return tuple(
+        _principal_path_from_payload(path)
+        for path in _payload_sequence(value, "principal_paths")
+    )
+
+
+def _candidate_from_payload(value: object) -> PriorityMarketCandidate:
+    payload = _payload_mapping(value, "legacy candidate", _CANDIDATE_FIELDS)
+    evidence_values = _payload_string_sequence(
+        payload["evidence_paths"],
+        "legacy candidate evidence_paths",
+    )
+    evidence_paths = tuple(
+        _payload_enum(
+            PriorityEvidencePath,
+            evidence_path,
+            "legacy candidate evidence_path",
+        )
+        for evidence_path in evidence_values
+    )
+    canonical_evidence_values = tuple(
+        evidence_path.value
+        for evidence_path in PriorityEvidencePath
+        if evidence_path in evidence_paths
+    )
+    if evidence_values != canonical_evidence_values:
+        raise ValueError(
+            "legacy candidate evidence_paths must use canonical unique order"
+        )
+    return PriorityMarketCandidate(
+        market=payload["market"],
+        score=payload["score"],
+        decision_rating=payload["decision_rating"],
+        evidence_paths=frozenset(evidence_paths),
+    )
+
+
+def _binding_from_payload(value: object) -> CandidateReviewBinding:
+    payload = _payload_mapping(
+        value,
+        "legacy review binding",
+        _REVIEW_BINDING_FIELDS,
+    )
+    return CandidateReviewBinding(
+        market_key=payload["market_key"],
+        legacy_candidate_index=payload["legacy_candidate_index"],
+        legacy_market=payload["legacy_market"],
+        principal_paths=_principal_paths_from_payload(
+            payload["principal_paths"]
+        ),
+    )
+
+
+def _legacy_from_payload(value: object) -> LegacyDecisionSnapshot:
+    payload = _payload_mapping(value, "shadow legacy", _LEGACY_FIELDS)
+    return LegacyDecisionSnapshot(
+        model_version=payload["model_version"],
+        candidates=tuple(
+            _candidate_from_payload(candidate)
+            for candidate in _payload_sequence(
+                payload["candidates"],
+                "shadow legacy candidates",
+            )
+        ),
+        final_priority=_payload_string_sequence(
+            payload["final_priority"],
+            "shadow legacy final_priority",
+        ),
+        review_bindings=tuple(
+            _binding_from_payload(binding)
+            for binding in _payload_sequence(
+                payload["review_bindings"],
+                "shadow legacy review_bindings",
+            )
+        ),
+        notes=_payload_string_sequence(
+            payload["notes"],
+            "shadow legacy notes",
+        ),
+    )
+
+
+def _market_comparison_from_payload(value: object) -> ShadowMarketComparison:
+    payload = _payload_mapping(
+        value,
+        "shadow market comparison",
+        _MARKET_COMPARISON_FIELDS,
+    )
+    return ShadowMarketComparison(
+        market_key=payload["market_key"],
+        legacy_candidate_index=payload["legacy_candidate_index"],
+        legacy_market=payload["legacy_market"],
+        legacy_score=payload["legacy_score"],
+        legacy_rating=payload["legacy_rating"],
+        model_win_probability=payload["model_win_probability"],
+        fair_decimal_price=payload["fair_decimal_price"],
+        market_no_vig_probability=payload["market_no_vig_probability"],
+        edge=payload["edge"],
+        principal_paths=_principal_paths_from_payload(
+            payload["principal_paths"]
+        ),
+        review_eligible=payload["review_eligible"],
+        review_ineligibility_flags=_payload_string_sequence(
+            payload["review_ineligibility_flags"],
+            "review_ineligibility_flags",
+        ),
+    )
+
+
+def deserialize_shadow_comparison(value: object) -> ShadowComparison:
+    """Reconstruct and validate one complete frozen shadow payload."""
+
+    payload = _payload_mapping(
+        value,
+        "shadow_comparison",
+        _SHADOW_COMPARISON_FIELDS,
+    )
+    return ShadowComparison(
+        authority=payload["authority"],
+        legacy=_legacy_from_payload(payload["legacy"]),
+        forecast_run_id=payload["forecast_run_id"],
+        market_comparisons=tuple(
+            _market_comparison_from_payload(comparison)
+            for comparison in _payload_sequence(
+                payload["market_comparisons"],
+                "shadow market_comparisons",
+            )
+        ),
+    )
 
 
 def _comparison_for_candidate(
@@ -666,5 +934,6 @@ __all__ = (
     "ShadowRunIdempotencyKeys",
     "ShadowRunRecords",
     "compare_shadow_forecast",
+    "deserialize_shadow_comparison",
     "record_shadow_run",
 )

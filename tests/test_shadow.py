@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import analysis.shadow as shadow_module
 from analysis.forecasting import (
     MarketType,
     OutcomeProbabilities,
@@ -43,6 +44,13 @@ from tests.test_forecasting_engine import (
     _fast_config,
     _market,
     forecast_engine_module,
+)
+
+
+deserialize_shadow_comparison = getattr(
+    shadow_module,
+    "deserialize_shadow_comparison",
+    None,
 )
 
 
@@ -587,6 +595,24 @@ class ShadowRecordingTests(unittest.TestCase):
         self.assertEqual(
             len(tuple(self.store.iter_records("capture_forecast_link"))),
             1,
+        )
+
+    def test_recorded_payload_reconstructs_the_full_immutable_comparison(
+        self,
+    ) -> None:
+        self.assertTrue(
+            callable(deserialize_shadow_comparison),
+            "shadow comparison deserializer is missing",
+        )
+        recorded = self.record()
+
+        reconstructed = deserialize_shadow_comparison(
+            recorded.forecast.outputs["shadow_comparison"]
+        )
+
+        self.assertEqual(
+            reconstructed,
+            compare_shadow_forecast(self.legacy, self.forecast),
         )
 
     def test_equivalent_binding_and_path_order_reuses_forecast_payload(self) -> None:

@@ -167,6 +167,9 @@ def _command_for_review(record: ReviewRecord) -> ReviewCommand:
         inside_80_ratio=record.inside_80_ratio,
         contradicted_paths=record.contradicted_paths,
         component_reviews=record.component_reviews,
+        qualifying_exogenous_source_observation_ids=(
+            record.qualifying_exogenous_source_observation_ids
+        ),
     )
 
 
@@ -295,6 +298,39 @@ def _review_relationship_error(
         return "official_result_record_id must reference an existing result"
     if result.game_pk != capture.game_pk:
         return "review capture and official result must concern the same game"
+    if result.finalized_at <= capture.captured_at:
+        return (
+            "official result finalized_at must be strictly after captured_at"
+        )
+    if result.finalized_at <= capture.first_pitch:
+        return (
+            "official result finalized_at must be strictly after first_pitch"
+        )
+    game_results = tuple(
+        record
+        for record in records
+        if isinstance(record, OfficialResultRecord)
+        and record.game_pk == result.game_pk
+    )
+    superseded_result_ids = frozenset(
+        record.supersedes_record_id
+        for record in game_results
+        if record.supersedes_record_id is not None
+    )
+    latest_results = tuple(
+        record
+        for record in game_results
+        if record.envelope.record_id not in superseded_result_ids
+    )
+    if (
+        len(latest_results) != 1
+        or latest_results[0].envelope.record_id
+        != command.official_result_record_id
+    ):
+        return (
+            "official_result_record_id must reference the current latest "
+            "official result"
+        )
 
     matching_markets = [
         record
@@ -874,6 +910,9 @@ class LedgerStore:
                 inside_80_ratio=command.inside_80_ratio,
                 contradicted_paths=command.contradicted_paths,
                 component_reviews=command.component_reviews,
+                qualifying_exogenous_source_observation_ids=(
+                    command.qualifying_exogenous_source_observation_ids
+                ),
             )
 
         record = self._append(

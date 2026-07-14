@@ -600,6 +600,7 @@ class ReviewCommand:
     inside_80_ratio: float
     contradicted_paths: tuple[str, ...]
     component_reviews: tuple[Mapping[str, object], ...]
+    qualifying_exogenous_source_observation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonempty(
@@ -629,6 +630,28 @@ class ReviewCommand:
             "component_reviews",
             freeze_mapping_sequence(self.component_reviews, "component_reviews"),
         )
+        source_ids = freeze_string_sequence(
+            self.qualifying_exogenous_source_observation_ids,
+            "qualifying_exogenous_source_observation_ids",
+        )
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError(
+                "qualifying exogenous source IDs must be unique"
+            )
+        source_ids = tuple(sorted(source_ids))
+        if self.classification == "D" and not source_ids:
+            raise ValueError(
+                "D requires qualifying exogenous source observation IDs"
+            )
+        if self.classification != "D" and source_ids:
+            raise ValueError(
+                "non-D classifications require empty qualifying source IDs"
+            )
+        object.__setattr__(
+            self,
+            "qualifying_exogenous_source_observation_ids",
+            source_ids,
+        )
 
 
 @dataclass(frozen=True)
@@ -645,6 +668,7 @@ class ReviewRecord:
     inside_80_ratio: float
     contradicted_paths: tuple[str, ...]
     component_reviews: tuple[Mapping[str, object], ...]
+    qualifying_exogenous_source_observation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.envelope, RecordEnvelope):
@@ -665,9 +689,17 @@ class ReviewRecord:
             inside_80_ratio=self.inside_80_ratio,
             contradicted_paths=self.contradicted_paths,
             component_reviews=self.component_reviews,
+            qualifying_exogenous_source_observation_ids=(
+                self.qualifying_exogenous_source_observation_ids
+            ),
         )
         object.__setattr__(self, "contradicted_paths", command.contradicted_paths)
         object.__setattr__(self, "component_reviews", command.component_reviews)
+        object.__setattr__(
+            self,
+            "qualifying_exogenous_source_observation_ids",
+            command.qualifying_exogenous_source_observation_ids,
+        )
 
 
 __all__ = (

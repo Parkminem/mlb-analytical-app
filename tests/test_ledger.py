@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -1102,6 +1102,32 @@ class LedgerStoreTests(unittest.TestCase):
             )
             self.assertEqual(len(tuple(store.iter_records("review"))), 1)
 
+    def test_stale_result_review_replays_but_cannot_append_under_a_new_key(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            _, _, _, _, result, command = append_review_context(store)
+            original = store.append_review(command)
+            store.append_official_result(
+                result_command(
+                    source_revision="2",
+                    finalized_at=FINALIZED_AT + timedelta(minutes=5),
+                    away_full_runs=5,
+                    supersedes_record_id=result.envelope.record_id,
+                )
+            )
+
+            replayed = store.append_review(command)
+
+            self.assertEqual(replayed, original)
+            with self.assertRaisesRegex(LedgerReferenceError, "latest"):
+                store.append_review(
+                    command,
+                    idempotency_key="review:stale-result:new-key",
+                )
+            self.assertEqual(len(tuple(store.iter_records("review"))), 1)
+
     def test_review_requires_existing_matching_link_result_and_market(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")
@@ -1195,6 +1221,47 @@ class LedgerStoreTests(unittest.TestCase):
                     idempotency_key="review:wrong-market-game",
                 )
 
+    def test_review_rejects_result_finalized_before_capture_or_first_pitch(
+        self,
+    ) -> None:
+        cases = (
+            (CAPTURED_AT, "captured_at"),
+            (FIRST_PITCH - timedelta(seconds=1), "first_pitch"),
+        )
+
+        for finalized_at, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    capture = store.append_capture(
+                        "capture:review-time",
+                        capture_command(),
+                    )
+                    forecast = store.append_forecast(forecast_command())
+                    link = store.link_capture_forecast(
+                        capture.capture_id,
+                        forecast.forecast_run_id,
+                    )
+                    market = store.append_market_observation(market_command())
+                    result = store.append_official_result(
+                        result_command(finalized_at=finalized_at)
+                    )
+                    command = review_command(
+                        capture_forecast_link_record_id=(
+                            link.envelope.record_id
+                        ),
+                        capture_id=capture.capture_id,
+                        forecast_run_id=forecast.forecast_run_id,
+                        official_result_record_id=result.envelope.record_id,
+                        market_key=market.market_key,
+                    )
+
+                    with self.assertRaisesRegex(
+                        LedgerReferenceError,
+                        expected,
+                    ):
+                        store.append_review(command)
+
     def test_review_explicit_key_conflicts_and_nested_fields_are_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")
@@ -1219,6 +1286,38 @@ class LedgerStoreTests(unittest.TestCase):
                 review.component_reviews[0]["new"] = {}
             with self.assertRaises(TypeError):
                 review.component_reviews[0]["classification"] = "mutated"
+
+    def test_review_source_ids_are_canonical_and_classification_bound(self) -> None:
+        review_fields = {field.name for field in fields(ReviewCommand)}
+        self.assertIn(
+            "qualifying_exogenous_source_observation_ids",
+            review_fields,
+            "ReviewCommand qualifying source IDs are missing",
+        )
+
+        source_ids = ["official:event:b", "official:event:a"]
+        command = review_command(
+            classification="D",
+            qualifying_exogenous_source_observation_ids=source_ids,
+        )
+        source_ids.append("official:event:mutated")
+
+        self.assertEqual(
+            command.qualifying_exogenous_source_observation_ids,
+            ("official:event:a", "official:event:b"),
+        )
+        with self.assertRaisesRegex(ValueError, "D requires"):
+            review_command(
+                classification="D",
+                qualifying_exogenous_source_observation_ids=(),
+            )
+        with self.assertRaisesRegex(ValueError, "non-D"):
+            review_command(
+                classification="A",
+                qualifying_exogenous_source_observation_ids=(
+                    "official:event:a",
+                ),
+            )
 
     def test_result_default_replay_and_explicit_key_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
