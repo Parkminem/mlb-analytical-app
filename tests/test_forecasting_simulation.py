@@ -16,6 +16,7 @@ from analysis.forecasting.simulation import (
     ComponentDistribution,
     DistributionSummary,
     GameSimulationInput,
+    SimulationResult,
     mean_runs_for_half_inning,
     simulate_game_distribution,
 )
@@ -31,6 +32,7 @@ from tests.test_forecasting_components import (
     _offense_lineup,
     _offense_profile,
     _offense_response,
+    _offense_usage,
     _offense_with_responses,
 )
 
@@ -374,6 +376,29 @@ class GameSimulationTests(unittest.TestCase):
             0.5 * ((1 / 3) * 0.8 * 0.6 + (2 / 3) * 1.2 * 1.9),
         )
 
+    def test_binomial_quantile_is_stable_for_large_symmetric_trials(self):
+        result = simulation_module._binomial_quantile(2000, 0.5, 0.5)
+
+        self.assertLessEqual(abs(result - 1000), 1)
+
+    def test_binomial_quantile_handles_extreme_probabilities_and_samples(self):
+        self.assertEqual(
+            simulation_module._binomial_quantile(2000, 1e-9, 0.5),
+            0,
+        )
+        self.assertEqual(
+            simulation_module._binomial_quantile(2000, 1 - 1e-9, 0.5),
+            2000,
+        )
+        self.assertEqual(
+            simulation_module._binomial_quantile(2000, 0.5, 0.0),
+            0,
+        )
+        self.assertEqual(
+            simulation_module._binomial_quantile(2000, 0.5, 1.0),
+            2000,
+        )
+
     def test_f5_paths_are_exactly_isolated_from_team_bullpen_quality(self):
         config = _fast_config()
         roles = (
@@ -522,6 +547,87 @@ class GameSimulationTests(unittest.TestCase):
             tuple(map(run_path, changed.games)),
         )
 
+    def test_diagnostic_uncertainty_uses_raw_lineup_sigma(self):
+        config = SimulationConfig(simulations=1)
+        baseline_input = _game_sim_input(config)
+        pitcher_id = baseline_input.home_pitcher_chain.pitchers[0].pitcher_id
+        lineup = _offense_lineup(log_standard_error=0.09)
+        profile = _offense_profile(
+            pitcher_id,
+            tuple(
+                usage
+                for side in ("R", "L")
+                for usage in (
+                    _offense_usage(pitcher_id, side, "FF", 0.25, 95.0),
+                    _offense_usage(pitcher_id, side, "CH", 0.75, 85.0),
+                )
+            ),
+        )
+        missing_sample_offense = forecast_offense(
+            _offense_with_responses(
+                lineup,
+                {
+                    slot.order: (
+                        _offense_response(
+                            slot.order,
+                            pitcher_id,
+                            expected_side=slot.expected_side,
+                            pitch_type="FF",
+                        ),
+                    )
+                    for slot in lineup.slots
+                },
+            ),
+            (profile,),
+            config,
+        )
+        expected_matchup_sigma = math.hypot(
+            0.09,
+            0.75 * config.sample_shortage_log_se_penalty,
+        )
+        simulation_input = replace(
+            baseline_input,
+            away_offense=missing_sample_offense,
+        )
+        random_factory = simulation_module.random.Random
+        random_instances = []
+        latent_calls = []
+
+        def tracked_random_factory(seed):
+            instance = random_factory(seed)
+            random_instances.append(instance)
+            return instance
+
+        def tracked_latent(rng, point, sigma, lower, upper):
+            latent_calls.append((rng, point, sigma, lower, upper))
+            return point
+
+        with (
+            patch.object(
+                simulation_module.random,
+                "Random",
+                side_effect=tracked_random_factory,
+            ),
+            patch.object(
+                simulation_module,
+                "draw_bounded_lognormal",
+                side_effect=tracked_latent,
+            ),
+        ):
+            simulate_game_distribution(simulation_input, "6" * 64, config)
+
+        score_rng, diagnostic_rng = random_instances
+        diagnostic_sigmas = tuple(
+            sigma for rng, _point, sigma, _lower, _upper in latent_calls
+            if rng is diagnostic_rng
+        )
+        score_sigmas = tuple(
+            sigma for rng, _point, sigma, _lower, _upper in latent_calls
+            if rng is score_rng
+        )
+        self.assertEqual(diagnostic_sigmas[0], 0.09)
+        self.assertIn(expected_matchup_sigma, score_sigmas)
+
     def test_component_distributions_are_deterministic_nearest_rank_values(self):
         config = _fast_config()
         simulation_input = _game_sim_input(config)
@@ -609,6 +715,199 @@ class GameSimulationTests(unittest.TestCase):
                 values=(1, 2, 3),
                 summary=inconsistent,
             )
+
+    def test_simulation_result_cannot_be_constructed_outside_the_factory(self):
+        config = SimulationConfig(simulations=1)
+        valid = simulate_game_distribution(
+            _game_sim_input(config),
+            "7" * 64,
+            config,
+        )
+
+        with self.assertRaisesRegex(ValueError, "simulation factory"):
+            SimulationResult(
+                forecast_run_id=valid.forecast_run_id,
+                simulation_count=valid.simulation_count,
+                games=valid.games,
+                component_distributions=valid.component_distributions,
+            )
+
+    def test_result_rejects_noncanonical_or_nonderived_components(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        valid = simulate_game_distribution(
+            simulation_input,
+            "8" * 64,
+            config,
+        )
+        baseline = dict(valid.component_distributions)
+        exposure_id = next(
+            component_id
+            for component_id in baseline
+            if "_bullpen_segment_" in component_id
+        )
+
+        missing_base = dict(baseline)
+        missing_base.pop("away_f5_runs")
+        missing_exposure = dict(baseline)
+        missing_exposure.pop(exposure_id)
+        fabricated = dict(baseline)
+        fabricated_component = replace(
+            baseline["away_full_runs"],
+            component_id="away_fabricated",
+        )
+        fabricated[fabricated_component.component_id] = fabricated_component
+        wrong_values = dict(baseline)
+        full_runs = baseline["away_full_runs"].values[0] + 1
+        wrong_values["away_full_runs"] = ComponentDistribution(
+            component_id="away_full_runs",
+            values=(full_runs,),
+            summary=simulation_module._summarize((full_runs,)),
+        )
+        invalid_binary = dict(baseline)
+        invalid_binary["away_protected_bullpen_close_entry"] = (
+            ComponentDistribution(
+                component_id="away_protected_bullpen_close_entry",
+                values=(2,),
+                summary=simulation_module._summarize((2,)),
+            )
+        )
+        wrong_exposure = dict(baseline)
+        exposure_value = 1 - baseline[exposure_id].values[0]
+        wrong_exposure[exposure_id] = ComponentDistribution(
+            component_id=exposure_id,
+            values=(exposure_value,),
+            summary=simulation_module._summarize((exposure_value,)),
+        )
+        wrong_summary = dict(baseline)
+        altered_summary = replace(baseline["home_full_runs"])
+        object.__setattr__(
+            altered_summary,
+            "summary",
+            DistributionSummary(99, 99, 99, 99, 99, 99, 99),
+        )
+        wrong_summary["home_full_runs"] = altered_summary
+
+        cases = {
+            "missing_base": missing_base,
+            "missing_exposure": missing_exposure,
+            "fabricated": fabricated,
+            "wrong_values": wrong_values,
+            "invalid_binary": invalid_binary,
+            "wrong_exposure": wrong_exposure,
+            "wrong_summary": wrong_summary,
+        }
+        for label, components in cases.items():
+            with self.subTest(label=label):
+                with patch.object(
+                    simulation_module,
+                    "_component_distributions",
+                    return_value=components,
+                ):
+                    with self.assertRaisesRegex(ValueError, "component"):
+                        simulate_game_distribution(
+                            simulation_input,
+                            "8" * 64,
+                            config,
+                        )
+
+    def test_full_game_extra_base_hits_cannot_fall_below_f5(self):
+        game, _ = _simulate_scripted_game([0, 1] + [0] * 15)
+
+        with self.assertRaisesRegex(ValueError, "full-game extra-base hits"):
+            replace(
+                game,
+                away_f5_traffic=1,
+                away_full_traffic=1,
+                away_f5_extra_base_hits=1,
+                away_full_extra_base_hits=0,
+            )
+
+    def test_exposed_bullpen_ids_must_be_canonical_sorted_unique(self):
+        game, _ = _simulate_scripted_game([0, 1] + [0] * 15)
+
+        with self.assertRaisesRegex(ValueError, "canonical sorted"):
+            replace(
+                game,
+                away_bullpen_segment_ids_exposed=("bullpen:z", "bullpen:a"),
+            )
+
+    def test_game_state_flags_must_match_regulation_and_extra_innings(self):
+        home_lead, _ = _simulate_scripted_game([0, 1] + [0] * 15)
+        away_lead, _ = _simulate_scripted_game([1, 0] + [0] * 16)
+        extra_game, _ = _simulate_scripted_game([0] * 18 + [1, 0])
+        cases = (
+            (home_lead, {"final_inning": 10}),
+            (away_lead, {"bottom_ninth_played": False}),
+            (extra_game, {"bottom_ninth_played": False}),
+            (home_lead, {"max_inning_tiebreak_used": True}),
+        )
+
+        for game, changes in cases:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, "game state"):
+                    replace(game, **changes)
+
+    def test_result_rejects_exposure_ids_not_available_in_context(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        valid = simulate_game_distribution(
+            simulation_input,
+            "9" * 64,
+            config,
+        )
+        invalid_game = replace(
+            valid.games[0],
+            away_bullpen_segment_ids_exposed=("bullpen:not-available",),
+        )
+
+        with patch.object(
+            simulation_module,
+            "_simulate_one_game",
+            return_value=invalid_game,
+        ):
+            with self.assertRaisesRegex(ValueError, "available bullpen"):
+                simulate_game_distribution(
+                    simulation_input,
+                    "9" * 64,
+                    config,
+                )
+
+    def test_synthetic_f5_relief_is_not_an_exposed_team_segment(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        game = simulation_module._simulate_one_game(
+            simulation_input,
+            simulation_module.random.Random(1),
+            simulation_module.random.Random(1),
+            config,
+        )
+
+        self.assertNotIn(
+            simulation_input.away_bullpen.unscheduled_f5_relief.segment_id,
+            game.away_bullpen_segment_ids_exposed,
+        )
+        self.assertNotIn(
+            simulation_input.home_bullpen.unscheduled_f5_relief.segment_id,
+            game.home_bullpen_segment_ids_exposed,
+        )
+
+    def test_result_binds_max_tiebreak_to_configured_max_inning(self):
+        config = SimulationConfig(simulations=1, max_innings=30)
+        extra_game, _ = _simulate_scripted_game([0] * 18 + [1, 0])
+        invalid_game = replace(extra_game, max_inning_tiebreak_used=True)
+
+        with patch.object(
+            simulation_module,
+            "_simulate_one_game",
+            return_value=invalid_game,
+        ):
+            with self.assertRaisesRegex(ValueError, "max_innings"):
+                simulate_game_distribution(
+                    _game_sim_input(config),
+                    "a" * 64,
+                    config,
+                )
 
     def test_invalid_ids_inputs_config_and_numeric_values_are_rejected(self):
         config = SimulationConfig(simulations=1)

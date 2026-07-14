@@ -2306,6 +2306,10 @@ class OffenseForecastTests(unittest.TestCase):
         )
         self.assertEqual(complete.matchup_log_standard_errors[pitcher_id], 0.09)
         self.assertGreater(missing.log_standard_error, complete.log_standard_error)
+        self.assertTrue(hasattr(missing, "lineup_log_standard_error"))
+        self.assertEqual(missing.lineup_log_standard_error, 0.09)
+        with self.assertRaises(FrozenInstanceError):
+            missing.lineup_log_standard_error = 0.50
 
     def test_selected_values_and_fixed_labels_are_carried_without_reshrinking(self):
         pitcher_id = "pitcher:starter"

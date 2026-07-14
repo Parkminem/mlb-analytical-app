@@ -565,6 +565,10 @@ class OffenseForecast:
     def multiplier_for(self, pitcher_or_segment_id: str) -> float:
         return self.matchup_multipliers.get(pitcher_or_segment_id, 1.0)
 
+    @property
+    def lineup_log_standard_error(self) -> float:
+        return self._context.lineup_log_standard_error
+
     def log_standard_error_for(self, pitcher_or_segment_id: str) -> float:
         explicit = self.matchup_log_standard_errors.get(pitcher_or_segment_id)
         if explicit is not None:

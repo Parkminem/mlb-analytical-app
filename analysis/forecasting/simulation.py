@@ -1,6 +1,7 @@
 """Deterministic one-generator MLB score simulation."""
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 import math
 import random
@@ -226,6 +227,12 @@ class SimulatedGame:
                 self, f"{side}_f5_traffic"
             ):
                 raise ValueError("full-game traffic cannot be below F5 traffic")
+            if getattr(self, f"{side}_full_extra_base_hits") < getattr(
+                self, f"{side}_f5_extra_base_hits"
+            ):
+                raise ValueError(
+                    "full-game extra-base hits cannot be below F5 extra-base hits"
+                )
             if getattr(self, f"{side}_f5_extra_base_hits") > getattr(
                 self, f"{side}_f5_traffic"
             ) or getattr(self, f"{side}_full_extra_base_hits") > getattr(
@@ -233,10 +240,19 @@ class SimulatedGame:
             ):
                 raise ValueError("extra-base hits cannot exceed traffic")
             exposed = getattr(self, f"{side}_bullpen_segment_ids_exposed")
-            if not isinstance(exposed, tuple) or len(set(exposed)) != len(exposed):
-                raise ValueError("exposed bullpen IDs must be a unique tuple")
+            if not isinstance(exposed, tuple):
+                raise ValueError(
+                    "exposed bullpen IDs must be a canonical sorted unique tuple"
+                )
             for segment_id in exposed:
                 _require_nonempty_string(segment_id, "exposed bullpen segment ID")
+            if (
+                exposed != tuple(sorted(exposed))
+                or len(exposed) != len(set(exposed))
+            ):
+                raise ValueError(
+                    "exposed bullpen IDs must be a canonical sorted unique tuple"
+                )
             protected = getattr(
                 self, f"{side}_protected_bullpen_close_entry"
             )
@@ -254,6 +270,27 @@ class SimulatedGame:
             raise ValueError("final_inning must be an integer of at least nine")
         if self.away_full_runs == self.home_full_runs:
             raise ValueError("a simulated full game must have a winner")
+        if self.final_inning > 9 and not self.bottom_ninth_played:
+            raise ValueError(
+                "game state with extra innings requires the bottom ninth"
+            )
+        if (
+            not self.bottom_ninth_played
+            and self.home_full_runs <= self.away_full_runs
+        ):
+            raise ValueError(
+                "game state with a skipped bottom ninth requires a regulation "
+                "home win"
+            )
+        if self.max_inning_tiebreak_used and (
+            self.final_inning < 10
+            or not self.bottom_ninth_played
+            or abs(self.away_full_runs - self.home_full_runs) != 1
+        ):
+            raise ValueError(
+                "game state with a max-inning tiebreak requires a one-run "
+                "extra-inning terminal score"
+            )
         if (
             self.home_pitcher_chain_runs_allowed
             + self.home_bullpen_runs_allowed
@@ -281,6 +318,8 @@ class SimulationResult:
     component_distributions: Mapping[str, ComponentDistribution]
 
     def __post_init__(self) -> None:
+        max_innings, available_entries = _require_simulation_result_context()
+        available_by_side = dict(available_entries)
         _validate_forecast_run_id(self.forecast_run_id)
         if (
             isinstance(self.simulation_count, bool)
@@ -292,6 +331,28 @@ class SimulationResult:
             raise ValueError("games must be a tuple matching simulation_count")
         if any(not isinstance(game, SimulatedGame) for game in self.games):
             raise TypeError("games must contain SimulatedGame values")
+        for game in self.games:
+            if game.final_inning > max_innings:
+                raise ValueError(
+                    "game final_inning cannot exceed configured max_innings"
+                )
+            if (
+                game.max_inning_tiebreak_used
+                and game.final_inning != max_innings
+            ):
+                raise ValueError(
+                    "max-inning tiebreak final_inning must equal config.max_innings"
+                )
+            for side in _SIDES:
+                exposed = getattr(
+                    game,
+                    f"{side}_bullpen_segment_ids_exposed",
+                )
+                if not set(exposed).issubset(available_by_side[side]):
+                    raise ValueError(
+                        "game exposure IDs must reference available bullpen "
+                        "segments"
+                    )
         if not isinstance(self.component_distributions, Mapping):
             raise TypeError("component_distributions must be a mapping")
         copied = dict(self.component_distributions)
@@ -302,13 +363,91 @@ class SimulationResult:
                 )
             if distribution.component_id != component_id:
                 raise ValueError("component distribution key and ID must match")
+            if not isinstance(distribution.values, tuple):
+                raise ValueError("component values must be a tuple")
             if len(distribution.values) != self.simulation_count:
                 raise ValueError("component values must match simulation_count")
+            if not isinstance(distribution.summary, DistributionSummary):
+                raise TypeError("component summary must be DistributionSummary")
+        expected = _expected_component_distributions(
+            self.games,
+            available_entries,
+        )
+        if set(copied) != set(expected):
+            raise ValueError(
+                "component distributions must contain exactly the canonical IDs"
+            )
+        for component_id, expected_distribution in expected.items():
+            if not _component_distribution_matches_exactly(
+                copied[component_id],
+                expected_distribution,
+            ):
+                raise ValueError(
+                    "component distributions must exactly match game-derived "
+                    "values and summaries"
+                )
         object.__setattr__(
             self,
             "component_distributions",
             MappingProxyType(copied),
         )
+
+
+def _make_simulation_result_factory():
+    active_context = ContextVar("simulation_result_context", default=None)
+
+    def build_result(
+        *,
+        forecast_run_id: str,
+        simulation_count: int,
+        games: tuple[SimulatedGame, ...],
+        component_distributions: Mapping[str, ComponentDistribution],
+        max_innings: int,
+        available_entries: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> SimulationResult:
+        if (
+            isinstance(max_innings, bool)
+            or not isinstance(max_innings, int)
+            or max_innings < 10
+        ):
+            raise ValueError("result context max_innings must be at least ten")
+        canonical_entries = tuple(
+            (side, tuple(sorted(segment_ids)))
+            for side, segment_ids in available_entries
+        )
+        if tuple(side for side, _ids in canonical_entries) != _SIDES:
+            raise ValueError("result context must contain away and home metadata")
+        for _side, segment_ids in canonical_entries:
+            if len(segment_ids) != len(set(segment_ids)):
+                raise ValueError("result context bullpen IDs must be unique")
+            for segment_id in segment_ids:
+                _require_nonempty_string(segment_id, "result context bullpen ID")
+        context = (max_innings, canonical_entries)
+        token = active_context.set(context)
+        try:
+            return SimulationResult(
+                forecast_run_id=forecast_run_id,
+                simulation_count=simulation_count,
+                games=games,
+                component_distributions=component_distributions,
+            )
+        finally:
+            active_context.reset(token)
+
+    def require_context():
+        context = active_context.get()
+        if context is None:
+            raise ValueError(
+                "SimulationResult must be constructed by the simulation factory"
+            )
+        return context
+
+    return build_result, require_context
+
+
+_build_simulation_result, _require_simulation_result_context = (
+    _make_simulation_result_factory()
+)
 
 
 @dataclass(frozen=True)
@@ -451,15 +590,41 @@ def _binomial_quantile(trials: int, probability: float, sample: float) -> int:
         return 0
     if probability == 1:
         return trials
-    mass = (1.0 - probability) ** trials
-    cumulative = mass
-    successes = 0
-    odds = probability / (1.0 - probability)
-    while sample >= cumulative and successes < trials:
-        successes += 1
-        mass *= (trials - successes + 1) / successes * odds
-        cumulative += mass
-    return successes
+    if sample <= 0:
+        return 0
+    if sample >= 1:
+        return trials
+
+    mode = min(trials, math.floor((trials + 1) * probability))
+    log_probability = math.log(probability)
+    log_complement = math.log1p(-probability)
+    log_weights = [-math.inf] * (trials + 1)
+    log_weights[mode] = 0.0
+    for successes in range(mode, 0, -1):
+        log_weights[successes - 1] = (
+            log_weights[successes]
+            + math.log(successes)
+            - math.log(trials - successes + 1)
+            + log_complement
+            - log_probability
+        )
+    for successes in range(mode, trials):
+        log_weights[successes + 1] = (
+            log_weights[successes]
+            + math.log(trials - successes)
+            - math.log(successes + 1)
+            + log_probability
+            - log_complement
+        )
+
+    weights = tuple(math.exp(log_weight) for log_weight in log_weights)
+    threshold = sample * math.fsum(weights)
+    cumulative = 0.0
+    for successes, weight in enumerate(weights):
+        cumulative += weight
+        if threshold < cumulative:
+            return successes
+    return trials
 
 
 def _fixed_gamma_poisson_source(
@@ -556,7 +721,7 @@ def _draw_offense_latents(
     diagnostic_uncertainty = draw_bounded_lognormal(
         diagnostic_rng,
         1.0,
-        offense.log_standard_error,
+        offense.lineup_log_standard_error,
         *config.offense_bounds,
     )
     return _OffenseLatents(
@@ -674,7 +839,7 @@ def _pitching_effects_for_half_inning(
                     pitching_latents.bullpen_run_prevention[relief.segment_id]
                 ),
                 pitcher_chain=False,
-                exposed_bullpen=True,
+                exposed_bullpen=not relief.synthetic,
                 protected_close_entry=close_entry,
             )
         )
@@ -993,10 +1158,74 @@ def _summarize(values: tuple[int | float, ...]) -> DistributionSummary:
     )
 
 
-def _component_distributions(
-    games: tuple[SimulatedGame, ...],
+def _summary_values(summary: DistributionSummary) -> tuple[int | float, ...]:
+    return (
+        summary.p05,
+        summary.p10,
+        summary.p20,
+        summary.median,
+        summary.p80,
+        summary.p90,
+        summary.p95,
+    )
+
+
+def _component_distribution_matches_exactly(
+    actual: ComponentDistribution,
+    expected: ComponentDistribution,
+) -> bool:
+    if actual.component_id != expected.component_id:
+        return False
+    if len(actual.values) != len(expected.values):
+        return False
+    if any(
+        type(actual_value) is not type(expected_value)
+        or actual_value != expected_value
+        for actual_value, expected_value in zip(actual.values, expected.values)
+    ):
+        return False
+    if actual.component_id.endswith("_protected_bullpen_close_entry") or (
+        "_bullpen_segment_" in actual.component_id
+        and actual.component_id.endswith("_exposed")
+    ):
+        if any(
+            type(value) is not int or value not in (0, 1)
+            for value in actual.values
+        ):
+            return False
+    return all(
+        type(actual_value) is type(expected_value)
+        and actual_value == expected_value
+        for actual_value, expected_value in zip(
+            _summary_values(actual.summary),
+            _summary_values(expected.summary),
+        )
+    )
+
+
+def _available_bullpen_entries(
     simulation_input: GameSimulationInput,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            side,
+            tuple(
+                segment.segment_id
+                for segment in getattr(
+                    simulation_input,
+                    f"{side}_bullpen",
+                ).available_segments
+            ),
+        )
+        for side in _SIDES
+    )
+
+
+def _expected_component_distributions(
+    games: tuple[SimulatedGame, ...],
+    available_entries: tuple[tuple[str, tuple[str, ...]], ...],
 ) -> Mapping[str, ComponentDistribution]:
+    available_by_side = dict(available_entries)
     values_by_id: dict[str, tuple[int | float, ...]] = {}
     for side in _SIDES:
         for suffix in _BASE_COMPONENT_SUFFIXES:
@@ -1007,14 +1236,11 @@ def _component_distributions(
                 else getattr(game, component_id)
                 for game in games
             )
-        bullpen = getattr(simulation_input, f"{side}_bullpen")
         exposed_field = f"{side}_bullpen_segment_ids_exposed"
-        for segment in bullpen.available_segments:
-            component_id = (
-                f"{side}_bullpen_segment_{segment.segment_id}_exposed"
-            )
+        for segment_id in available_by_side[side]:
+            component_id = f"{side}_bullpen_segment_{segment_id}_exposed"
             values_by_id[component_id] = tuple(
-                int(segment.segment_id in getattr(game, exposed_field))
+                int(segment_id in getattr(game, exposed_field))
                 for game in games
             )
     return MappingProxyType(
@@ -1026,6 +1252,16 @@ def _component_distributions(
             )
             for component_id, values in values_by_id.items()
         }
+    )
+
+
+def _component_distributions(
+    games: tuple[SimulatedGame, ...],
+    simulation_input: GameSimulationInput,
+) -> Mapping[str, ComponentDistribution]:
+    return _expected_component_distributions(
+        games,
+        _available_bullpen_entries(simulation_input),
     )
 
 
@@ -1060,9 +1296,12 @@ def simulate_game_distribution(
         )
         for _ in range(config.simulations)
     )
-    return SimulationResult(
+    available_entries = _available_bullpen_entries(input)
+    return _build_simulation_result(
         forecast_run_id=forecast_run_id,
         simulation_count=config.simulations,
         games=games,
         component_distributions=_component_distributions(games, input),
+        max_innings=config.max_innings,
+        available_entries=available_entries,
     )
