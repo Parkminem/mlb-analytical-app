@@ -205,11 +205,24 @@ class ReviewServiceTests(unittest.TestCase):
         result_game_pk=None,
         result_finalized_at=None,
         market_observation_side="home",
+        forecast_run_id=None,
+        stored_normalized_input_hash=None,
+        simulation_config_hash=None,
     ) -> RecordedFixture:
         outputs = self._fresh_outputs()
         if mutate_outputs is not None:
             mutate_outputs(outputs)
         game_pk = self.game.identity.game_pk
+        record_input_hash = (
+            self.normalized_input_hash
+            if stored_normalized_input_hash is None
+            else stored_normalized_input_hash
+        )
+        record_forecast_run_id = (
+            self.engine_forecast.forecast_run_id
+            if forecast_run_id is None
+            else forecast_run_id
+        )
         capture = self.store.append_capture(
             "capture:review:test",
             CaptureCommand(
@@ -218,16 +231,20 @@ class ReviewServiceTests(unittest.TestCase):
                 first_pitch=self.game.identity.first_pitch,
                 lineup_state="confirmed",
                 out_of_sample_eligible=True,
-                normalized_input_hash=self.normalized_input_hash,
+                normalized_input_hash=record_input_hash,
                 payload=self.capture_payload,
             ),
         )
         forecast = self.store.append_forecast(
             ForecastCommand(
-                forecast_run_id=self.engine_forecast.forecast_run_id,
+                forecast_run_id=record_forecast_run_id,
                 model_version=self.engine_forecast.model_version,
-                simulation_config_hash=self.simulation_config_hash,
-                normalized_input_hash=self.normalized_input_hash,
+                simulation_config_hash=(
+                    self.simulation_config_hash
+                    if simulation_config_hash is None
+                    else simulation_config_hash
+                ),
+                normalized_input_hash=record_input_hash,
                 outputs=outputs,
             )
         )
@@ -254,6 +271,20 @@ class ReviewServiceTests(unittest.TestCase):
             )
         )
         away_f5, home_f5, away_full, home_full = score
+        result_component_values = dict(
+            self._default_component_values()
+            if component_values is None
+            else component_values
+        )
+        official_scores = {
+            "away_f5_runs": away_f5,
+            "home_f5_runs": home_f5,
+            "away_full_runs": away_full,
+            "home_full_runs": home_full,
+        }
+        for component_id, score_value in official_scores.items():
+            if component_id in result_component_values:
+                result_component_values[component_id] = float(score_value)
         result = self.store.append_official_result(
             OfficialResultCommand(
                 game_pk=game_pk if result_game_pk is None else result_game_pk,
@@ -272,11 +303,7 @@ class ReviewServiceTests(unittest.TestCase):
                 home_f5_runs=home_f5,
                 away_full_runs=away_full,
                 home_full_runs=home_full,
-                component_values=(
-                    self._default_component_values()
-                    if component_values is None
-                    else component_values
-                ),
+                component_values=result_component_values,
                 documented_events=(
                     ({"result_label": "loss"},)
                     if documented_events is None
@@ -410,7 +437,7 @@ class ReviewServiceTests(unittest.TestCase):
         fixture = self.fixture(
             documented_events=({"result_label": "loss"},),
             market_observation_side="home",
-            score=(0, 5, 4, 3),
+            score=(0, 2, 4, 3),
         )
 
         result = build_and_record_review(
@@ -553,6 +580,74 @@ class ReviewServiceTests(unittest.TestCase):
                             MARKET_KEY,
                         )
 
+    def test_all_component_distributions_and_intervals_are_revalidated(self):
+        component_id = "home_f5_runs"
+
+        def change_internal_component_id(outputs):
+            outputs["component_distributions"][component_id][
+                "component_id"
+            ] = "away_f5_runs"
+
+        def change_unrelated_value_count(outputs):
+            outputs["component_distributions"][component_id]["values"].pop()
+
+        def change_unrelated_summary(outputs):
+            summary = outputs["component_distributions"][component_id][
+                "summary"
+            ]
+            for field_name in summary:
+                summary[field_name] = 999
+
+        def remove_unrelated_interval(outputs):
+            outputs["intervals"].pop(component_id)
+
+        def change_unrelated_interval(outputs):
+            summary = outputs["intervals"][component_id]
+            for field_name in summary:
+                summary[field_name] = -1
+
+        def add_fabricated_component(outputs):
+            fabricated_id = "away_fabricated_component"
+            distribution = json.loads(
+                canonical_json(outputs["component_distributions"][component_id])
+            )
+            distribution["component_id"] = fabricated_id
+            outputs["component_distributions"][fabricated_id] = distribution
+            outputs["intervals"][fabricated_id] = json.loads(
+                canonical_json(distribution["summary"])
+            )
+
+        def change_bullpen_diagnostic_segment_id(outputs):
+            outputs["component_diagnostics"]["away_bullpen"]["segments"][0][
+                "segment_id"
+            ] = "bullpen:SEA:tampered"
+
+        mutations = (
+            change_internal_component_id,
+            change_unrelated_value_count,
+            change_unrelated_summary,
+            remove_unrelated_interval,
+            change_unrelated_interval,
+            add_fabricated_component,
+            change_bullpen_diagnostic_segment_id,
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(mutate_outputs=mutation)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "component|simulation_count|summary|interval|diagnostic",
+                    ):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
     def test_missing_official_component_is_rejected_even_when_score_exists(self):
         component_values = self._default_component_values()
         component_values.pop("away_full_runs")
@@ -591,7 +686,7 @@ class ReviewServiceTests(unittest.TestCase):
 
         fixture = self.fixture(
             mutate_outputs=use_team_alias,
-            score=(0, 5, 4, 3),
+            score=(0, 2, 4, 3),
         )
 
         candidate = build_review_candidate(
@@ -854,6 +949,10 @@ class ReviewServiceTests(unittest.TestCase):
     def test_malformed_forecast_schema_and_fingerprint_are_rejected(self):
         mutations = (
             (
+                lambda outputs: outputs.update(forecast_run_id=123),
+                "forecast_run_id",
+            ),
+            (
                 lambda outputs: outputs.pop("market_inputs"),
                 "market_inputs",
             ),
@@ -883,6 +982,93 @@ class ReviewServiceTests(unittest.TestCase):
                             fixture.result.envelope.record_id,
                             MARKET_KEY,
                         )
+
+    def test_market_inputs_and_evaluations_require_exact_key_sets(self):
+        def add_extra_market_input(outputs):
+            semantic = json.loads(
+                canonical_json(outputs["market_inputs"][MARKET_KEY])
+            )
+            semantic["market_key"] = "ghost_market"
+            outputs["market_inputs"]["ghost_market"] = semantic
+
+        def add_extra_market_evaluation(outputs):
+            outputs["markets"]["ghost_market"] = json.loads(
+                canonical_json(outputs["markets"][MARKET_KEY])
+            )
+
+        for mutation in (add_extra_market_input, add_extra_market_evaluation):
+            with self.subTest(mutation=mutation.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(mutate_outputs=mutation)
+
+                    with self.assertRaisesRegex(ValueError, "keys.*exactly match"):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
+    def test_market_evaluation_revalidates_probability_derived_fields(self):
+        def forge_probability_and_edge(outputs):
+            evaluation = outputs["markets"][MARKET_KEY]
+            probabilities = evaluation["probabilities"]
+            probabilities["win"] = 0.8
+            probabilities["push"] = 0.0
+            probabilities["loss"] = 0.2
+            evaluation["edge"] = 0.123456
+            outputs["shadow_comparison"]["market_comparisons"][0][
+                "edge"
+            ] = 0.123456
+
+        fixture = self.fixture(mutate_outputs=forge_probability_and_edge)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "probabilities|derived|edge",
+        ):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_ordinary_market_cannot_be_swapped_to_arbitrary_unevaluated(self):
+        def swap_to_unevaluated(outputs):
+            evaluation = outputs["markets"][MARKET_KEY]
+            for field_name in (
+                "probabilities",
+                "model_conditional_win_probability",
+                "fair_decimal_price",
+                "market_no_vig_probability",
+                "edge",
+                "expected_value",
+                "selected_decimal_price",
+                "opposing_decimal_price",
+            ):
+                evaluation[field_name] = None
+            evaluation["evaluated"] = False
+            evaluation["reason"] = "arbitrary unevaluated replacement"
+            comparison = outputs["shadow_comparison"]["market_comparisons"][0]
+            for field_name in (
+                "model_win_probability",
+                "fair_decimal_price",
+                "market_no_vig_probability",
+                "edge",
+            ):
+                comparison[field_name] = None
+
+        fixture = self.fixture(mutate_outputs=swap_to_unevaluated)
+
+        with self.assertRaisesRegex(ValueError, "unevaluated|evaluated"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
 
     def test_shadow_schema_rejects_missing_and_additional_fields(self):
         mutations = (
@@ -951,6 +1137,33 @@ class ReviewServiceTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "outputs forecast_run_id"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_forged_record_output_shadow_ids_are_rejected_by_capture_semantics(
+        self,
+    ):
+        forged_id = "f" * 64
+
+        def forge_all_ids(outputs):
+            outputs["forecast_run_id"] = forged_id
+            outputs["shadow_comparison"]["forecast_run_id"] = forged_id
+
+        fixture = self.fixture(
+            mutate_outputs=forge_all_ids,
+            forecast_run_id=forged_id,
+            stored_normalized_input_hash=forged_id,
+            simulation_config_hash=forged_id,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "forecast_run_id.*capture semantics|normalized_input_hash",
+        ):
             build_review_candidate(
                 self.store,
                 fixture.link.envelope.record_id,

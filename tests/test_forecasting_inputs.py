@@ -2,9 +2,11 @@ from dataclasses import dataclass, FrozenInstanceError, fields, is_dataclass, re
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import hashlib
+import json
 import math
 import unittest
 
+import analysis.forecasting.identity as identity_module
 from analysis.forecasting import (
     BooleanFeature,
     BullpenInput,
@@ -31,6 +33,7 @@ from analysis.forecasting import (
     StarterProjectionComponents,
     WorkloadHistory,
 )
+from analysis.forecasting.engine import resolve_forecast_input
 from analysis.forecasting.identity import (
     build_forecast_run_id,
     canonical_json,
@@ -1125,6 +1128,86 @@ class ForecastIdentityTests(unittest.TestCase):
                     {"simulations": 20_000},
                 ),
             )
+
+    def test_capture_payload_rebuilds_exact_resolved_semantic_identity(self):
+        semantic_from_capture = getattr(
+            identity_module,
+            "semantic_forecast_payload_from_capture_payload",
+            None,
+        )
+        run_id_from_capture = getattr(
+            identity_module,
+            "build_forecast_run_id_from_capture_payload",
+            None,
+        )
+        self.assertTrue(callable(semantic_from_capture))
+        self.assertTrue(callable(run_id_from_capture))
+        game = normalized_game()
+        alias_observation = replace(
+            game.observations[0],
+            observation_id="obs:semantic-alias",
+        )
+        total_market = replace(
+            game.markets[0],
+            market_key="game:900001:full_total:under:8.5",
+            market_type=MarketType.FULL_TOTAL,
+            selected_side="under",
+            line=8.5,
+        )
+        captured_game = replace(
+            game,
+            markets=(total_market, game.markets[0]),
+            observations=(alias_observation, game.observations[0]),
+        )
+        resolved_game = resolve_forecast_input(captured_game)
+        config = {"simulations": 20_000, "seed_mode": "forecast"}
+
+        rebuilt = semantic_from_capture(capture_payload(captured_game))
+
+        self.assertEqual(
+            canonical_json(rebuilt),
+            canonical_json(semantic_forecast_payload(resolved_game)),
+        )
+        self.assertNotIn("captured_at", rebuilt)
+        self.assertEqual(
+            run_id_from_capture(
+                capture_payload(captured_game),
+                "shadow-1",
+                config,
+            ),
+            build_forecast_run_id(resolved_game, "shadow-1", config),
+        )
+
+    def test_capture_semantic_rebuild_rejects_malformed_payload_schema(self):
+        semantic_from_capture = getattr(
+            identity_module,
+            "semantic_forecast_payload_from_capture_payload",
+            None,
+        )
+        self.assertTrue(callable(semantic_from_capture))
+        baseline = capture_payload(normalized_game())
+
+        malformed_payloads = []
+        missing_identity = json.loads(canonical_json(baseline))
+        missing_identity.pop("identity")
+        malformed_payloads.append(missing_identity)
+        additional_field = json.loads(canonical_json(baseline))
+        additional_field["unexpected"] = True
+        malformed_payloads.append(additional_field)
+        missing_market_field = json.loads(canonical_json(baseline))
+        missing_market_field["markets"][0].pop("market_type")
+        malformed_payloads.append(missing_market_field)
+        duplicate_market = json.loads(canonical_json(baseline))
+        duplicate_market["markets"].append(duplicate_market["markets"][0])
+        malformed_payloads.append(duplicate_market)
+        unknown_team_alias = json.loads(canonical_json(baseline))
+        unknown_team_alias["markets"][0]["selected_side"] = "NYY"
+        malformed_payloads.append(unknown_team_alias)
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    semantic_from_capture(payload)
 
     def test_behavior_changing_inputs_change_forecast_id(self) -> None:
         game = complete_forecast_game()

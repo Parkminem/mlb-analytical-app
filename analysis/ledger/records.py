@@ -524,6 +524,14 @@ class OfficialResultCommand:
         _require_nonnegative_run(self.home_f5_runs, "home_f5_runs")
         _require_nonnegative_run(self.away_full_runs, "away_full_runs")
         _require_nonnegative_run(self.home_full_runs, "home_full_runs")
+        for side in ("away", "home"):
+            if getattr(self, f"{side}_full_runs") < getattr(
+                self,
+                f"{side}_f5_runs",
+            ):
+                raise ValueError(
+                    f"{side}_full_runs cannot be lower than {side}_f5_runs"
+                )
         component_values = freeze_mapping(
             self.component_values,
             "component_values",
@@ -534,6 +542,19 @@ class OfficialResultCommand:
             if not _is_finite_number(component_value):
                 raise ValueError(
                     f"component_values[{component_id}] must be a finite number"
+                )
+        for score_field in (
+            "away_f5_runs",
+            "home_f5_runs",
+            "away_full_runs",
+            "home_full_runs",
+        ):
+            if (
+                score_field in component_values
+                and component_values[score_field] != getattr(self, score_field)
+            ):
+                raise ValueError(
+                    f"component_values[{score_field}] must match {score_field}"
                 )
         object.__setattr__(self, "component_values", component_values)
         object.__setattr__(

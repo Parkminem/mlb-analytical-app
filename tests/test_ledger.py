@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
@@ -997,6 +997,12 @@ class LedgerStoreTests(unittest.TestCase):
             "home_protected_bullpen_close_entry",
         )
         values = {key: float(index) for index, key in enumerate(fixed_keys)}
+        values.update(
+            away_f5_runs=2.0,
+            home_f5_runs=1.0,
+            away_full_runs=4.0,
+            home_full_runs=3.0,
+        )
         values["away_bullpen_segment_bridge_exposed"] = 1.0
         values["home_bullpen_segment_high-leverage_exposed"] = 0.0
 
@@ -1015,6 +1021,48 @@ class LedgerStoreTests(unittest.TestCase):
             with self.subTest(key=key):
                 with self.assertRaises(ValueError):
                     result_command(component_values={key: 1.0})
+
+    def test_official_score_components_match_explicit_scores_when_present(
+        self,
+    ) -> None:
+        consistent = {
+            "away_f5_runs": 2.0,
+            "home_f5_runs": 1.0,
+            "away_full_runs": 4.0,
+            "home_full_runs": 3.0,
+        }
+
+        command = result_command(component_values=consistent)
+        missing_optional = result_command(component_values={})
+
+        self.assertEqual(dict(command.component_values), consistent)
+        self.assertEqual(dict(missing_optional.component_values), {})
+        for component_id in consistent:
+            tampered = dict(consistent)
+            tampered[component_id] = 20.0
+            with self.subTest(component_id=component_id):
+                with self.assertRaisesRegex(ValueError, component_id):
+                    result_command(component_values=tampered)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            record = store.append_official_result(command)
+            with self.assertRaisesRegex(ValueError, "away_full_runs"):
+                replace(
+                    record,
+                    component_values={"away_full_runs": 3.0},
+                )
+
+    def test_official_full_score_cannot_be_lower_than_f5_score(self) -> None:
+        for side in ("away", "home"):
+            with self.subTest(side=side):
+                with self.assertRaisesRegex(ValueError, f"{side}_full_runs"):
+                    result_command(
+                        **{
+                            f"{side}_f5_runs": 5,
+                            f"{side}_full_runs": 4,
+                        }
+                    )
 
     def test_market_and_result_mapping_content_is_defensively_frozen(self) -> None:
         events = [{"event": "home_run", "details": ["third inning"]}]

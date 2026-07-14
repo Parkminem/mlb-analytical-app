@@ -1,14 +1,21 @@
 """Canonical payloads and deterministic identities for normalized forecasts."""
 
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 import hashlib
 import json
 import math
+from types import UnionType
+from typing import Union, get_args, get_origin
 
-from .inputs import FeatureProvenance, NormalizedGameInput, SourceObservation
+from .inputs import (
+    FeatureProvenance,
+    MarketType,
+    NormalizedGameInput,
+    SourceObservation,
+)
 
 
 def _mapping_key(value: object) -> str:
@@ -176,10 +183,205 @@ def semantic_forecast_payload(game: NormalizedGameInput) -> dict[str, object]:
     return payload
 
 
+def _capture_datetime(value: object, field_name: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"{field_name} must be a canonical UTC datetime")
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError as error:
+        raise ValueError(
+            f"{field_name} must be a canonical UTC datetime"
+        ) from error
+    if _canonical_value(parsed) != value:
+        raise ValueError(f"{field_name} must be a canonical UTC datetime")
+    return parsed
+
+
+def _capture_date(value: object, field_name: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a canonical date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} must be a canonical date") from error
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field_name} must be a canonical date")
+    return parsed
+
+
+def _capture_typed_value(
+    value: object,
+    expected_type: object,
+    field_name: str,
+) -> object:
+    origin = get_origin(expected_type)
+    arguments = get_args(expected_type)
+    if origin in (Union, UnionType):
+        if value is None and type(None) in arguments:
+            return None
+        errors = []
+        for argument in arguments:
+            if argument is type(None):
+                continue
+            try:
+                return _capture_typed_value(value, argument, field_name)
+            except (TypeError, ValueError) as error:
+                errors.append(error)
+        raise ValueError(f"{field_name} has an invalid value") from (
+            errors[-1] if errors else None
+        )
+    if origin is tuple:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{field_name} must be a sequence")
+        if len(arguments) != 2 or arguments[1] is not Ellipsis:
+            raise TypeError(f"unsupported capture tuple type for {field_name}")
+        return tuple(
+            _capture_typed_value(item, arguments[0], f"{field_name}[{index}]")
+            for index, item in enumerate(value)
+        )
+    if expected_type is datetime:
+        return _capture_datetime(value, field_name)
+    if expected_type is date:
+        return _capture_date(value, field_name)
+    if isinstance(expected_type, type) and issubclass(expected_type, Enum):
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a canonical enum string")
+        try:
+            return expected_type(value)
+        except ValueError as error:
+            raise ValueError(
+                f"{field_name} contains an unsupported enum value"
+            ) from error
+    if isinstance(expected_type, type) and is_dataclass(expected_type):
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field_name} must be a mapping")
+        expected_fields = {field.name for field in fields(expected_type)}
+        if set(value) != expected_fields:
+            missing = ", ".join(sorted(expected_fields - set(value))) or "none"
+            additional = ", ".join(sorted(set(value) - expected_fields)) or "none"
+            raise ValueError(
+                f"{field_name} schema mismatch; missing={missing}; "
+                f"additional={additional}"
+            )
+        converted = {
+            field.name: _capture_typed_value(
+                value[field.name],
+                field.type,
+                f"{field_name}.{field.name}",
+            )
+            for field in fields(expected_type)
+        }
+        try:
+            return expected_type(**converted)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{field_name} is invalid: {error}") from error
+    if expected_type is str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        return value
+    if expected_type is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        return value
+    if expected_type is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+        return value
+    if expected_type is float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"{field_name} must be a finite number")
+        return float(value)
+    raise TypeError(f"unsupported capture field type for {field_name}")
+
+
+def _resolved_capture_game(game: NormalizedGameInput) -> NormalizedGameInput:
+    if game.identity.away_team == game.identity.home_team:
+        raise ValueError("capture identity away_team and home_team must differ")
+    side_by_team = {
+        game.identity.away_team: "away",
+        game.identity.home_team: "home",
+    }
+    side_market_types = frozenset(
+        (MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5)
+    )
+    resolved_markets = []
+    market_keys = set()
+    for market in game.markets:
+        if market.market_key in market_keys:
+            raise ValueError("capture markets must have unique market_key values")
+        market_keys.add(market.market_key)
+        if market.market_type in side_market_types:
+            selected_side = market.selected_side
+            if selected_side not in {"away", "home"}:
+                selected_side = side_by_team.get(selected_side)
+            if selected_side is None:
+                raise ValueError(
+                    "capture side market must use away/home or a captured team alias"
+                )
+            market = replace(market, selected_side=selected_side)
+        resolved_markets.append(market)
+    return replace(
+        game,
+        markets=tuple(
+            sorted(resolved_markets, key=lambda market: market.market_key)
+        ),
+    )
+
+
+def semantic_forecast_payload_from_capture_payload(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate a complete capture payload and recover forecast semantics."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("capture payload must be a mapping")
+    game = _capture_typed_value(
+        payload,
+        NormalizedGameInput,
+        "capture payload",
+    )
+    if not isinstance(game, NormalizedGameInput):
+        raise TypeError("capture payload must reconstruct NormalizedGameInput")
+    return semantic_forecast_payload(_resolved_capture_game(game))
+
+
+def normalized_input_hash_from_capture_payload(
+    payload: Mapping[str, object],
+) -> str:
+    """Hash canonical forecast semantics recovered from a capture payload."""
+
+    encoded = canonical_json(
+        semantic_forecast_payload_from_capture_payload(payload)
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def normalized_input_hash(game: NormalizedGameInput) -> str:
     """Hash the canonical semantic normalized input."""
 
     encoded = canonical_json(semantic_forecast_payload(game)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _forecast_run_id_from_semantic_payload(
+    semantic_payload: Mapping[str, object],
+    model_version: str,
+    simulation_config: Mapping[str, object],
+) -> str:
+    if not isinstance(model_version, str) or not model_version.strip():
+        raise ValueError("model_version must be a non-empty string")
+    if not isinstance(simulation_config, Mapping):
+        raise TypeError("simulation_config must be a mapping")
+    payload = {
+        "input": semantic_payload,
+        "model_version": model_version,
+        "simulation_config": simulation_config,
+    }
+    encoded = canonical_json(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -190,14 +392,22 @@ def build_forecast_run_id(
 ) -> str:
     """Build a deterministic identity for one semantic forecast run."""
 
-    if not isinstance(model_version, str) or not model_version.strip():
-        raise ValueError("model_version must be a non-empty string")
-    if not isinstance(simulation_config, Mapping):
-        raise TypeError("simulation_config must be a mapping")
-    payload = {
-        "input": semantic_forecast_payload(game),
-        "model_version": model_version,
-        "simulation_config": simulation_config,
-    }
-    encoded = canonical_json(payload).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _forecast_run_id_from_semantic_payload(
+        semantic_forecast_payload(game),
+        model_version,
+        simulation_config,
+    )
+
+
+def build_forecast_run_id_from_capture_payload(
+    payload: Mapping[str, object],
+    model_version: str,
+    simulation_config: Mapping[str, object],
+) -> str:
+    """Build a deterministic run ID from one frozen capture payload."""
+
+    return _forecast_run_id_from_semantic_payload(
+        semantic_forecast_payload_from_capture_payload(payload),
+        model_version,
+        simulation_config,
+    )

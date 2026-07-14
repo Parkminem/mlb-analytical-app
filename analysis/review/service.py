@@ -2,8 +2,14 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import hashlib
 
 from analysis.forecasting.engine import SemanticMarketInput
+from analysis.forecasting.identity import (
+    build_forecast_run_id_from_capture_payload,
+    canonical_json,
+    normalized_input_hash_from_capture_payload,
+)
 from analysis.forecasting.inputs import MarketType
 from analysis.forecasting.market import settle_observed_market
 from analysis.forecasting.simulation import (
@@ -86,12 +92,6 @@ def _require_mapping(value: object, field_name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a mapping")
     return value
-
-
-def _require_sequence(value: object, field_name: str) -> tuple[object, ...]:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{field_name} must be a sequence")
-    return tuple(value)
 
 
 def _require_store(store: object, *, append: bool = False) -> None:
@@ -201,6 +201,41 @@ def _capture_identity(capture: CaptureRecord) -> tuple[str, str]:
     return away_team, home_team
 
 
+def _require_deterministic_forecast_identity(
+    capture: CaptureRecord,
+    forecast: ForecastRecord,
+    simulation_config: Mapping[str, object],
+) -> None:
+    expected_input_hash = normalized_input_hash_from_capture_payload(
+        capture.payload
+    )
+    if capture.normalized_input_hash != expected_input_hash:
+        raise ValueError(
+            "CaptureRecord normalized_input_hash must match capture semantics"
+        )
+    if forecast.normalized_input_hash != expected_input_hash:
+        raise ValueError(
+            "ForecastRecord normalized_input_hash must match capture semantics"
+        )
+    expected_config_hash = hashlib.sha256(
+        canonical_json(simulation_config).encode("utf-8")
+    ).hexdigest()
+    if forecast.simulation_config_hash != expected_config_hash:
+        raise ValueError(
+            "ForecastRecord simulation_config_hash must match frozen outputs"
+        )
+    expected_forecast_run_id = build_forecast_run_id_from_capture_payload(
+        capture.payload,
+        forecast.model_version,
+        simulation_config,
+    )
+    if forecast.forecast_run_id != expected_forecast_run_id:
+        raise ValueError(
+            "ForecastRecord forecast_run_id must match canonical capture semantics, "
+            "model_version, and simulation_config"
+        )
+
+
 def _resolve_selected_side(
     market: SemanticMarketInput,
     away_team: str,
@@ -221,13 +256,20 @@ def _resolve_selected_side(
 
 def _exact_shadow_comparison(
     outputs: Mapping[str, object],
+    forecast_context: object,
     forecast_run_id: str,
     market_key: str,
+    away_team: str,
+    home_team: str,
 ) -> tuple[object, Mapping[str, SemanticMarketInput]]:
     from analysis.shadow import (
+        FrozenForecastContext,
         deserialize_shadow_comparison,
         validate_shadow_forecast_context,
     )
+
+    if not isinstance(forecast_context, FrozenForecastContext):
+        raise TypeError("forecast_context must be FrozenForecastContext")
 
     shadow = deserialize_shadow_comparison(
         outputs.get("shadow_comparison")
@@ -238,9 +280,11 @@ def _exact_shadow_comparison(
         )
     semantic_market_inputs = validate_shadow_forecast_context(
         shadow,
-        outputs.get("market_inputs"),
-        outputs.get("markets"),
-        outputs.get("component_distributions"),
+        forecast_context.market_inputs,
+        forecast_context.markets,
+        forecast_context.component_distributions,
+        away_team=away_team,
+        home_team=home_team,
     )
     matches = tuple(
         comparison
@@ -323,56 +367,6 @@ def _component_direction(
     return "high_is_supportive"
 
 
-def _distribution_summary(
-    component_id: str,
-    value: Mapping[str, object],
-) -> DistributionSummary:
-    summary_value = _require_mapping(
-        value.get("summary"),
-        f"component distribution {component_id} summary",
-    )
-    if set(summary_value) != set(_SUMMARY_FIELDS):
-        raise ValueError(
-            f"component distribution {component_id} summary is malformed"
-        )
-    return DistributionSummary(
-        **{field_name: summary_value[field_name] for field_name in _SUMMARY_FIELDS}
-    )
-
-
-def _component_distribution(
-    distributions: Mapping[str, object],
-    component_id: str,
-    simulation_count: int,
-) -> ComponentDistribution:
-    if component_id not in distributions:
-        raise ValueError(
-            f"missing frozen component distribution for {component_id}"
-        )
-    value = _require_mapping(
-        distributions[component_id],
-        f"component distribution {component_id}",
-    )
-    if value.get("component_id") != component_id:
-        raise ValueError(
-            f"component distribution key must match component_id {component_id}"
-        )
-    values = _require_sequence(
-        value.get("values"),
-        f"component distribution {component_id} values",
-    )
-    if len(values) != simulation_count:
-        raise ValueError(
-            f"component distribution {component_id} values must match "
-            "simulation_count"
-        )
-    return ComponentDistribution(
-        component_id=component_id,
-        values=values,
-        summary=_distribution_summary(component_id, value),
-    )
-
-
 def _predictive_interval(summary: DistributionSummary) -> PredictiveInterval:
     return PredictiveInterval(
         **{field_name: getattr(summary, field_name) for field_name in _SUMMARY_FIELDS}
@@ -380,21 +374,10 @@ def _predictive_interval(summary: DistributionSummary) -> PredictiveInterval:
 
 
 def _component_pairs(
-    outputs: Mapping[str, object],
+    distributions: Mapping[str, ComponentDistribution],
     result: OfficialResultRecord,
     paths: tuple[PrincipalPathBinding, ...],
 ) -> tuple[tuple[ComponentForecast, ...], tuple[ComponentObservation, ...]]:
-    simulation_count = outputs.get("simulation_count")
-    if (
-        isinstance(simulation_count, bool)
-        or not isinstance(simulation_count, int)
-        or simulation_count <= 0
-    ):
-        raise ValueError("forecast outputs simulation_count must be positive")
-    distributions = _require_mapping(
-        outputs.get("component_distributions"),
-        "forecast outputs component_distributions",
-    )
     ordered_paths = tuple(
         sorted(paths, key=lambda path: _EVIDENCE_PATH_ORDER[path.evidence_path])
     )
@@ -406,11 +389,11 @@ def _component_pairs(
     forecasts = []
     observations = []
     for component_id in sorted(path_by_component):
-        distribution = _component_distribution(
-            distributions,
-            component_id,
-            simulation_count,
-        )
+        if component_id not in distributions:
+            raise ValueError(
+                f"missing frozen component distribution for {component_id}"
+            )
+        distribution = distributions[component_id]
         if component_id not in result.component_values:
             raise ValueError(
                 "official result component_values is missing required "
@@ -528,14 +511,29 @@ def build_review_candidate(
     away_team, home_team = _capture_identity(capture)
 
     outputs = _require_mapping(forecast.outputs, "forecast outputs")
-    if outputs.get("forecast_run_id") != forecast.forecast_run_id:
+    from analysis.shadow import deserialize_forecast_context
+
+    forecast_context = deserialize_forecast_context(
+        outputs,
+        away_team=away_team,
+        home_team=home_team,
+    )
+    _require_deterministic_forecast_identity(
+        capture,
+        forecast,
+        forecast_context.simulation_config.to_mapping(),
+    )
+    if forecast_context.forecast_run_id != forecast.forecast_run_id:
         raise ValueError(
             "forecast outputs forecast_run_id must match ForecastRecord"
         )
     comparison, semantic_market_inputs = _exact_shadow_comparison(
         outputs,
+        forecast_context,
         forecast.forecast_run_id,
         market_key,
+        away_team,
+        home_team,
     )
     if market_key not in semantic_market_inputs:
         raise ValueError(
@@ -545,7 +543,7 @@ def build_review_candidate(
     resolved_market = _resolve_selected_side(market, away_team, home_team)
     paths = _principal_paths(comparison, market.market_type)
     component_forecasts, component_observations = _component_pairs(
-        outputs,
+        forecast_context.component_distributions,
         result,
         paths,
     )

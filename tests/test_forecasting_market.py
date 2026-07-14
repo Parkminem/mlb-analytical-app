@@ -699,8 +699,8 @@ class MarketSettlementTests(unittest.TestCase):
 class ObservedMarketSettlementTests(unittest.TestCase):
     def test_ml_uses_full_score_and_never_pushes_on_a_tie(self):
         cases = (
-            ((1, 5, 4, 3), "win"),
-            ((5, 1, 3, 4), "loss"),
+            ((1, 2, 4, 3), "win"),
+            ((2, 1, 3, 4), "loss"),
             ((2, 2, 4, 4), "loss"),
         )
 
@@ -754,12 +754,12 @@ class ObservedMarketSettlementTests(unittest.TestCase):
 
     def test_f5_and_full_totals_settle_over_under_and_integer_pushes(self):
         cases = (
-            (MarketType.F5_TOTAL, "over", 4.5, (3, 2, 8, 1), "win"),
-            (MarketType.F5_TOTAL, "under", 4.5, (3, 2, 1, 8), "loss"),
-            (MarketType.F5_TOTAL, "under", 5.0, (3, 2, 1, 8), "push"),
+            (MarketType.F5_TOTAL, "over", 4.5, (3, 2, 8, 3), "win"),
+            (MarketType.F5_TOTAL, "under", 4.5, (3, 2, 3, 8), "loss"),
+            (MarketType.F5_TOTAL, "under", 5.0, (3, 2, 3, 8), "push"),
             (MarketType.FULL_TOTAL, "over", 8.5, (0, 0, 5, 4), "win"),
-            (MarketType.FULL_TOTAL, "under", 8.5, (9, 0, 5, 4), "loss"),
-            (MarketType.FULL_TOTAL, "over", 9.0, (9, 0, 5, 4), "push"),
+            (MarketType.FULL_TOTAL, "under", 8.5, (4, 0, 5, 4), "loss"),
+            (MarketType.FULL_TOTAL, "over", 9.0, (4, 0, 5, 4), "push"),
         )
 
         for market_type, side, line, score, expected in cases:

@@ -1,7 +1,7 @@
 """One-way comparison of legacy decisions with shadow forecast outputs."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import hashlib
 import json
 import math
@@ -14,6 +14,7 @@ from analysis.forecasting.engine import (
     build_semantic_market_inputs,
     resolve_forecast_input,
 )
+from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import (
     build_forecast_run_id,
     canonical_json,
@@ -24,6 +25,11 @@ from analysis.forecasting.inputs import (
     MarketType,
     NormalizedGameInput,
     SettlementFormat,
+)
+from analysis.forecasting.market import MarketEvaluation, OutcomeProbabilities
+from analysis.forecasting.simulation import (
+    ComponentDistribution,
+    DistributionSummary,
 )
 from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
@@ -111,6 +117,62 @@ _COMPARISON_EVALUATION_FIELDS = (
     ("fair_decimal_price", "fair_decimal_price"),
     ("market_no_vig_probability", "market_no_vig_probability"),
     ("edge", "edge"),
+)
+_OUTCOME_PROBABILITY_FIELDS = frozenset(("win", "push", "loss"))
+_MARKET_EVALUATION_FIELDS = frozenset(
+    (
+        "probabilities",
+        "model_conditional_win_probability",
+        "fair_decimal_price",
+        "market_no_vig_probability",
+        "edge",
+        "expected_value",
+        "selected_decimal_price",
+        "opposing_decimal_price",
+        "evaluated",
+        "reason",
+        "semantic_fingerprint",
+    )
+)
+_FORECAST_OUTPUT_FIELDS = frozenset(
+    (
+        "forecast_run_id",
+        "config_version",
+        "simulation_config",
+        "simulation_count",
+        "component_diagnostics",
+        "component_distributions",
+        "intervals",
+        "market_inputs",
+        "markets",
+        "shadow_comparison",
+    )
+)
+_DISTRIBUTION_FIELDS = frozenset(("component_id", "values", "summary"))
+_DISTRIBUTION_SUMMARY_FIELDS = frozenset(
+    ("p05", "p10", "p20", "median", "p80", "p90", "p95")
+)
+_DIAGNOSTIC_FIELDS = frozenset(
+    (
+        "away_pitcher_chain",
+        "home_pitcher_chain",
+        "away_offense",
+        "home_offense",
+        "away_bullpen",
+        "home_bullpen",
+    )
+)
+_BASE_COMPONENT_SUFFIXES = (
+    "f5_runs",
+    "full_runs",
+    "f5_traffic",
+    "full_traffic",
+    "f5_extra_base_hits",
+    "full_extra_base_hits",
+    "pitcher_chain_runs_allowed",
+    "bullpen_runs_allowed",
+    "pitcher_chain_workload_outs",
+    "protected_bullpen_close_entry",
 )
 
 
@@ -467,6 +529,40 @@ class ShadowRunRecords:
             raise ValueError("link forecast_run_id must match forecast")
 
 
+@dataclass(frozen=True)
+class FrozenForecastContext:
+    forecast_run_id: str
+    config_version: str
+    simulation_config: SimulationConfig
+    simulation_count: int
+    market_inputs: Mapping[str, SemanticMarketInput]
+    markets: Mapping[str, MarketEvaluation]
+    component_distributions: Mapping[str, ComponentDistribution]
+    intervals: Mapping[str, DistributionSummary]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.forecast_run_id, str)
+            or _FORECAST_RUN_ID.fullmatch(self.forecast_run_id) is None
+        ):
+            raise ValueError(
+                "forecast_run_id must be exactly 64 lowercase hex characters"
+            )
+        _require_nonempty_string(self.config_version, "config_version")
+        if not isinstance(self.simulation_config, SimulationConfig):
+            raise TypeError("simulation_config must be SimulationConfig")
+        if self.config_version != self.simulation_config.version:
+            raise ValueError("config_version must match simulation_config")
+        if (
+            isinstance(self.simulation_count, bool)
+            or not isinstance(self.simulation_count, int)
+            or self.simulation_count != self.simulation_config.simulations
+        ):
+            raise ValueError(
+                "simulation_count must match simulation_config simulations"
+            )
+
+
 def _payload_mapping(
     value: object,
     field_name: str,
@@ -712,6 +808,373 @@ def _semantic_market_from_context(
     )
 
 
+def _require_semantic_market_contract(
+    market: SemanticMarketInput,
+    captured_team_aliases: frozenset[str],
+) -> None:
+    side_markets = frozenset(
+        (MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5)
+    )
+    total_markets = frozenset((MarketType.F5_TOTAL, MarketType.FULL_TOTAL))
+    if market.market_type in side_markets:
+        if market.selected_side not in {"away", "home"} | captured_team_aliases:
+            raise ValueError(
+                "side market selected_side must be away/home or a captured "
+                "team alias"
+            )
+    elif market.market_type in total_markets:
+        if market.selected_side not in {"over", "under"}:
+            raise ValueError("total market selected_side must be over or under")
+    else:
+        raise ValueError("market_type is unsupported")
+    if market.market_type is MarketType.ML:
+        if market.line is not None:
+            raise ValueError("ML line must be absent")
+    elif not _is_finite_number(market.line):
+        raise ValueError(f"{market.market_type.value} line must be finite")
+    elif market.market_type in total_markets and market.line < 0:
+        raise ValueError("total market line must be nonnegative")
+    elif market.market_type is MarketType.PLUS_1_5 and market.line != 1.5:
+        raise ValueError("plus_1_5 line must be exactly 1.5")
+    if (
+        market.market_type is not MarketType.F5_SIDE
+        and market.settlement_format is not SettlementFormat.TWO_WAY
+    ):
+        raise ValueError("settlement_format must be two_way for this market")
+    market.semantic_fingerprint
+
+
+def _market_evaluation_from_context(
+    market_key: str,
+    value: object,
+) -> MarketEvaluation:
+    if isinstance(value, MarketEvaluation):
+        return value
+    payload = _payload_mapping(
+        value,
+        f"markets[{market_key}]",
+        _MARKET_EVALUATION_FIELDS,
+    )
+    probability_value = payload["probabilities"]
+    probabilities = None
+    if probability_value is not None:
+        probability_payload = _payload_mapping(
+            probability_value,
+            f"markets[{market_key}] probabilities",
+            _OUTCOME_PROBABILITY_FIELDS,
+        )
+        probabilities = OutcomeProbabilities(
+            win=probability_payload["win"],
+            push=probability_payload["push"],
+            loss=probability_payload["loss"],
+        )
+    return MarketEvaluation(
+        probabilities=probabilities,
+        model_conditional_win_probability=(
+            payload["model_conditional_win_probability"]
+        ),
+        fair_decimal_price=payload["fair_decimal_price"],
+        market_no_vig_probability=payload["market_no_vig_probability"],
+        edge=payload["edge"],
+        expected_value=payload["expected_value"],
+        selected_decimal_price=payload["selected_decimal_price"],
+        opposing_decimal_price=payload["opposing_decimal_price"],
+        evaluated=payload["evaluated"],
+        reason=payload["reason"],
+        semantic_fingerprint=payload["semantic_fingerprint"],
+    )
+
+
+def _validated_market_context(
+    market_inputs: Mapping[str, object],
+    markets: Mapping[str, object],
+    *,
+    away_team: str | None = None,
+    home_team: str | None = None,
+) -> tuple[
+    Mapping[str, SemanticMarketInput],
+    Mapping[str, MarketEvaluation],
+]:
+    if set(market_inputs) != set(markets):
+        raise ValueError("market_inputs and markets keys must exactly match")
+    if (away_team is None) != (home_team is None):
+        raise ValueError("away_team and home_team must be provided together")
+    captured_team_aliases: frozenset[str] = frozenset()
+    if away_team is not None and home_team is not None:
+        _require_nonempty_string(away_team, "away_team")
+        _require_nonempty_string(home_team, "home_team")
+        if away_team == home_team:
+            raise ValueError("away_team and home_team must differ")
+        captured_team_aliases = frozenset((away_team, home_team))
+    parsed_inputs = {}
+    parsed_evaluations = {}
+    for market_key in sorted(market_inputs):
+        _require_nonempty_string(market_key, "market key")
+        semantic = _semantic_market_from_context(
+            market_key,
+            market_inputs[market_key],
+        )
+        _require_semantic_market_contract(semantic, captured_team_aliases)
+        evaluation = _market_evaluation_from_context(
+            market_key,
+            markets[market_key],
+        )
+        if evaluation.semantic_fingerprint != semantic.semantic_fingerprint:
+            raise ValueError(
+                f"markets[{market_key}] semantic_fingerprint must match "
+                "frozen market semantics"
+            )
+        unsupported_three_way_f5 = (
+            semantic.market_type is MarketType.F5_SIDE
+            and semantic.settlement_format is SettlementFormat.THREE_WAY
+        )
+        if unsupported_three_way_f5:
+            if evaluation.evaluated or evaluation.reason != (
+                "three-way F5 settlement is unsupported"
+            ):
+                raise ValueError(
+                    "three-way F5 market must use the fixed unevaluated state"
+                )
+        elif not evaluation.evaluated:
+            raise ValueError(
+                f"ordinary market {market_key} cannot be unevaluated"
+            )
+        if evaluation.evaluated:
+            for field_name in (
+                "selected_decimal_price",
+                "opposing_decimal_price",
+            ):
+                if getattr(evaluation, field_name) != getattr(
+                    semantic,
+                    field_name,
+                ):
+                    raise ValueError(
+                        f"markets[{market_key}] {field_name} must match "
+                        "market_inputs"
+                    )
+        parsed_inputs[market_key] = semantic
+        parsed_evaluations[market_key] = evaluation
+    return (
+        MappingProxyType(parsed_inputs),
+        MappingProxyType(parsed_evaluations),
+    )
+
+
+def _simulation_config_from_payload(value: object) -> SimulationConfig:
+    expected_fields = frozenset(field.name for field in fields(SimulationConfig))
+    payload = _payload_mapping(
+        value,
+        "forecast outputs simulation_config",
+        expected_fields,
+    )
+    try:
+        config = SimulationConfig.from_mapping(payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"simulation_config is invalid: {error}") from error
+    if canonical_json(payload) != canonical_json(config.to_mapping()):
+        raise ValueError("simulation_config must be canonical")
+    return config
+
+
+def _diagnostic_component_ids(value: object) -> frozenset[str]:
+    diagnostics = _payload_mapping(
+        value,
+        "forecast outputs component_diagnostics",
+        _DIAGNOSTIC_FIELDS,
+    )
+    component_ids = {
+        f"{side}_{suffix}"
+        for side in ("away", "home")
+        for suffix in _BASE_COMPONENT_SUFFIXES
+    }
+    for side in ("away", "home"):
+        bullpen = diagnostics[f"{side}_bullpen"]
+        if not isinstance(bullpen, Mapping):
+            raise ValueError(f"{side} bullpen diagnostic must be a mapping")
+        segments = _payload_sequence(
+            bullpen.get("segments"),
+            f"{side} bullpen diagnostic segments",
+        )
+        segment_ids = set()
+        for segment_value in segments:
+            if not isinstance(segment_value, Mapping):
+                raise ValueError(
+                    f"{side} bullpen diagnostic segment must be a mapping"
+                )
+            segment_id = segment_value.get("segment_id")
+            _require_nonempty_string(
+                segment_id,
+                f"{side} bullpen diagnostic segment_id",
+            )
+            if segment_id in segment_ids:
+                raise ValueError(
+                    f"{side} bullpen diagnostic segment IDs must be unique"
+                )
+            segment_ids.add(segment_id)
+            available = segment_value.get("available")
+            if not isinstance(available, bool):
+                raise ValueError(
+                    f"{side} bullpen diagnostic available must be boolean"
+                )
+            if available:
+                component_ids.add(
+                    f"{side}_bullpen_segment_{segment_id}_exposed"
+                )
+    return frozenset(component_ids)
+
+
+def _distribution_summary_from_payload(
+    value: object,
+    field_name: str,
+) -> DistributionSummary:
+    payload = _payload_mapping(
+        value,
+        field_name,
+        _DISTRIBUTION_SUMMARY_FIELDS,
+    )
+    return DistributionSummary(
+        **{
+            summary_field: payload[summary_field]
+            for summary_field in _DISTRIBUTION_SUMMARY_FIELDS
+        }
+    )
+
+
+def _component_distributions_from_payload(
+    value: object,
+    simulation_count: int,
+    expected_component_ids: frozenset[str],
+) -> Mapping[str, ComponentDistribution]:
+    if not isinstance(value, Mapping):
+        raise ValueError("forecast component_distributions must be a mapping")
+    actual_component_ids = set(value)
+    missing_component_ids = expected_component_ids - actual_component_ids
+    if missing_component_ids:
+        raise ValueError(
+            "component distributions are missing diagnostic component IDs "
+            "(missing_component_distribution): "
+            + ", ".join(sorted(missing_component_ids))
+        )
+    unexpected_component_ids = actual_component_ids - expected_component_ids
+    if unexpected_component_ids:
+        raise ValueError(
+            "component distributions contain unexpected diagnostic component "
+            "IDs: "
+            + ", ".join(sorted(unexpected_component_ids))
+        )
+    distributions = {}
+    for component_id in sorted(value):
+        _require_nonempty_string(component_id, "component distribution key")
+        payload = _payload_mapping(
+            value[component_id],
+            f"component distribution {component_id}",
+            _DISTRIBUTION_FIELDS,
+        )
+        if payload["component_id"] != component_id:
+            raise ValueError(
+                f"component distribution key must match component_id {component_id}"
+            )
+        values = _payload_sequence(
+            payload["values"],
+            f"component distribution {component_id} values",
+        )
+        if len(values) != simulation_count:
+            raise ValueError(
+                f"component distribution {component_id} values must match "
+                "simulation_count"
+            )
+        distributions[component_id] = ComponentDistribution(
+            component_id=component_id,
+            values=values,
+            summary=_distribution_summary_from_payload(
+                payload["summary"],
+                f"component distribution {component_id} summary",
+            ),
+        )
+    return MappingProxyType(distributions)
+
+
+def _intervals_from_payload(
+    value: object,
+    distributions: Mapping[str, ComponentDistribution],
+) -> Mapping[str, DistributionSummary]:
+    if not isinstance(value, Mapping):
+        raise ValueError("forecast intervals must be a mapping")
+    if set(value) != set(distributions):
+        raise ValueError(
+            "interval keys must exactly match component distributions"
+        )
+    intervals = {}
+    for component_id in sorted(value):
+        interval = _distribution_summary_from_payload(
+            value[component_id],
+            f"interval {component_id}",
+        )
+        if interval != distributions[component_id].summary:
+            raise ValueError(
+                f"interval {component_id} must match distribution summary"
+            )
+        intervals[component_id] = interval
+    return MappingProxyType(intervals)
+
+
+def deserialize_forecast_context(
+    value: object,
+    *,
+    away_team: str | None = None,
+    home_team: str | None = None,
+) -> FrozenForecastContext:
+    """Reconstruct the complete immutable review-facing forecast context."""
+
+    payload = _payload_mapping(
+        value,
+        "forecast outputs",
+        _FORECAST_OUTPUT_FIELDS,
+    )
+    config = _simulation_config_from_payload(payload["simulation_config"])
+    simulation_count = payload["simulation_count"]
+    if (
+        isinstance(simulation_count, bool)
+        or not isinstance(simulation_count, int)
+        or simulation_count <= 0
+    ):
+        raise ValueError("simulation_count must be a positive integer")
+    market_inputs_value = payload["market_inputs"]
+    markets_value = payload["markets"]
+    if not isinstance(market_inputs_value, Mapping):
+        raise ValueError("forecast market_inputs must be a mapping")
+    if not isinstance(markets_value, Mapping):
+        raise ValueError("forecast markets must be a mapping")
+    market_inputs, markets = _validated_market_context(
+        market_inputs_value,
+        markets_value,
+        away_team=away_team,
+        home_team=home_team,
+    )
+    component_ids = _diagnostic_component_ids(
+        payload["component_diagnostics"]
+    )
+    distributions = _component_distributions_from_payload(
+        payload["component_distributions"],
+        simulation_count,
+        component_ids,
+    )
+    intervals = _intervals_from_payload(
+        payload["intervals"],
+        distributions,
+    )
+    return FrozenForecastContext(
+        forecast_run_id=payload["forecast_run_id"],
+        config_version=payload["config_version"],
+        simulation_config=config,
+        simulation_count=simulation_count,
+        market_inputs=market_inputs,
+        markets=markets,
+        component_distributions=distributions,
+        intervals=intervals,
+    )
+
+
 def _evaluation_fingerprint(market_key: str, value: object) -> str:
     fingerprint = (
         value.get("semantic_fingerprint")
@@ -827,6 +1290,9 @@ def validate_shadow_forecast_context(
     market_inputs: object,
     markets: object,
     component_distributions: object,
+    *,
+    away_team: str | None = None,
+    home_team: str | None = None,
 ) -> Mapping[str, SemanticMarketInput]:
     """Validate every shadow comparison against one frozen forecast output."""
 
@@ -845,7 +1311,13 @@ def validate_shadow_forecast_context(
         binding.legacy_candidate_index: binding
         for binding in comparison.legacy.review_bindings
     }
-    parsed_market_inputs: dict[str, SemanticMarketInput] = {}
+    parsed_inputs, parsed_evaluations = _validated_market_context(
+        market_inputs,
+        markets,
+        away_team=away_team,
+        home_team=home_team,
+    )
+    parsed_market_inputs = dict(parsed_inputs)
     for market_comparison in comparison.market_comparisons:
         binding = bindings_by_index.get(
             market_comparison.legacy_candidate_index
@@ -855,8 +1327,8 @@ def validate_shadow_forecast_context(
             if binding is None
             else _binding_context_flags(
                 binding,
-                market_inputs,
-                markets,
+                parsed_inputs,
+                parsed_evaluations,
                 component_distributions,
                 parsed_market_inputs,
             )
@@ -877,7 +1349,7 @@ def validate_shadow_forecast_context(
         evaluation = (
             None
             if binding is None
-            else markets.get(binding.market_key)
+            else parsed_evaluations.get(binding.market_key)
         )
         _require_comparison_evaluation_match(
             market_comparison,
@@ -1205,12 +1677,14 @@ def record_shadow_run(
 
 __all__ = (
     "CandidateReviewBinding",
+    "FrozenForecastContext",
     "LegacyDecisionSnapshot",
     "ShadowComparison",
     "ShadowMarketComparison",
     "ShadowRunIdempotencyKeys",
     "ShadowRunRecords",
     "compare_shadow_forecast",
+    "deserialize_forecast_context",
     "deserialize_shadow_comparison",
     "record_shadow_run",
     "validate_shadow_forecast_context",
