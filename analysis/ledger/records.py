@@ -780,6 +780,35 @@ class OfficialResultCommand:
                 raise ValueError(
                     f"component_values[{score_field}] must match {score_field}"
                 )
+        for pitching_side, opponent_side in (("away", "home"), ("home", "away")):
+            chain_key = f"{pitching_side}_pitcher_chain_runs_allowed"
+            bullpen_key = f"{pitching_side}_bullpen_runs_allowed"
+            present_keys = tuple(
+                key for key in (chain_key, bullpen_key) if key in component_values
+            )
+            opponent_runs = float(getattr(self, f"{opponent_side}_full_runs"))
+            for key in present_keys:
+                value = float(component_values[key])
+                if value < 0.0 or not value.is_integer():
+                    raise ValueError(
+                        "pitcher-chain and bullpen runs allowed must be "
+                        "nonnegative whole-run counts"
+                    )
+                if value > opponent_runs:
+                    raise ValueError(
+                        "a pitcher-chain or bullpen runs allowed component "
+                        "cannot exceed the opponent full-game score"
+                    )
+            if len(present_keys) == 2:
+                attributed_runs = math.fsum(
+                    float(component_values[key])
+                    for key in (chain_key, bullpen_key)
+                )
+                if attributed_runs != opponent_runs:
+                    raise ValueError(
+                        "pitcher-chain and bullpen runs allowed must sum to the "
+                        "opponent full-game score"
+                    )
         object.__setattr__(self, "component_values", component_values)
         object.__setattr__(
             self,

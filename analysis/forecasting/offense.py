@@ -125,6 +125,8 @@ class _OffenseInvariantContext:
     matchup_bounds: tuple[float, float]
     lineup_log_standard_error: float
     sample_shortage_log_se_penalty: float
+    bats_by_order: tuple[str, ...]
+    pitcher_throws: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
         _require_finite_positive(self.league_woba, "league_woba")
@@ -155,6 +157,21 @@ class _OffenseInvariantContext:
             self.sample_shortage_log_se_penalty,
             "sample_shortage_log_se_penalty",
         )
+        if not isinstance(self.bats_by_order, tuple) or len(self.bats_by_order) != 9:
+            raise ValueError("bats_by_order must contain nine values")
+        for bats in self.bats_by_order:
+            if bats not in ("R", "L", "S"):
+                raise ValueError("bats_by_order values must be R, L, or S")
+        if not isinstance(self.pitcher_throws, tuple) or not self.pitcher_throws:
+            raise ValueError("pitcher_throws must be a nonempty tuple")
+        pitcher_ids = []
+        for pitcher_id, throws in self.pitcher_throws:
+            _require_nonempty_string(pitcher_id, "pitcher_throws pitcher_id")
+            if throws not in _EXPECTED_SIDES:
+                raise ValueError("pitcher_throws values must be R or L")
+            pitcher_ids.append(pitcher_id)
+        if len(set(pitcher_ids)) != len(pitcher_ids):
+            raise ValueError("pitcher_throws must have unique pitcher IDs")
 
 
 @dataclass(frozen=True)
@@ -195,6 +212,17 @@ class SlotMatchupForecast:
         if self.expected_side not in _EXPECTED_SIDES:
             raise ValueError("expected_side must be R or L")
         _require_nonempty_string(self.pitcher_id, "pitcher_id")
+        pitcher_throws = dict(self._context.pitcher_throws)
+        if self.pitcher_id not in pitcher_throws:
+            raise ValueError("pitcher_id must exist in the offense invariant context")
+        expected_side = _expected_side_for(
+            self._context.bats_by_order[self.order - 1],
+            pitcher_throws[self.pitcher_id],
+        )
+        if self.expected_side != expected_side:
+            raise ValueError(
+                "expected_side must match the batter side resolved for the pitcher"
+            )
 
         if not isinstance(self.evaluated_pitch_types, tuple):
             raise ValueError("evaluated_pitch_types must be a tuple")
@@ -379,12 +407,6 @@ class SlotMatchupForecast:
             object.__setattr__(self, field_name, frozen)
 
 
-def _aggregate_matchup_log_standard_error(
-    matchup_sigmas: Mapping[str, float],
-) -> float:
-    return max(matchup_sigmas.values())
-
-
 @dataclass(frozen=True)
 class OffenseForecast:
     base_offense_multiplier: float
@@ -464,17 +486,14 @@ class OffenseForecast:
                 unknowns[pitcher_id],
                 "matchup_unknown_exposures",
             )
-        expected_log_standard_error = _aggregate_matchup_log_standard_error(
-            sigmas
-        )
         if not math.isclose(
             self.log_standard_error,
-            expected_log_standard_error,
+            self._context.lineup_log_standard_error,
             rel_tol=0.0,
             abs_tol=_FLOAT_TOLERANCE,
         ):
             raise ValueError(
-                "log_standard_error must equal the maximum matchup sigma"
+                "log_standard_error must equal the lineup base sigma"
             )
 
         if not isinstance(self.slot_forecasts, tuple):
@@ -503,7 +522,7 @@ class OffenseForecast:
                 "slot_forecasts must contain nine ordered slots per pitcher"
             )
 
-        signatures_by_order: dict[int, tuple[str, str, str]] = {}
+        signatures_by_order: dict[int, tuple[str, str]] = {}
         for pitcher_id in pitcher_ids:
             pitcher_slots = tuple(
                 slot
@@ -519,7 +538,6 @@ class OffenseForecast:
                 signature = (
                     slot.batter_id,
                     slot.batter_name,
-                    slot.expected_side,
                 )
                 previous = signatures_by_order.setdefault(slot.order, signature)
                 if previous != signature:
@@ -578,10 +596,7 @@ class OffenseForecast:
         explicit = self.matchup_log_standard_errors.get(pitcher_or_segment_id)
         if explicit is not None:
             return explicit
-        return math.hypot(
-            self.log_standard_error,
-            self.unknown_bullpen_matchup_log_se_penalty,
-        )
+        return self.unknown_bullpen_matchup_log_se_penalty
 
     def slot_forecasts_for(
         self,
@@ -594,6 +609,12 @@ class OffenseForecast:
 
 def _clip(value: float, bounds: tuple[float, float]) -> float:
     return min(bounds[1], max(bounds[0], value))
+
+
+def _expected_side_for(bats: str, pitcher_throws: str) -> str:
+    if bats == "S":
+        return "L" if pitcher_throws == "R" else "R"
+    return bats
 
 
 def _candidate_sort_key(response: object, average_velocity_mph: float) -> tuple:
@@ -616,13 +637,14 @@ def _select_response(
     slot: LineupSlot,
     pitcher: PitcherInput,
     pitch_usage: PitchUsage,
+    expected_side: str,
 ):
     matching = tuple(
         response
         for response in slot.responses
         if response.batter_id == slot.batter_id
         and response.pitcher_id == pitcher.pitcher_id
-        and response.expected_side == slot.expected_side
+        and response.expected_side == expected_side
         and response.pitch_type == pitch_usage.pitch_type
     )
     exact = tuple(
@@ -664,10 +686,11 @@ def _forecast_slot(
     config: SimulationConfig,
     context: _OffenseInvariantContext,
 ) -> SlotMatchupForecast:
+    expected_side = _expected_side_for(slot.bats, pitcher.throws)
     matching_positive_mix = tuple(
         pitch_usage
         for pitch_usage in pitcher.pitch_mix
-        if pitch_usage.opposing_side == slot.expected_side
+        if pitch_usage.opposing_side == expected_side
         and pitch_usage.usage > 0.0
     )
     if not matching_positive_mix:
@@ -675,7 +698,7 @@ def _forecast_slot(
             order=slot.order,
             batter_id=slot.batter_id,
             batter_name=slot.batter_name,
-            expected_side=slot.expected_side,
+            expected_side=expected_side,
             pitcher_id=pitcher.pitcher_id,
             evaluated_pitch_types=(),
             normalized_pitch_usages={},
@@ -711,7 +734,12 @@ def _forecast_slot(
     for pitch_usage in matching_positive_mix:
         pitch_type = pitch_usage.pitch_type
         velocities[pitch_type] = pitch_usage.average_velocity_mph
-        selected = _select_response(slot, pitcher, pitch_usage)
+        selected = _select_response(
+            slot,
+            pitcher,
+            pitch_usage,
+            expected_side,
+        )
         if selected is None:
             bands[pitch_type] = None
             deltas[pitch_type] = None
@@ -760,7 +788,7 @@ def _forecast_slot(
         order=slot.order,
         batter_id=slot.batter_id,
         batter_name=slot.batter_name,
-        expected_side=slot.expected_side,
+        expected_side=expected_side,
         pitcher_id=pitcher.pitcher_id,
         evaluated_pitch_types=pitch_types,
         normalized_pitch_usages=normalized_usages,
@@ -853,10 +881,7 @@ def _summarize_pitcher_slots(
         exposure_woba / context.league_woba,
         context.matchup_bounds,
     )
-    matchup_sigma = math.hypot(
-        context.lineup_log_standard_error,
-        unknown_exposure * context.sample_shortage_log_se_penalty,
-    )
+    matchup_sigma = unknown_exposure * context.sample_shortage_log_se_penalty
     return matchup_multiplier, matchup_sigma, unknown_exposure
 
 
@@ -910,6 +935,7 @@ def _forecast_offense_impl(
         9.0,
         "pa_weights",
     )
+    ordered_slots = tuple(sorted(lineup.slots, key=lambda slot: slot.order))
     context = context_issuer(
         league_woba=config.league_woba,
         normalized_pa_weights=normalized_pa_weights,
@@ -918,8 +944,12 @@ def _forecast_offense_impl(
         sample_shortage_log_se_penalty=(
             config.sample_shortage_log_se_penalty
         ),
+        bats_by_order=tuple(slot.bats for slot in ordered_slots),
+        pitcher_throws=tuple(
+            (profile.pitcher_id, profile.throws)
+            for profile in opposing_profiles
+        ),
     )
-    ordered_slots = tuple(sorted(lineup.slots, key=lambda slot: slot.order))
     slot_forecasts = tuple(
         _forecast_slot(slot, profile, config, context)
         for slot in ordered_slots
@@ -949,9 +979,7 @@ def _forecast_offense_impl(
         matchup_multipliers=matchup_multipliers,
         projected_traffic_per_9=projected_traffic,
         projected_extra_base_hits_per_9=projected_extra_base_hits,
-        log_standard_error=_aggregate_matchup_log_standard_error(
-            matchup_sigmas
-        ),
+        log_standard_error=lineup_log_standard_error,
         slot_forecasts=slot_forecasts,
         matchup_log_standard_errors=matchup_sigmas,
         matchup_unknown_exposures=matchup_unknowns,
@@ -972,6 +1000,8 @@ def _build_forecast_offense():
         matchup_bounds: tuple[float, float],
         lineup_log_standard_error: float,
         sample_shortage_log_se_penalty: float,
+        bats_by_order: tuple[str, ...],
+        pitcher_throws: tuple[tuple[str, str], ...],
     ) -> _OffenseInvariantContext:
         context = _OffenseInvariantContext(
             league_woba=league_woba,
@@ -979,6 +1009,8 @@ def _build_forecast_offense():
             matchup_bounds=matchup_bounds,
             lineup_log_standard_error=lineup_log_standard_error,
             sample_shortage_log_se_penalty=sample_shortage_log_se_penalty,
+            bats_by_order=bats_by_order,
+            pitcher_throws=pitcher_throws,
         )
         issued_contexts[id(context)] = context
         return context

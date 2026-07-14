@@ -139,20 +139,33 @@ def _validate_response_relationships(
     opposing_chain: PitcherChainInput,
     team_label: str,
 ) -> None:
-    opposing_pitcher_ids = {
-        pitcher.pitcher_id for pitcher in opposing_chain.pitchers
+    opposing_pitchers = {
+        pitcher.pitcher_id: pitcher for pitcher in opposing_chain.pitchers
     }
+    matchup_pitcher = opposing_pitchers[opposing_chain.matchup_pitcher_id]
     for slot in lineup.slots:
+        matchup_side = (
+            "L" if matchup_pitcher.throws == "R" else "R"
+        ) if slot.bats == "S" else slot.bats
+        if slot.expected_side != matchup_side:
+            raise ValueError(
+                f"{team_label} lineup expected_side must match the batter side "
+                "against the matchup pitcher"
+            )
         for response in slot.responses:
-            if response.pitcher_id not in opposing_pitcher_ids:
+            if response.pitcher_id not in opposing_pitchers:
                 raise ValueError(
                     f"{team_label} lineup response pitcher_id must reference "
                     "the opposing pitcher chain"
                 )
-            if response.expected_side != slot.expected_side:
+            pitcher = opposing_pitchers[response.pitcher_id]
+            expected_side = (
+                "L" if pitcher.throws == "R" else "R"
+            ) if slot.bats == "S" else slot.bats
+            if response.expected_side != expected_side:
                 raise ValueError(
-                    f"{team_label} lineup response expected_side must match "
-                    "the LineupSlot expected_side"
+                    f"{team_label} lineup response expected_side must match the "
+                    "batter side resolved for its opposing pitcher"
                 )
 
 

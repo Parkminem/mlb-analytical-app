@@ -485,7 +485,10 @@ class ReviewServiceTests(unittest.TestCase):
     def test_candidate_reuses_complete_frozen_distribution_and_interval(self):
         component_values = self._default_component_values()
         component_values["home_pitcher_chain_runs_allowed"] = 99.0
-        fixture = self.fixture(component_values=component_values)
+        fixture = self.fixture(
+            component_values=component_values,
+            score=(2, 1, 100, 3),
+        )
 
         candidate = build_review_candidate(
             self.store,
@@ -781,6 +784,7 @@ class ReviewServiceTests(unittest.TestCase):
         component_values[target] = 99.0
         fixture = self.fixture(
             component_values=component_values,
+            score=(2, 1, 100, 3),
             documented_events=(
                 {
                     "event_type": "injury",
@@ -873,6 +877,7 @@ class ReviewServiceTests(unittest.TestCase):
         component_values[target] = 99.0
         fixture = self.fixture(
             component_values=component_values,
+            score=(2, 1, 100, 3),
             documented_events=(
                 {
                     "event_type": "injury",

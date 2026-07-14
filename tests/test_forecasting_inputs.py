@@ -2046,3 +2046,40 @@ class ForecastIdentityTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_pregame_input(changed)
+
+    def test_switch_hitter_responses_follow_each_pitcher_handedness(self) -> None:
+        game = complete_forecast_game()
+        opener, bulk = game.home_pitching.pitchers
+        lefty_bulk = replace(bulk, throws="L")
+        home_pitching = replace(
+            game.home_pitching,
+            pitchers=(opener, lefty_bulk),
+        )
+        slot = game.away_lineup.slots[0]
+        bulk_response = replace(
+            slot.responses[0],
+            expected_side="R",
+        )
+        opener_response = replace(
+            bulk_response,
+            pitcher_id=opener.pitcher_id,
+            expected_side="L",
+        )
+        switch_slot = replace(
+            slot,
+            expected_side="R",
+            responses=(opener_response, bulk_response),
+        )
+        away_lineup = replace_lineup_slot(
+            game.away_lineup,
+            0,
+            switch_slot,
+        )
+
+        validate_pregame_input(
+            replace(
+                game,
+                away_lineup=away_lineup,
+                home_pitching=home_pitching,
+            )
+        )

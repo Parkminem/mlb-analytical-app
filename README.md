@@ -42,6 +42,7 @@ Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`
 - 같은 record kind와 같은 caller-supplied idempotency key에 같은 canonical payload를 다시 보내면 기존 record를 반환합니다. 같은 key에 바뀐 payload를 보내면 idempotency conflict입니다. 같은 semantic state라도 새 key를 사용하면 새 capture가 append될 수 있고 deterministic forecast는 재사용될 수 있습니다. 실제 상태 변화에는 새 key를 사용하며, 이전 capture를 대체하는 경우 supersession 관계와 새 capture-to-forecast link를 함께 기록합니다.
 - `record_shadow_run`은 capture supersession 인자를 받지 않습니다. 이전 capture를 명시적으로 대체해야 하면 lower-level `LedgerStore.append_capture`에 `CaptureCommand.supersedes_capture_id`를 설정하고 forecast/link API로 lineage를 완성합니다. 기존 record를 수정하지 않습니다.
 - 공식 결과 정정은 새 `source_revision`과 최신 결과를 가리키는 `supersedes_record_id`로 새 immutable result를 append합니다. 이전 결과는 변경하지 않으며 review와 calibration은 최신 non-superseded official result만 사용합니다.
+- 공식 결과가 선발 체인 실점과 불펜 실점을 모두 제공하면 각 투수진의 두 값은 음이 아닌 정수여야 하며 상대 최종 득점과 정확히 일치해야 합니다. 보존되지 않는 구성요소는 review 또는 calibration에 들어가기 전에 거부됩니다.
 
 ## Documentation
 

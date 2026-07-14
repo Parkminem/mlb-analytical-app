@@ -1919,6 +1919,72 @@ class StarterForecastTests(unittest.TestCase):
 
 
 class OffenseForecastTests(unittest.TestCase):
+    def test_switch_hitter_side_is_resolved_for_each_pitcher_profile(self):
+        righty_id = "pitcher:righty-opener"
+        lefty_id = "pitcher:lefty-bulk"
+        righty = _offense_profile(
+            righty_id,
+            (
+                _offense_usage(righty_id, "L", "SL", 1.0, 85.0),
+                _offense_usage(righty_id, "R", "FF", 1.0, 95.0),
+            ),
+        )
+        lefty = replace(
+            _offense_profile(
+                lefty_id,
+                (
+                    _offense_usage(lefty_id, "R", "CH", 1.0, 86.0),
+                    _offense_usage(lefty_id, "L", "SI", 1.0, 93.0),
+                ),
+            ),
+            throws="L",
+        )
+        lineup = _offense_lineup()
+        switch_slot = replace(
+            lineup.slots[0],
+            bats="S",
+            expected_side="L",
+            responses=(
+                _offense_response(
+                    1,
+                    righty_id,
+                    expected_side="L",
+                    pitch_type="SL",
+                    velocity_center_mph=85.0,
+                    adjusted_woba=0.400,
+                    slot_label="플러스",
+                ),
+                _offense_response(
+                    1,
+                    lefty_id,
+                    expected_side="R",
+                    pitch_type="CH",
+                    velocity_center_mph=86.0,
+                    adjusted_woba=0.240,
+                    slot_label="마이너스",
+                ),
+            ),
+        )
+        lineup = replace(
+            lineup,
+            slots=(switch_slot,) + lineup.slots[1:],
+        )
+
+        forecast = forecast_offense(
+            lineup,
+            (righty, lefty),
+            SimulationConfig(),
+        )
+
+        righty_slot = forecast.slot_forecasts_for(righty_id)[0]
+        lefty_slot = forecast.slot_forecasts_for(lefty_id)[0]
+        self.assertEqual(righty_slot.expected_side, "L")
+        self.assertEqual(righty_slot.evaluated_pitch_types, ("SL",))
+        self.assertEqual(righty_slot.adjusted_wobas["SL"], 0.400)
+        self.assertEqual(lefty_slot.expected_side, "R")
+        self.assertEqual(lefty_slot.evaluated_pitch_types, ("CH",))
+        self.assertEqual(lefty_slot.adjusted_wobas["CH"], 0.240)
+
     def test_all_slots_for_each_profile_are_sorted_by_order_then_profile(self):
         opener = _offense_profile("pitcher:opener")
         bulk = _offense_profile("pitcher:bulk")
@@ -2302,10 +2368,20 @@ class OffenseForecastTests(unittest.TestCase):
         self.assertEqual(complete.matchup_unknown_exposures[pitcher_id], 0.0)
         self.assertAlmostEqual(
             missing.matchup_log_standard_errors[pitcher_id],
-            math.hypot(0.09, 0.75 * config.sample_shortage_log_se_penalty),
+            0.75 * config.sample_shortage_log_se_penalty,
         )
-        self.assertEqual(complete.matchup_log_standard_errors[pitcher_id], 0.09)
-        self.assertGreater(missing.log_standard_error, complete.log_standard_error)
+        self.assertEqual(complete.matchup_log_standard_errors[pitcher_id], 0.0)
+        self.assertEqual(missing.log_standard_error, complete.log_standard_error)
+        self.assertGreater(
+            math.hypot(
+                missing.log_standard_error,
+                missing.matchup_log_standard_errors[pitcher_id],
+            ),
+            math.hypot(
+                complete.log_standard_error,
+                complete.matchup_log_standard_errors[pitcher_id],
+            ),
+        )
         self.assertTrue(hasattr(missing, "lineup_log_standard_error"))
         self.assertEqual(missing.lineup_log_standard_error, 0.09)
         with self.assertRaises(FrozenInstanceError):
@@ -2365,15 +2441,12 @@ class OffenseForecastTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             forecast.matchup_log_standard_errors[pitcher_id],
-            math.hypot(
-                0.09,
-                expected_unknown_exposure
-                * config.sample_shortage_log_se_penalty,
-            ),
+            expected_unknown_exposure
+            * config.sample_shortage_log_se_penalty,
         )
         self.assertGreater(
             forecast.matchup_log_standard_errors[pitcher_id],
-            base.log_standard_error.value,
+            0.0,
         )
 
     def test_selected_values_and_fixed_labels_are_carried_without_reshrinking(self):
@@ -2557,17 +2630,17 @@ class OffenseForecastTests(unittest.TestCase):
         self.assertEqual(forecast.matchup_multipliers[second_id], 1.0)
         self.assertEqual(forecast.matchup_unknown_exposures[first_id], 0.0)
         self.assertEqual(forecast.matchup_unknown_exposures[second_id], 0.5)
-        self.assertEqual(forecast.matchup_log_standard_errors[first_id], 0.10)
+        self.assertEqual(forecast.matchup_log_standard_errors[first_id], 0.0)
         self.assertAlmostEqual(
             forecast.matchup_log_standard_errors[second_id],
-            math.hypot(0.10, 0.5 * config.sample_shortage_log_se_penalty),
+            0.5 * config.sample_shortage_log_se_penalty,
         )
         self.assertEqual(len(forecast.slot_forecasts_for(first_id)), 9)
         self.assertEqual(len(forecast.slot_forecasts_for(second_id)), 9)
         self.assertEqual(set(forecast.matchup_multipliers), {first_id, second_id})
         self.assertEqual(set(forecast.matchup_log_standard_errors), {first_id, second_id})
 
-    def test_unknown_bullpen_is_neutral_and_adds_penalty_in_quadrature(self):
+    def test_unknown_bullpen_is_neutral_and_keeps_separate_matchup_penalty(self):
         pitcher_id = "pitcher:starter"
         config = SimulationConfig()
         forecast = forecast_offense(
@@ -2586,12 +2659,9 @@ class OffenseForecastTests(unittest.TestCase):
             forecast.log_standard_error_for(pitcher_id),
             forecast.matchup_log_standard_errors[pitcher_id],
         )
-        self.assertAlmostEqual(
+        self.assertEqual(
             forecast.log_standard_error_for("bullpen:unknown"),
-            math.hypot(
-                forecast.log_standard_error,
-                config.unknown_bullpen_matchup_log_se_penalty,
-            ),
+            config.unknown_bullpen_matchup_log_se_penalty,
         )
         self.assertEqual(forecast.slot_forecasts_for("bullpen:unknown"), ())
 
@@ -2708,14 +2778,13 @@ class OffenseForecastTests(unittest.TestCase):
                 "matchup_log_standard_errors",
                 {
                     "matchup_log_standard_errors": {pitcher_id: 0.9},
-                    "log_standard_error": 0.9,
                 },
             ),
         )
 
         self.assertEqual(result.matchup_multipliers[pitcher_id], 1.25)
         self.assertEqual(result.matchup_unknown_exposures[pitcher_id], 0.0)
-        self.assertEqual(result.matchup_log_standard_errors[pitcher_id], 0.10)
+        self.assertEqual(result.matchup_log_standard_errors[pitcher_id], 0.0)
         for field_name, changes in inconsistent_changes:
             with self.subTest(field_name=field_name):
                 with self.assertRaisesRegex(
@@ -2762,6 +2831,8 @@ class OffenseForecastTests(unittest.TestCase):
             sample_shortage_log_se_penalty=(
                 context.sample_shortage_log_se_penalty
             ),
+            bats_by_order=context.bats_by_order,
+            pitcher_throws=context.pitcher_throws,
         )
 
         for value in (result.slot_forecasts[0], result):
@@ -2802,7 +2873,7 @@ class OffenseForecastTests(unittest.TestCase):
             json.loads(first_json)["_context"],
         )
 
-    def test_global_log_standard_error_must_equal_max_profile_sigma(self):
+    def test_base_log_standard_error_must_equal_lineup_sigma(self):
         first_id = "pitcher:opener"
         second_id = "pitcher:bulk"
         result = forecast_offense(
@@ -2816,7 +2887,7 @@ class OffenseForecastTests(unittest.TestCase):
             ),
             SimulationConfig(),
         )
-        expected = max(result.matchup_log_standard_errors.values())
+        expected = result.lineup_log_standard_error
 
         self.assertEqual(result.log_standard_error, expected)
         within_tolerance = expected + offense_module._FLOAT_TOLERANCE / 2.0
@@ -2829,7 +2900,7 @@ class OffenseForecastTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ValueError,
-            "log_standard_error.*maximum matchup sigma",
+            "log_standard_error.*lineup base sigma",
         ):
             replace(result, log_standard_error=99.0)
 

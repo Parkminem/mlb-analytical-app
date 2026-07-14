@@ -651,9 +651,8 @@ class GameSimulationTests(unittest.TestCase):
             (profile,),
             config,
         )
-        expected_matchup_sigma = math.hypot(
-            0.09,
-            0.75 * config.sample_shortage_log_se_penalty,
+        expected_matchup_sigma = (
+            0.75 * config.sample_shortage_log_se_penalty
         )
         simulation_input = replace(
             baseline_input,
@@ -697,6 +696,80 @@ class GameSimulationTests(unittest.TestCase):
         )
         self.assertEqual(diagnostic_sigmas[0], 0.09)
         self.assertIn(expected_matchup_sigma, score_sigmas)
+
+    def test_each_offense_uncertainty_source_is_sampled_once(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        pitcher_id = simulation_input.home_pitcher_chain.pitchers[0].pitcher_id
+        lineup = _offense_lineup(log_standard_error=0.09)
+        profile = _offense_profile(
+            pitcher_id,
+            tuple(
+                usage
+                for side in ("R", "L")
+                for usage in (
+                    _offense_usage(pitcher_id, side, "FF", 0.25, 95.0),
+                    _offense_usage(pitcher_id, side, "CH", 0.75, 85.0),
+                )
+            ),
+        )
+        offense = forecast_offense(
+            _offense_with_responses(
+                lineup,
+                {
+                    slot.order: (
+                        _offense_response(
+                            slot.order,
+                            pitcher_id,
+                            expected_side=slot.expected_side,
+                            pitch_type="FF",
+                        ),
+                    )
+                    for slot in lineup.slots
+                },
+            ),
+            (profile,),
+            config,
+        )
+        score_rng = simulation_module.random.Random(1)
+        diagnostic_rng = simulation_module.random.Random(2)
+        latent_calls = []
+
+        def tracked_latent(rng, point, sigma, lower, upper):
+            latent_calls.append((rng, point, sigma, lower, upper))
+            return point
+
+        with patch.object(
+            simulation_module,
+            "draw_bounded_lognormal",
+            side_effect=tracked_latent,
+        ):
+            simulation_module._draw_offense_latents(
+                offense,
+                simulation_input.home_pitcher_chain,
+                simulation_input.home_bullpen,
+                score_rng,
+                diagnostic_rng,
+                config,
+            )
+
+        score_calls = tuple(
+            call for call in latent_calls if call[0] is score_rng
+        )
+        diagnostic_calls = tuple(
+            call for call in latent_calls if call[0] is diagnostic_rng
+        )
+        explicit_matchup_sigma = 0.75 * config.sample_shortage_log_se_penalty
+
+        self.assertEqual(score_calls[0][2], 0.09)
+        self.assertEqual(score_calls[1][2], explicit_matchup_sigma)
+        self.assertTrue(
+            all(
+                call[2] == config.unknown_bullpen_matchup_log_se_penalty
+                for call in score_calls[2:]
+            )
+        )
+        self.assertEqual(tuple(call[2] for call in diagnostic_calls), (0.09,))
 
     def test_component_distributions_are_deterministic_nearest_rank_values(self):
         config = _fast_config()

@@ -1098,6 +1098,10 @@ class LedgerStoreTests(unittest.TestCase):
             home_f5_runs=1.0,
             away_full_runs=4.0,
             home_full_runs=3.0,
+            away_pitcher_chain_runs_allowed=2.0,
+            away_bullpen_runs_allowed=1.0,
+            home_pitcher_chain_runs_allowed=3.0,
+            home_bullpen_runs_allowed=1.0,
         )
         values["away_bullpen_segment_bridge_exposed"] = 1.0
         values["home_bullpen_segment_high-leverage_exposed"] = 0.0
@@ -1148,6 +1152,62 @@ class LedgerStoreTests(unittest.TestCase):
                     record,
                     component_values={"away_full_runs": 3.0},
                 )
+
+    def test_pitching_run_components_must_conserve_opponent_full_score(
+        self,
+    ) -> None:
+        consistent = {
+            "away_pitcher_chain_runs_allowed": 2.0,
+            "away_bullpen_runs_allowed": 1.0,
+            "home_pitcher_chain_runs_allowed": 3.0,
+            "home_bullpen_runs_allowed": 1.0,
+        }
+
+        command = result_command(component_values=consistent)
+        self.assertEqual(dict(command.component_values), consistent)
+
+        for component_id in (
+            "away_pitcher_chain_runs_allowed",
+            "home_bullpen_runs_allowed",
+        ):
+            tampered = dict(consistent)
+            tampered[component_id] += 1.0
+            with self.subTest(component_id=component_id):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "pitcher-chain and bullpen runs allowed",
+                ):
+                    result_command(component_values=tampered)
+
+        negative = dict(consistent)
+        negative["away_pitcher_chain_runs_allowed"] = -1.0
+        negative["away_bullpen_runs_allowed"] = 4.0
+        with self.assertRaisesRegex(ValueError, "nonnegative whole-run counts"):
+            result_command(component_values=negative)
+
+        fractional = dict(consistent)
+        fractional["away_pitcher_chain_runs_allowed"] = 1.5
+        fractional["away_bullpen_runs_allowed"] = 1.5
+        with self.assertRaisesRegex(ValueError, "nonnegative whole-run counts"):
+            result_command(component_values=fractional)
+
+    def test_single_pitching_run_component_cannot_exceed_opponent_score(
+        self,
+    ) -> None:
+        impossible_components = {
+            "away_pitcher_chain_runs_allowed": 4.0,
+            "away_bullpen_runs_allowed": 4.0,
+            "home_pitcher_chain_runs_allowed": 5.0,
+            "home_bullpen_runs_allowed": 5.0,
+        }
+
+        for component_id, value in impossible_components.items():
+            with self.subTest(component_id=component_id):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "cannot exceed the opponent full-game score",
+                ):
+                    result_command(component_values={component_id: value})
 
     def test_official_full_score_cannot_be_lower_than_f5_score(self) -> None:
         for side in ("away", "home"):
