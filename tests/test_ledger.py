@@ -135,13 +135,25 @@ def review_command(**overrides: object) -> ReviewCommand:
         "contradicted_paths": [],
         "component_reviews": [
             {
-                "evidence_path": "away_lineup.power",
-                "component_ids": ["away_full_runs"],
+                "evidence_path": "starter_suppression",
+                "component_ids": ["home_pitcher_chain_runs_allowed"],
                 "contradicted": False,
                 "inside_80_count": 1,
                 "component_count": 1,
                 "notes": [],
-            }
+            },
+            {
+                "evidence_path": "top_order_matchup",
+                "component_ids": [
+                    "away_full_runs",
+                    "away_full_traffic",
+                    "away_full_extra_base_hits",
+                ],
+                "contradicted": False,
+                "inside_80_count": 2,
+                "component_count": 3,
+                "notes": [],
+            },
         ],
     }
     values.update(overrides)
@@ -1414,22 +1426,75 @@ class LedgerStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contradicted_paths"):
             review_command(
                 classification="C",
-                contradicted_paths=("away_lineup.power",),
+                contradicted_paths=("top_order_matchup",),
             )
 
         with self.assertRaisesRegex(ValueError, "component_reviews"):
             review_command(
                 component_reviews=(
                     {
-                        "evidence_path": "away_lineup.power",
-                        "component_ids": ("away_full_runs",),
+                        "evidence_path": "starter_suppression",
+                        "component_ids": ("home_pitcher_chain_runs_allowed",),
                         "contradicted": False,
                         "inside_80_count": 2,
                         "component_count": 1,
                         "notes": (),
                     },
+                    {
+                        "evidence_path": "top_order_matchup",
+                        "component_ids": (
+                            "away_full_runs",
+                            "away_full_traffic",
+                            "away_full_extra_base_hits",
+                        ),
+                        "contradicted": False,
+                        "inside_80_count": 2,
+                        "component_count": 3,
+                        "notes": (),
+                    },
                 ),
             )
+
+    def test_review_requires_canonical_two_to_four_principal_paths(self) -> None:
+        one_path = review_command().component_reviews[:1]
+        with self.assertRaisesRegex(ValueError, "two to four"):
+            review_command(component_reviews=one_path)
+
+        noncanonical = list(review_command().component_reviews)
+        noncanonical[0] = {
+            **dict(noncanonical[0]),
+            "evidence_path": "away_lineup.power",
+        }
+        with self.assertRaisesRegex(ValueError, "canonical evidence path"):
+            review_command(component_reviews=noncanonical)
+
+    def test_review_inside_ratio_must_match_unique_component_statuses(self) -> None:
+        with self.assertRaisesRegex(ValueError, "inside_80_ratio"):
+            review_command(inside_80_ratio=1.0)
+
+    def test_review_component_ids_must_be_official_components(self) -> None:
+        component_reviews = list(review_command().component_reviews)
+        component_reviews[1] = {
+            **dict(component_reviews[1]),
+            "component_ids": ("invented_component",),
+            "inside_80_count": 1,
+            "component_count": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "component_ids"):
+            review_command(component_reviews=component_reviews)
+
+    def test_review_component_shapes_must_match_canonical_paths(self) -> None:
+        component_reviews = list(review_command().component_reviews)
+        component_reviews[1] = {
+            **dict(component_reviews[1]),
+            "component_ids": ("away_full_runs",),
+            "inside_80_count": 1,
+            "component_count": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "component shape"):
+            review_command(component_reviews=component_reviews)
 
     def test_review_source_ids_are_canonical_and_classification_bound(self) -> None:
         review_fields = {field.name for field in fields(ReviewCommand)}
@@ -1693,7 +1758,7 @@ class LedgerStoreTests(unittest.TestCase):
         self.assertIsInstance(review.component_reviews, tuple)
         self.assertEqual(
             review.component_reviews[0]["evidence_path"],
-            "away_lineup.power",
+            "starter_suppression",
         )
 
     def test_concurrent_same_key_retries_append_exactly_one_record(self) -> None:
@@ -1784,6 +1849,46 @@ class LedgerStoreTests(unittest.TestCase):
                 store.append_capture("capture:symlink-swap", capture_command())
 
             self.assertEqual(victim.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_parent_symlink_swap_cannot_redirect_append_or_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trusted_parent = root / "trusted"
+            displaced_parent = root / "trusted-displaced"
+            attacker_parent = root / "attacker"
+            trusted_parent.mkdir()
+            attacker_parent.mkdir()
+
+            store = LedgerStore(trusted_parent / "ledger.jsonl")
+            victim_path = attacker_parent / "ledger.jsonl"
+            LedgerStore(victim_path).append_capture(
+                "capture:victim",
+                capture_command(payload={"source": "victim"}),
+            )
+            victim_content = victim_path.read_bytes()
+
+            trusted_parent.rename(displaced_parent)
+            trusted_parent.symlink_to(attacker_parent, target_is_directory=True)
+
+            errors: dict[str, LedgerCorruptionError] = {}
+            operations = {
+                "append": lambda: store.append_capture(
+                    "capture:redirected",
+                    capture_command(payload={"source": "redirected"}),
+                ),
+                "read": lambda: tuple(store.iter_records()),
+            }
+            for operation_name, operation in operations.items():
+                try:
+                    operation()
+                except LedgerCorruptionError as error:
+                    errors[operation_name] = error
+
+            self.assertEqual(victim_path.read_bytes(), victim_content)
+            self.assertEqual(set(errors), {"append", "read"})
+            self.assertTrue(
+                all("parent" in str(error) for error in errors.values())
+            )
 
     def test_invalid_utf8_and_duplicate_json_keys_raise_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

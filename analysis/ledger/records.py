@@ -3,6 +3,9 @@
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+import math
+
+from analysis.model import PriorityEvidencePath
 
 
 _LOWERCASE_HEX = frozenset("0123456789abcdef")
@@ -16,6 +19,16 @@ _COMPONENT_REVIEW_KEYS = frozenset(
         "inside_80_count",
         "component_count",
         "notes",
+    )
+)
+_PRIORITY_EVIDENCE_PATHS = frozenset(
+    evidence_path.value for evidence_path in PriorityEvidencePath
+)
+_CONVERSION_EVIDENCE_PATHS = frozenset(
+    (
+        PriorityEvidencePath.TOP_ORDER_MATCHUP.value,
+        PriorityEvidencePath.RECENT_RUN_CONVERSION.value,
+        PriorityEvidencePath.UNDERDOG_RUN_CREATION.value,
     )
 )
 
@@ -241,7 +254,10 @@ def _require_nonnegative_run(value: object, field_name: str) -> None:
 
 def _validate_component_reviews(
     component_reviews: tuple[FrozenMapping, ...],
+    inside_80_ratio: float,
 ) -> tuple[str, ...]:
+    if len(component_reviews) > 4:
+        raise ValueError("component_reviews cannot exceed four principal paths")
     contradicted_paths: list[str] = []
     evidence_paths: set[str] = set()
     for index, review in enumerate(component_reviews):
@@ -255,6 +271,10 @@ def _validate_component_reviews(
             evidence_path,
             f"component_reviews[{index}].evidence_path",
         )
+        if evidence_path not in _PRIORITY_EVIDENCE_PATHS:
+            raise ValueError(
+                f"component_reviews[{index}] requires a canonical evidence path"
+            )
         if evidence_path in evidence_paths:
             raise ValueError("component_reviews evidence paths must be unique")
         evidence_paths.add(evidence_path)
@@ -269,6 +289,11 @@ def _validate_component_reviews(
                 component_id,
                 f"component_reviews[{index}].component_ids",
             )
+            if not _valid_component_id(component_id):
+                raise ValueError(
+                    f"component_reviews[{index}].component_ids contains an "
+                    "unsupported official component"
+                )
         if len(set(component_ids)) != len(component_ids):
             raise ValueError(
                 f"component_reviews[{index}].component_ids must be unique"
@@ -293,6 +318,13 @@ def _validate_component_reviews(
             raise ValueError(
                 f"component_reviews[{index}].component_count must match component_ids"
             )
+        if not _valid_component_review_shape(
+            evidence_path,
+            frozenset(component_ids),
+        ):
+            raise ValueError(
+                f"component_reviews[{index}] has an invalid component shape"
+            )
         if not 0 <= inside_80_count <= component_count:
             raise ValueError(
                 f"component_reviews[{index}].inside_80_count is out of range"
@@ -307,6 +339,13 @@ def _validate_component_reviews(
             _require_nonempty(note, f"component_reviews[{index}].notes")
         if contradicted:
             contradicted_paths.append(evidence_path)
+    if component_reviews and not _inside_ratio_is_representable(
+        component_reviews,
+        inside_80_ratio,
+    ):
+        raise ValueError(
+            "inside_80_ratio is inconsistent with unique component statuses"
+        )
     return tuple(contradicted_paths)
 
 
@@ -345,6 +384,106 @@ def _valid_component_id(component_id: str) -> bool:
         if component_id.startswith(prefix) and component_id.endswith(suffix):
             segment_id = component_id[len(prefix) : -len(suffix)]
             return bool(segment_id.strip())
+    return False
+
+
+def _valid_component_review_shape(
+    evidence_path: str,
+    component_ids: frozenset[str],
+) -> bool:
+    if evidence_path == PriorityEvidencePath.STARTER_SUPPRESSION.value:
+        return any(
+            component_ids == {f"{side}_pitcher_chain_runs_allowed"}
+            for side in ("away", "home")
+        )
+    if evidence_path == PriorityEvidencePath.STARTER_COLLAPSE.value:
+        return any(
+            component_ids
+            == {
+                f"{side}_pitcher_chain_runs_allowed",
+                f"{side}_pitcher_chain_workload_outs",
+            }
+            for side in ("away", "home")
+        )
+    if evidence_path in _CONVERSION_EVIDENCE_PATHS:
+        return any(
+            component_ids
+            == {
+                f"{side}_{horizon}_runs",
+                f"{side}_{horizon}_traffic",
+                f"{side}_{horizon}_extra_base_hits",
+            }
+            for side in ("away", "home")
+            for horizon in ("f5", "full")
+        )
+    if evidence_path == PriorityEvidencePath.LATE_BULLPEN_EXPOSURE.value:
+        if len(component_ids) != 2:
+            return False
+        for side in ("away", "home"):
+            workload_id = f"{side}_pitcher_chain_workload_outs"
+            if workload_id not in component_ids:
+                continue
+            exposure_id = next(iter(component_ids.difference((workload_id,))))
+            prefix = f"{side}_bullpen_segment_"
+            suffix = "_exposed"
+            if exposure_id.startswith(prefix) and exposure_id.endswith(suffix):
+                return bool(exposure_id[len(prefix) : -len(suffix)].strip())
+        return False
+    if evidence_path == PriorityEvidencePath.BULLPEN_PROTECTION.value:
+        return any(
+            component_ids
+            == {
+                f"{side}_bullpen_runs_allowed",
+                f"{side}_protected_bullpen_close_entry",
+            }
+            for side in ("away", "home")
+        )
+    return False
+
+
+def _inside_ratio_is_representable(
+    component_reviews: tuple[FrozenMapping, ...],
+    inside_80_ratio: float,
+) -> bool:
+    component_ids = tuple(
+        sorted(
+            {
+                component_id
+                for review in component_reviews
+                for component_id in review["component_ids"]
+            }
+        )
+    )
+    target_float = inside_80_ratio * len(component_ids)
+    target_count = round(target_float)
+    if not math.isclose(
+        target_float,
+        target_count,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        return False
+    component_indexes = {
+        component_id: index for index, component_id in enumerate(component_ids)
+    }
+    constraints = tuple(
+        (
+            tuple(
+                component_indexes[component_id]
+                for component_id in review["component_ids"]
+            ),
+            review["inside_80_count"],
+        )
+        for review in component_reviews
+    )
+    for mask in range(1 << len(component_ids)):
+        if mask.bit_count() != target_count:
+            continue
+        if all(
+            sum((mask >> index) & 1 for index in indexes) == inside_count
+            for indexes, inside_count in constraints
+        ):
+            return True
     return False
 
 
@@ -745,7 +884,14 @@ class ReviewCommand:
             raise ValueError(
                 "classified reviews require non-empty component_reviews"
             )
-        component_contradictions = _validate_component_reviews(component_reviews)
+        if self.classification is not None and not 2 <= len(component_reviews) <= 4:
+            raise ValueError(
+                "classified reviews require two to four principal paths"
+            )
+        component_contradictions = _validate_component_reviews(
+            component_reviews,
+            self.inside_80_ratio,
+        )
         if contradicted_paths != component_contradictions:
             raise ValueError(
                 "contradicted_paths must match contradicted component_reviews"

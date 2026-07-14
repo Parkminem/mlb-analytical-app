@@ -294,17 +294,28 @@ def append_review(
             resolved_classification = "B"
     resolved_component_reviews = component_reviews
     if resolved_component_reviews is None:
-        evidence_paths = contradicted_paths or ("away_lineup.power",)
-        resolved_component_reviews = tuple(
+        resolved_component_reviews = (
             {
-                "evidence_path": evidence_path,
-                "component_ids": ("away_full_runs",),
-                "contradicted": evidence_path in contradicted_paths,
-                "inside_80_count": int(inside_80_ratio >= 0.50),
+                "evidence_path": "starter_suppression",
+                "component_ids": ("home_pitcher_chain_runs_allowed",),
+                "contradicted": "starter_suppression" in contradicted_paths,
+                "inside_80_count": int(inside_80_ratio >= 1.0),
                 "component_count": 1,
                 "notes": (),
-            }
-            for evidence_path in evidence_paths
+            },
+            {
+                "evidence_path": "top_order_matchup",
+                "component_ids": (
+                    "away_full_runs",
+                    "away_full_traffic",
+                    "away_full_extra_base_hits",
+                ),
+                "contradicted": "top_order_matchup" in contradicted_paths,
+                "inside_80_count": round(inside_80_ratio * 4)
+                - int(inside_80_ratio >= 1.0),
+                "component_count": 3,
+                "notes": (),
+            },
         )
     return store.append_review(
         ReviewCommand(
@@ -1957,7 +1968,7 @@ class CalibrationSelectionTests(unittest.TestCase):
         )
         append_entry_market(self.store, game_pk=910032, id_suffix="entry")
         result = append_result(self.store, game_pk=910032)
-        for classification, inside_80_ratio in (("A", 0.75), ("B", 0.70)):
+        for classification, market_result in (("A", "win"), ("B", "loss")):
             append_review(
                 self.store,
                 capture=context[0],
@@ -1966,7 +1977,8 @@ class CalibrationSelectionTests(unittest.TestCase):
                 result=result,
                 id_suffix=classification,
                 classification=classification,
-                inside_80_ratio=inside_80_ratio,
+                market_result=market_result,
+                inside_80_ratio=0.75,
             )
 
         with self.assertRaisesRegex(ValueError, "conflicting review records"):
@@ -1993,12 +2005,24 @@ class CalibrationSelectionTests(unittest.TestCase):
                 id_suffix=classification,
                 component_reviews=(
                     {
-                        "evidence_path": "away_lineup.power",
-                        "component_ids": ("away_full_runs",),
+                        "evidence_path": "starter_suppression",
+                        "component_ids": ("home_pitcher_chain_runs_allowed",),
                         "contradicted": False,
                         "inside_80_count": 1,
                         "component_count": 1,
                         "notes": (classification,),
+                    },
+                    {
+                        "evidence_path": "top_order_matchup",
+                        "component_ids": (
+                            "away_full_runs",
+                            "away_full_traffic",
+                            "away_full_extra_base_hits",
+                        ),
+                        "contradicted": False,
+                        "inside_80_count": 3,
+                        "component_count": 3,
+                        "notes": (),
                     },
                 ),
             )

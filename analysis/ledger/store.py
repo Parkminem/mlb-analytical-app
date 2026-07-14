@@ -11,6 +11,7 @@ from pathlib import Path
 import stat
 from typing import Callable, TypeVar
 import uuid
+import weakref
 
 from analysis.forecasting.identity import canonical_json
 
@@ -353,14 +354,76 @@ class LedgerStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path).resolve(strict=False)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._reject_existing_hard_links()
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
-        descriptor = self._open_no_follow(
-            self.lock_path,
-            os.O_CREAT | os.O_RDWR,
-            "ledger lock",
+        self._parent_path = self.path.parent
+        self._ledger_name = self.path.name
+        self._lock_name = self.lock_path.name
+        self._parent_descriptor = self._open_parent_directory()
+        parent_stat = os.fstat(self._parent_descriptor)
+        self._parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        self._parent_descriptor_finalizer = weakref.finalize(
+            self,
+            os.close,
+            self._parent_descriptor,
         )
-        os.close(descriptor)
+        try:
+            self._reject_existing_hard_links()
+            descriptor = self._open_no_follow(
+                self._lock_name,
+                os.O_CREAT | os.O_RDWR,
+                "ledger lock",
+            )
+            os.close(descriptor)
+        except Exception:
+            self._parent_descriptor_finalizer()
+            raise
+
+    def _open_parent_directory(self) -> int:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self._parent_path, flags)
+        except OSError as error:
+            raise LedgerCorruptionError(
+                "ledger parent directory cannot be opened safely"
+            ) from error
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = self._parent_path.lstat()
+            if (
+                not stat.S_ISDIR(descriptor_stat.st_mode)
+                or not stat.S_ISDIR(path_stat.st_mode)
+                or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                raise LedgerCorruptionError(
+                    "ledger parent directory changed while being opened"
+                )
+        except Exception:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _validate_parent_identity(self) -> None:
+        try:
+            descriptor_stat = os.fstat(self._parent_descriptor)
+            path_stat = self._parent_path.lstat()
+        except OSError as error:
+            raise LedgerCorruptionError(
+                "ledger parent directory changed after store construction"
+            ) from error
+        if (
+            not stat.S_ISDIR(descriptor_stat.st_mode)
+            or not stat.S_ISDIR(path_stat.st_mode)
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            != self._parent_identity
+            or (path_stat.st_dev, path_stat.st_ino) != self._parent_identity
+        ):
+            raise LedgerCorruptionError(
+                "ledger parent directory changed after store construction"
+            )
 
     @staticmethod
     def _reject_hard_links(link_count: int) -> None:
@@ -371,20 +434,30 @@ class LedgerStore:
 
     def _reject_existing_hard_links(self) -> None:
         try:
-            link_count = self.path.stat().st_nlink
+            descriptor = self._open_no_follow(
+                self._ledger_name,
+                os.O_RDONLY,
+                "ledger",
+            )
         except FileNotFoundError:
             return
-        self._reject_hard_links(link_count)
+        os.close(descriptor)
 
     def _open_no_follow(
         self,
-        path: Path,
+        file_name: str,
         flags: int,
         path_label: str,
     ) -> int:
+        self._validate_parent_identity()
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(path, flags | no_follow, 0o600)
+            descriptor = os.open(
+                file_name,
+                flags | no_follow,
+                0o600,
+                dir_fd=self._parent_descriptor,
+            )
         except OSError as error:
             if error.errno in (errno.ELOOP, errno.EMLINK):
                 raise LedgerCorruptionError(
@@ -393,7 +466,11 @@ class LedgerStore:
             raise
         try:
             descriptor_stat = os.fstat(descriptor)
-            path_stat = path.lstat()
+            path_stat = os.stat(
+                file_name,
+                dir_fd=self._parent_descriptor,
+                follow_symlinks=False,
+            )
             if stat.S_ISLNK(path_stat.st_mode):
                 raise LedgerCorruptionError(
                     f"{path_label} path must not be a symlink"
@@ -418,7 +495,7 @@ class LedgerStore:
     def _read_records(self) -> tuple[_RecordT, ...]:
         try:
             descriptor = self._open_no_follow(
-                self.path,
+                self._ledger_name,
                 os.O_RDONLY,
                 "ledger",
             )
@@ -615,7 +692,7 @@ class LedgerStore:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("idempotency_key must be a non-empty string")
         lock_descriptor = self._open_no_follow(
-            self.lock_path,
+            self._lock_name,
             os.O_RDWR,
             "ledger lock",
         )
@@ -647,7 +724,7 @@ class LedgerStore:
                 )
                 record = build(envelope)
                 descriptor = self._open_no_follow(
-                    self.path,
+                    self._ledger_name,
                     os.O_APPEND | os.O_CREAT | os.O_WRONLY,
                     "ledger",
                 )
@@ -1134,7 +1211,12 @@ class LedgerStore:
         return forecast
 
     def iter_records(self, kind: str | None = None):
-        with self.lock_path.open("a+b") as lock_file:
+        lock_descriptor = self._open_no_follow(
+            self._lock_name,
+            os.O_CREAT | os.O_RDWR,
+            "ledger lock",
+        )
+        with os.fdopen(lock_descriptor, "r+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
             try:
                 records = self._read_records()
