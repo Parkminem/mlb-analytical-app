@@ -39,6 +39,7 @@ __all__ = (
     "SimulatedGame",
     "DistributionSummary",
     "ComponentDistribution",
+    "validate_component_distribution_domain",
     "SimulationResult",
     "mean_runs_for_half_inning",
     "simulate_game_distribution",
@@ -156,6 +157,36 @@ class ComponentDistribution:
             raise TypeError("summary must be DistributionSummary")
         if self.summary != _summarize(self.values):
             raise ValueError("summary must match the nearest-rank values")
+
+
+def validate_component_distribution_domain(
+    distribution: ComponentDistribution,
+) -> None:
+    """Validate the count domain shared by every forecast component."""
+
+    if not isinstance(distribution, ComponentDistribution):
+        raise TypeError("distribution must be ComponentDistribution")
+    if any(
+        type(value) is not int or value < 0
+        for value in distribution.values
+    ):
+        raise ValueError(
+            f"component {distribution.component_id} count domain requires "
+            "nonnegative integers"
+        )
+    binary_component = distribution.component_id.endswith(
+        "_protected_bullpen_close_entry"
+    ) or (
+        "_bullpen_segment_" in distribution.component_id
+        and distribution.component_id.endswith("_exposed")
+    )
+    if binary_component and any(
+        value not in (0, 1) for value in distribution.values
+    ):
+        raise ValueError(
+            f"binary component {distribution.component_id} requires values "
+            "in {{0, 1}}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1143,6 +1174,10 @@ def _component_distribution_matches_exactly(
     actual: ComponentDistribution,
     expected: ComponentDistribution,
 ) -> bool:
+    try:
+        validate_component_distribution_domain(actual)
+    except (TypeError, ValueError):
+        return False
     if actual.component_id != expected.component_id:
         return False
     if len(actual.values) != len(expected.values):
@@ -1153,15 +1188,6 @@ def _component_distribution_matches_exactly(
         for actual_value, expected_value in zip(actual.values, expected.values)
     ):
         return False
-    if actual.component_id.endswith("_protected_bullpen_close_entry") or (
-        "_bullpen_segment_" in actual.component_id
-        and actual.component_id.endswith("_exposed")
-    ):
-        if any(
-            type(value) is not int or value not in (0, 1)
-            for value in actual.values
-        ):
-            return False
     return all(
         type(actual_value) is type(expected_value)
         and actual_value == expected_value

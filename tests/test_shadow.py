@@ -628,6 +628,47 @@ class ShadowComparisonTests(unittest.TestCase):
                 market_comparisons=(forged_unbound_mismatch,),
             )
 
+    def test_candidate_market_mismatch_is_exact_bound_ineligible_state(
+        self,
+    ) -> None:
+        mismatched_binding = replace(
+            binding(),
+            legacy_market="full_total",
+        )
+        legacy = legacy_snapshot(review_bindings=(mismatched_binding,))
+
+        comparison = compare_shadow_forecast(legacy, self.forecast)
+        market = comparison.market_comparisons[0]
+
+        self.assertFalse(market.review_eligible)
+        self.assertEqual(
+            market.review_ineligibility_flags,
+            ("candidate_market_mismatch",),
+        )
+        self.assertEqual(market.market_key, mismatched_binding.market_key)
+        self.assertEqual(market.legacy_market, legacy.candidates[0].market)
+        self.assertEqual(market.principal_paths, ())
+
+        for forged_flags in (
+            ("unknown_market_key",),
+            ("missing_pregame_binding", "candidate_market_mismatch"),
+        ):
+            with self.subTest(forged_flags=forged_flags):
+                forged = replace(
+                    market,
+                    review_ineligibility_flags=forged_flags,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "candidate_market_mismatch|missing_pregame_binding",
+                ):
+                    ShadowComparison(
+                        authority="legacy",
+                        legacy=legacy,
+                        forecast_run_id=comparison.forecast_run_id,
+                        market_comparisons=(forged,),
+                    )
+
     def test_comparison_rejects_eligible_entry_without_binding(self) -> None:
         valid = compare_shadow_forecast(
             legacy_snapshot(),
@@ -718,6 +759,29 @@ class ShadowRecordingTests(unittest.TestCase):
             len(tuple(self.store.iter_records("capture_forecast_link"))),
             1,
         )
+
+    def test_recording_preserves_candidate_market_mismatch_state(self) -> None:
+        mismatched_binding = replace(
+            binding(),
+            legacy_market="full_total",
+        )
+        legacy = legacy_snapshot(review_bindings=(mismatched_binding,))
+
+        result = self.record(
+            legacy=legacy,
+            keys=self.keys("candidate-market-mismatch"),
+        )
+        market = result.forecast.outputs["shadow_comparison"][
+            "market_comparisons"
+        ][0]
+
+        self.assertFalse(market["review_eligible"])
+        self.assertEqual(
+            market["review_ineligibility_flags"],
+            ("candidate_market_mismatch",),
+        )
+        self.assertEqual(market["market_key"], mismatched_binding.market_key)
+        self.assertEqual(market["principal_paths"], ())
 
     def test_recorded_payload_reconstructs_the_full_immutable_comparison(
         self,

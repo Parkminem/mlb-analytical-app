@@ -26,10 +26,15 @@ from analysis.forecasting.inputs import (
     NormalizedGameInput,
     SettlementFormat,
 )
-from analysis.forecasting.market import MarketEvaluation, OutcomeProbabilities
+from analysis.forecasting.market import (
+    MarketEvaluation,
+    OutcomeProbabilities,
+    market_is_push_capable,
+)
 from analysis.forecasting.simulation import (
     ComponentDistribution,
     DistributionSummary,
+    validate_component_distribution_domain,
 )
 from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
@@ -465,12 +470,11 @@ class ShadowComparison:
                 comparison.legacy_candidate_index
             )
             flags = comparison.review_ineligibility_flags
-            if "candidate_market_mismatch" in flags:
-                raise ValueError(
-                    "candidate_market_mismatch contradicts exact legacy market "
-                    "identity"
-                )
             if binding is None:
+                if "candidate_market_mismatch" in flags:
+                    raise ValueError(
+                        "candidate_market_mismatch requires a review binding"
+                    )
                 if comparison.review_eligible:
                     raise ValueError(
                         "eligible market comparison requires an exact review binding"
@@ -486,12 +490,19 @@ class ShadowComparison:
                     "comparison with a review binding cannot claim "
                     "missing_pregame_binding"
                 )
-            if (
-                comparison.market_key != binding.market_key
-                or comparison.legacy_market != binding.legacy_market
-            ):
+            if comparison.market_key != binding.market_key:
                 raise ValueError(
                     "market comparison must match its exact review binding"
+                )
+            expected_candidate_mismatch = (
+                comparison.legacy_market != binding.legacy_market
+            )
+            if (
+                "candidate_market_mismatch" in flags
+            ) != expected_candidate_mismatch:
+                raise ValueError(
+                    "candidate_market_mismatch must match review binding "
+                    "legacy_market identity"
                 )
             if (
                 comparison.review_eligible
@@ -924,6 +935,20 @@ def _validated_market_context(
                 f"markets[{market_key}] semantic_fingerprint must match "
                 "frozen market semantics"
             )
+        if (
+            evaluation.evaluated
+            and evaluation.probabilities is not None
+            and not market_is_push_capable(
+                semantic.market_type,
+                semantic.settlement_format,
+                semantic.line,
+            )
+            and evaluation.probabilities.push != 0.0
+        ):
+            raise ValueError(
+                f"markets[{market_key}] non-push-capable semantics cannot "
+                "contain push probability"
+            )
         unsupported_three_way_f5 = (
             semantic.market_type is MarketType.F5_SIDE
             and semantic.settlement_format is SettlementFormat.THREE_WAY
@@ -1083,7 +1108,7 @@ def _component_distributions_from_payload(
                 f"component distribution {component_id} values must match "
                 "simulation_count"
             )
-        distributions[component_id] = ComponentDistribution(
+        distribution = ComponentDistribution(
             component_id=component_id,
             values=values,
             summary=_distribution_summary_from_payload(
@@ -1091,6 +1116,8 @@ def _component_distributions_from_payload(
                 f"component distribution {component_id} summary",
             ),
         )
+        validate_component_distribution_domain(distribution)
+        distributions[component_id] = distribution
     return MappingProxyType(distributions)
 
 
@@ -1322,17 +1349,25 @@ def validate_shadow_forecast_context(
         binding = bindings_by_index.get(
             market_comparison.legacy_candidate_index
         )
-        expected_flags = (
-            ("missing_pregame_binding",)
-            if binding is None
-            else _binding_context_flags(
-                binding,
-                parsed_inputs,
-                parsed_evaluations,
-                component_distributions,
-                parsed_market_inputs,
+        if binding is None:
+            expected_flags = ("missing_pregame_binding",)
+        else:
+            context_flags = set(
+                _binding_context_flags(
+                    binding,
+                    parsed_inputs,
+                    parsed_evaluations,
+                    component_distributions,
+                    parsed_market_inputs,
+                )
             )
-        )
+            if binding.legacy_market != market_comparison.legacy_market:
+                context_flags.add("candidate_market_mismatch")
+            expected_flags = tuple(
+                flag
+                for flag in _INELIGIBILITY_FLAG_ORDER
+                if flag in context_flags
+            )
         if market_comparison.review_ineligibility_flags != expected_flags:
             expected = ", ".join(expected_flags) or "none"
             stored = (

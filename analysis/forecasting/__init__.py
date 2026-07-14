@@ -30,6 +30,7 @@ from .market import (
     MarketEvaluation,
     OutcomeProbabilities,
     evaluate_market,
+    market_is_push_capable,
     price_market,
 )
 from .engine import ForecastOutput, run_forecast
@@ -63,6 +64,7 @@ __all__ = (
     "StarterProjectionComponents",
     "WorkloadHistory",
     "evaluate_market",
+    "market_is_push_capable",
     "price_market",
     "run_forecast",
 )

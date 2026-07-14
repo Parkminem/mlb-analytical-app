@@ -332,10 +332,10 @@ def _resolved_capture_game(game: NormalizedGameInput) -> NormalizedGameInput:
     )
 
 
-def semantic_forecast_payload_from_capture_payload(
+def normalized_game_input_from_capture_payload(
     payload: Mapping[str, object],
-) -> dict[str, object]:
-    """Validate a complete capture payload and recover forecast semantics."""
+) -> NormalizedGameInput:
+    """Reconstruct one complete normalized game from its canonical capture."""
 
     if not isinstance(payload, Mapping):
         raise ValueError("capture payload must be a mapping")
@@ -346,6 +346,15 @@ def semantic_forecast_payload_from_capture_payload(
     )
     if not isinstance(game, NormalizedGameInput):
         raise TypeError("capture payload must reconstruct NormalizedGameInput")
+    return game
+
+
+def semantic_forecast_payload_from_capture_payload(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate a complete capture payload and recover forecast semantics."""
+
+    game = normalized_game_input_from_capture_payload(payload)
     return semantic_forecast_payload(_resolved_capture_game(game))
 
 

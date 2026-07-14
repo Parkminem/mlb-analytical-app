@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import math
 
 from analysis.forecasting.identity import canonical_json
+from analysis.forecasting.inputs import MarketType, SettlementFormat
+from analysis.forecasting.market import market_is_push_capable
 from analysis.ledger.records import (
     CaptureForecastLink,
     CaptureRecord,
@@ -103,22 +105,6 @@ def _validated_market_line(market_type: str, line: object) -> float | None:
     if market_type == "plus_1_5" and value != 1.5:
         raise ValueError("plus_1_5 line must be exactly 1.5")
     return value
-
-
-def _push_capable_market(
-    market_type: str,
-    settlement_format: str,
-    line: float | None,
-) -> bool:
-    if market_type == "f5_side":
-        return (
-            settlement_format == "two_way"
-            and line is not None
-            and line.is_integer()
-        )
-    if market_type in _TOTAL_MARKET_TYPES:
-        return line is not None and line.is_integer()
-    return False
 
 
 @dataclass(frozen=True)
@@ -388,9 +374,9 @@ class CalibrationRow:
                 "settlement_format must be two_way for this market_type"
             )
         line = _validated_market_line(self.market_type, self.line)
-        push_capable = _push_capable_market(
-            self.market_type,
-            self.settlement_format,
+        push_capable = market_is_push_capable(
+            MarketType(self.market_type),
+            SettlementFormat(self.settlement_format),
             line,
         )
 

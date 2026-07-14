@@ -16,7 +16,15 @@ from analysis.forecasting.inputs import (
     MarketType,
     SettlementFormat,
 )
-from analysis.forecasting.market import MarketEvaluation, price_market
+from analysis.forecasting.market import (
+    MarketEvaluation,
+    OutcomeProbabilities,
+    price_market,
+)
+from analysis.forecasting.simulation import (
+    ComponentDistribution,
+    DistributionSummary,
+)
 from tests.test_forecasting_inputs import (
     AVAILABLE_AT,
     CAPTURED_AT,
@@ -403,6 +411,53 @@ class ForecastEngineTests(unittest.TestCase):
         )
         self.assertEqual(output.config_version, _fast_config().version)
 
+    def test_output_rejects_component_values_outside_count_domains(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        exposure_id = next(
+            component_id
+            for component_id in output.component_distributions
+            if "_bullpen_segment_" in component_id
+            and component_id.endswith("_exposed")
+        )
+        cases = (
+            ("home_f5_runs", -1),
+            ("home_full_runs", 1.5),
+            ("home_protected_bullpen_close_entry", 2),
+            (exposure_id, 2),
+        )
+        for component_id, value in cases:
+            with self.subTest(component_id=component_id, value=value):
+                values = (value,) * output.simulation_count
+                distribution = ComponentDistribution(
+                    component_id=component_id,
+                    values=values,
+                    summary=DistributionSummary(
+                        value,
+                        value,
+                        value,
+                        value,
+                        value,
+                        value,
+                        value,
+                    ),
+                )
+                distributions = dict(output.component_distributions)
+                distributions[component_id] = distribution
+                intervals = dict(output.intervals)
+                intervals[component_id] = distribution.summary
+                output_values = {
+                    field.name: getattr(output, field.name)
+                    for field in fields(output)
+                }
+                output_values["component_distributions"] = distributions
+                output_values["intervals"] = intervals
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "domain|binary|count",
+                ):
+                    ForecastOutput(**output_values)
+
     def test_output_preserves_canonical_resolved_semantic_market_inputs(self):
         team_market = _market("z:side", MarketType.ML, "SEA", None)
         total_market = _market(
@@ -524,6 +579,25 @@ class ForecastEngineTests(unittest.TestCase):
         values["market_inputs"] = market_inputs
 
         with self.assertRaisesRegex(ValueError, "fingerprint.*market_inputs"):
+            ForecastOutput(**values)
+
+    def test_forecast_rejects_push_probability_for_non_push_market(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        semantic = output.market_inputs["sea_ml"]
+        evaluation = replace(
+            price_market(
+                OutcomeProbabilities(win=0.5, push=0.1, loss=0.4),
+                semantic.selected_decimal_price,
+                semantic.opposing_decimal_price,
+            ),
+            semantic_fingerprint=semantic.semantic_fingerprint,
+        )
+        markets = dict(output.markets)
+        markets["sea_ml"] = evaluation
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        values["markets"] = markets
+
+        with self.assertRaisesRegex(ValueError, "push"):
             ForecastOutput(**values)
 
     def test_forecast_rejects_unbound_unevaluated_ordinary_market(self):

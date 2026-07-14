@@ -18,6 +18,7 @@ from .inputs import (
 from .market import (
     MarketEvaluation,
     evaluate_market,
+    market_is_push_capable,
     market_semantic_fingerprint,
 )
 from .offense import OffenseForecast, forecast_offense
@@ -26,6 +27,7 @@ from .simulation import (
     DistributionSummary,
     GameSimulationInput,
     simulate_game_distribution,
+    validate_component_distribution_domain,
 )
 from .starter import PitcherChainForecast, forecast_pitcher_chain
 from .validation import validate_pregame_input
@@ -139,6 +141,7 @@ def _freeze_component_distributions(
             )
         if distribution.component_id != component_id:
             raise ValueError("component distribution key and ID must match")
+        validate_component_distribution_domain(distribution)
         if len(distribution.values) != simulation_count:
             raise ValueError("component values must match simulation_count")
     return MappingProxyType(
@@ -298,6 +301,19 @@ def _freeze_market_inputs(
         if evaluation.semantic_fingerprint != market.semantic_fingerprint:
             raise ValueError(
                 "evaluation semantic_fingerprint must match market_inputs"
+            )
+        if (
+            evaluation.evaluated
+            and evaluation.probabilities is not None
+            and not market_is_push_capable(
+                market.market_type,
+                market.settlement_format,
+                market.line,
+            )
+            and evaluation.probabilities.push != 0.0
+        ):
+            raise ValueError(
+                "non-push-capable market cannot contain push probability"
             )
     return MappingProxyType(
         {key: copied[key] for key in sorted(copied)}

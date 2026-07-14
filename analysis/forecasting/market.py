@@ -94,6 +94,30 @@ def market_semantic_fingerprint(
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def market_is_push_capable(
+    market_type: MarketType,
+    settlement_format: SettlementFormat,
+    line: float | None,
+) -> bool:
+    """Return whether exact settlement terms can produce a push."""
+
+    if not isinstance(market_type, MarketType):
+        raise ValueError("market_type must be MarketType")
+    if not isinstance(settlement_format, SettlementFormat):
+        raise ValueError("settlement_format must be SettlementFormat")
+    if line is not None and not _is_finite_number(line):
+        raise ValueError("line must be finite when present")
+    if settlement_format is not SettlementFormat.TWO_WAY or line is None:
+        return False
+    if market_type not in {
+        MarketType.F5_SIDE,
+        MarketType.F5_TOTAL,
+        MarketType.FULL_TOTAL,
+    }:
+        return False
+    return float(line).is_integer()
+
+
 def _canonical_derived_probability(value: float, field_name: str) -> float:
     if not _is_finite_number(value):
         raise ValueError(f"{field_name} must be finite")
@@ -553,6 +577,7 @@ __all__ = (
     "OutcomeProbabilities",
     "MarketEvaluation",
     "market_semantic_fingerprint",
+    "market_is_push_capable",
     "price_market",
     "evaluate_market",
     "settle_observed_market",

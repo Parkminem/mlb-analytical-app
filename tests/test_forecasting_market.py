@@ -505,6 +505,31 @@ class MarketPricingTests(unittest.TestCase):
 
 @unittest.skipUnless(MARKET_API_AVAILABLE, "forecasting market API is missing")
 class MarketSettlementTests(unittest.TestCase):
+    def test_push_capability_uses_settlement_specific_semantics(self):
+        helper = getattr(market_module, "market_is_push_capable", None)
+        self.assertTrue(callable(helper), "push-capability helper is missing")
+        cases = (
+            (MarketType.F5_SIDE, SettlementFormat.TWO_WAY, 0.0, True),
+            (MarketType.F5_SIDE, SettlementFormat.TWO_WAY, 0.5, False),
+            (MarketType.F5_SIDE, SettlementFormat.THREE_WAY, 0.0, False),
+            (MarketType.F5_TOTAL, SettlementFormat.TWO_WAY, 4.0, True),
+            (MarketType.F5_TOTAL, SettlementFormat.TWO_WAY, 4.5, False),
+            (MarketType.FULL_TOTAL, SettlementFormat.TWO_WAY, 8.0, True),
+            (MarketType.FULL_TOTAL, SettlementFormat.TWO_WAY, 8.5, False),
+            (MarketType.ML, SettlementFormat.TWO_WAY, None, False),
+            (MarketType.PLUS_1_5, SettlementFormat.TWO_WAY, 1.5, False),
+        )
+        for market_type, settlement_format, line, expected in cases:
+            with self.subTest(
+                market_type=market_type,
+                settlement_format=settlement_format,
+                line=line,
+            ):
+                self.assertIs(
+                    helper(market_type, settlement_format, line),
+                    expected,
+                )
+
     def test_evaluate_market_binds_semantics_while_price_market_is_unbound(self):
         market = _market(MarketType.ML, "away", line=None)
         evaluated = evaluate_market(

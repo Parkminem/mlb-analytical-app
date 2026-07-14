@@ -8,14 +8,17 @@ from analysis.forecasting.engine import SemanticMarketInput
 from analysis.forecasting.identity import (
     build_forecast_run_id_from_capture_payload,
     canonical_json,
+    normalized_game_input_from_capture_payload,
     normalized_input_hash_from_capture_payload,
+    semantic_forecast_payload_from_capture_payload,
 )
-from analysis.forecasting.inputs import MarketType
+from analysis.forecasting.inputs import MarketType, NormalizedGameInput
 from analysis.forecasting.market import settle_observed_market
 from analysis.forecasting.simulation import (
     ComponentDistribution,
     DistributionSummary,
 )
+from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
     CaptureForecastLink,
     CaptureRecord,
@@ -178,27 +181,26 @@ def _require_latest_result(
         raise ValueError("result_record_id references a superseded official result")
 
 
-def _capture_identity(capture: CaptureRecord) -> tuple[str, str]:
-    payload = _require_mapping(capture.payload, "capture payload")
-    identity = _require_mapping(payload.get("identity"), "capture payload identity")
-    game_pk = identity.get("game_pk")
-    if (
-        isinstance(game_pk, bool)
-        or not isinstance(game_pk, int)
-        or game_pk != capture.game_pk
-    ):
+def _validated_capture_game(capture: CaptureRecord) -> NormalizedGameInput:
+    game = normalized_game_input_from_capture_payload(capture.payload)
+    if game.identity.game_pk != capture.game_pk:
         raise ValueError("capture payload identity game_pk must match capture game_pk")
-    away_team = _require_nonempty_string(
-        identity.get("away_team"),
-        "capture payload identity away_team",
-    )
-    home_team = _require_nonempty_string(
-        identity.get("home_team"),
-        "capture payload identity home_team",
-    )
-    if away_team == home_team:
-        raise ValueError("captured away_team and home_team must differ")
-    return away_team, home_team
+    if capture.captured_at >= capture.first_pitch:
+        raise ValueError("CaptureRecord captured_at must be before first_pitch")
+    if game.captured_at != capture.captured_at:
+        raise ValueError(
+            "capture payload captured_at must exactly match CaptureRecord"
+        )
+    if game.identity.first_pitch != capture.first_pitch:
+        raise ValueError(
+            "capture payload identity.first_pitch must exactly match CaptureRecord"
+        )
+    validation = validate_pregame_input(game)
+    if validation.out_of_sample_eligible != capture.out_of_sample_eligible:
+        raise ValueError(
+            "CaptureRecord out_of_sample_eligible must match capture validation"
+        )
+    return game
 
 
 def _require_deterministic_forecast_identity(
@@ -252,6 +254,25 @@ def _resolve_selected_side(
             "side market selected_side must use away/home or a captured team alias"
         )
     return replace(market, selected_side=selected_side)
+
+
+def _require_capture_forecast_market_binding(
+    capture: CaptureRecord,
+    market_inputs: Mapping[str, SemanticMarketInput],
+    away_team: str,
+    home_team: str,
+) -> None:
+    expected_markets = semantic_forecast_payload_from_capture_payload(
+        capture.payload
+    )["markets"]
+    actual_markets = tuple(
+        _resolve_selected_side(market_inputs[market_key], away_team, home_team)
+        for market_key in sorted(market_inputs)
+    )
+    if canonical_json(actual_markets) != canonical_json(expected_markets):
+        raise ValueError(
+            "forecast market_inputs must exactly match canonical capture markets"
+        )
 
 
 def _exact_shadow_comparison(
@@ -508,7 +529,9 @@ def build_review_candidate(
             "official result finalized_at must be strictly after first_pitch"
         )
     _require_latest_result(records, result)
-    away_team, home_team = _capture_identity(capture)
+    captured_game = _validated_capture_game(capture)
+    away_team = captured_game.identity.away_team
+    home_team = captured_game.identity.home_team
 
     outputs = _require_mapping(forecast.outputs, "forecast outputs")
     from analysis.shadow import deserialize_forecast_context
@@ -527,6 +550,12 @@ def build_review_candidate(
         raise ValueError(
             "forecast outputs forecast_run_id must match ForecastRecord"
         )
+    _require_capture_forecast_market_binding(
+        capture,
+        forecast_context.market_inputs,
+        away_team,
+        home_team,
+    )
     comparison, semantic_market_inputs = _exact_shadow_comparison(
         outputs,
         forecast_context,

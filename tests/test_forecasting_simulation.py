@@ -178,6 +178,47 @@ def _simulate_scripted_game(runs):
 
 
 class GameSimulationTests(unittest.TestCase):
+    def test_forecast_component_domain_validator_is_public_and_strict(self):
+        validator = getattr(
+            simulation_module,
+            "validate_component_distribution_domain",
+            None,
+        )
+        self.assertTrue(callable(validator), "component domain validator missing")
+        valid = ComponentDistribution(
+            component_id="away_f5_runs",
+            values=(0, 1, 2),
+            summary=simulation_module._summarize((0, 1, 2)),
+        )
+        invalid = (
+            ComponentDistribution(
+                component_id="away_f5_runs",
+                values=(-1,),
+                summary=simulation_module._summarize((-1,)),
+            ),
+            ComponentDistribution(
+                component_id="away_full_runs",
+                values=(1.5,),
+                summary=simulation_module._summarize((1.5,)),
+            ),
+            ComponentDistribution(
+                component_id="home_protected_bullpen_close_entry",
+                values=(2,),
+                summary=simulation_module._summarize((2,)),
+            ),
+            ComponentDistribution(
+                component_id="home_bullpen_segment_bridge_exposed",
+                values=(2,),
+                summary=simulation_module._summarize((2,)),
+            ),
+        )
+
+        self.assertIsNone(validator(valid))
+        for distribution in invalid:
+            with self.subTest(component_id=distribution.component_id):
+                with self.assertRaisesRegex(ValueError, "domain|binary|count"):
+                    validator(distribution)
+
     def test_same_run_id_reproduces_exact_scores(self):
         config = _fast_config()
         simulation_input = _game_sim_input(config)
