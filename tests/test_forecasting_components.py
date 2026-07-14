@@ -3081,7 +3081,7 @@ class BullpenForecastTests(unittest.TestCase):
             _bullpen_input(
                 {
                     BullpenRole.HIGH_LEVERAGE: {
-                        "log_standard_error": _bullpen_numeric(0.40),
+                        "log_standard_error": _bullpen_numeric(0.20),
                         "limited_performance_or_use_risk": _bullpen_boolean(True),
                     }
                 }
@@ -3100,10 +3100,40 @@ class BullpenForecastTests(unittest.TestCase):
 
         self.assertTrue(setup.available)
         self.assertTrue(setup.limited_performance_or_use_risk)
-        self.assertEqual(setup.base_log_standard_error, 0.40)
-        self.assertEqual(setup.log_standard_error, math.hypot(0.40, 0.30))
+        self.assertEqual(setup.base_log_standard_error, 0.20)
+        self.assertEqual(
+            setup.log_standard_error,
+            math.sqrt(0.20 ** 2 + 0.30 ** 2),
+        )
         self.assertEqual(setup.notes, ("limited_performance_or_use_risk",))
         self.assertIs(selected, setup)
+
+    def test_direct_segment_invariant_uses_approved_sigma_expression(self):
+        base_sigma = 1e50
+        penalty = 7e50
+        forecast = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "log_standard_error": _bullpen_numeric(base_sigma),
+                        "limited_performance_or_use_risk": _bullpen_boolean(True),
+                    }
+                }
+            ),
+            SimulationConfig(limited_reliever_log_se_penalty=penalty),
+        )
+        setup = forecast.by_role[BullpenRole.HIGH_LEVERAGE]
+        approved_sigma = math.sqrt(base_sigma ** 2 + penalty ** 2)
+        hypot_sigma = math.hypot(base_sigma, penalty)
+
+        self.assertNotEqual(approved_sigma, hypot_sigma)
+        try:
+            rebuilt = replace(setup, log_standard_error=approved_sigma)
+        except ValueError as error:
+            self.fail(f"approved sigma expression was rejected: {error}")
+        self.assertEqual(rebuilt.log_standard_error, approved_sigma)
+        with self.assertRaisesRegex(ValueError, "log_standard_error"):
+            replace(setup, log_standard_error=hypot_sigma)
 
     def test_limited_and_unavailable_normalized_flags_are_inconsistent(self):
         bullpen = _bullpen_input(
@@ -3213,7 +3243,7 @@ class BullpenForecastTests(unittest.TestCase):
         cases = (
             (6, 1, True, BullpenRole.BRIDGE),
             (6, 1, False, BullpenRole.MIDDLE),
-            (7, 1, True, BullpenRole.BRIDGE),
+            (7, 1, True, BullpenRole.HIGH_LEVERAGE),
             (7, 1, False, BullpenRole.HIGH_LEVERAGE),
             (7, 4, False, BullpenRole.MIDDLE),
             (8, -3, False, BullpenRole.HIGH_LEVERAGE),

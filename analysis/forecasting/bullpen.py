@@ -164,12 +164,14 @@ class BullpenSegmentForecast:
                 "run_prevention_multiplier is inconsistent with projected_ra9"
             )
 
-        penalty = (
-            context.limited_reliever_log_se_penalty
-            if self.limited_performance_or_use_risk
-            else 0.0
+        expected_sigma = math.sqrt(
+            self.base_log_standard_error ** 2
+            + (
+                context.limited_reliever_log_se_penalty ** 2
+                if self.limited_performance_or_use_risk
+                else 0
+            )
         )
-        expected_sigma = math.hypot(self.base_log_standard_error, penalty)
         if not math.isclose(
             self.log_standard_error,
             expected_sigma,
@@ -362,9 +364,13 @@ def _forecast_team_segment(
         projected_ra9 / context.league_ra9,
         context.bullpen_ra9_bounds,
     )
-    sigma = math.hypot(
-        base_sigma,
-        context.limited_reliever_log_se_penalty if limited else 0.0,
+    sigma = math.sqrt(
+        base_sigma ** 2
+        + (
+            context.limited_reliever_log_se_penalty ** 2
+            if limited
+            else 0
+        )
     )
     return BullpenSegmentForecast(
         segment_id=segment.segment_id,
@@ -503,14 +509,14 @@ def select_bullpen_segment(
         return forecast.unscheduled_f5_relief
 
     close_game = abs(margin) <= 3
-    if bridge_needed and inning in (6, 7):
-        roles = (BullpenRole.BRIDGE, BullpenRole.MIDDLE)
-    elif close_game and inning in (7, 8):
+    if close_game and inning in (7, 8):
         roles = (
             BullpenRole.HIGH_LEVERAGE,
             BullpenRole.MIDDLE,
             BullpenRole.BRIDGE,
         )
+    elif bridge_needed and inning in (6, 7):
+        roles = (BullpenRole.BRIDGE, BullpenRole.MIDDLE)
     elif close_game and inning >= 9:
         roles = (
             BullpenRole.CLOSER,
