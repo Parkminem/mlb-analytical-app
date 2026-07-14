@@ -23,6 +23,8 @@ Every source observation must contain:
 
 | Field | Required meaning |
 |---|---|
+| `observation_id` | The unique identifier used to bind normalized feature provenance to this observation |
+| `source_name` | The canonical name of the source provider |
 | `source_record` | A stable identifier or URL for the exact source record |
 | `observed_at` | The source observation's timestamp |
 | `available_at` | The earliest defensible time the observation was available for pregame use |
@@ -30,7 +32,7 @@ Every source observation must contain:
 | `effective_date` | The game, slate, or statistical date to which it applies |
 | `content_hash` | A stable hash of the captured source content |
 
-Every normalized value must reference its source-observation IDs and record the latest `available_at` used; lookback features must also record their lookback end. Pregame validation requires those times to be at or before `captured_at`. Do not substitute `fetched_at` for an unknown `available_at`. When availability cannot be defended, retain the observation only as retrospective data and exclude its capture from out-of-sample calibration.
+Every normalized value must bind its `FeatureProvenance.observation_ids` to matching `SourceObservation.observation_id` values in the capture and record the latest `available_at` used; lookback features must also record their lookback end. Pregame validation requires those times to be at or before `captured_at`. Do not substitute `fetched_at` for an unknown `available_at`. When availability cannot be defended, retain the observation only as retrospective data and exclude its capture from out-of-sample calibration.
 
 ## Data Handling
 

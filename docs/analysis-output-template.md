@@ -6,7 +6,7 @@ Use this structure for daily MLB analysis. Keep the summary concise, then suppor
 
 | Game | F5 | F5 O/U | ML | +1.5 | O/U | Final |
 |---|---|---|---|---|---|---|
-| Away vs Home | pick / lean / pass | line + direction / pass | pick / lean / pass | pick / lean / pass | line + direction / pass | one or more non-conflicting choices |
+| Away vs Home | play / lean / pass | line + direction + play/lean/pass | play / lean / pass | play / lean / pass | line + direction + play/lean/pass | one or more non-conflicting choices |
 
 Use decimal odds when prices are available.
 
@@ -30,7 +30,7 @@ When a same-game side or handicap plus O/U combination is listed, explain the in
 **Starter structure:** confirmed starter, opener/bulk, `PRIM`, or bullpen game  
 **Confidence flags:** projected lineup, starter conflict, high sample uncertainty, missing umpire, or none
 
-When a shadow forecast is available, add the following block to the written review for the evaluated market. Do not add it as a replacement pick column in the summary table.
+When a shadow forecast is available, add the following block to the written review for the evaluated market. Do not add it as a replacement recommendation column in the summary table.
 
 ```text
 Shadow probability: 54.2%
@@ -110,6 +110,10 @@ Use the official MLB result and the exact frozen pregame capture-to-forecast lin
 - `A`: win, no contradicted principal path, and at least 75% of principal components inside the central 80% intervals.
 - `B`: no contradicted principal path and at least 60% inside the central 80% intervals, but not `A`; losses and pushes can be `B`.
 - `C`: any contradicted principal path or fewer than 60% inside the central 80% intervals, even if the ticket won.
-- `D`: a documented injury, ejection, or defensive-error event with at least three unearned runs affects a principal component outside its central 90% interval. Include the stable source-observation ID for the external event; without that provenance, do not assign `D`.
+- `D`: a supported, documented external event affects a principal-bound component outside its central 90% interval.
+
+For a `C` path contradiction, first require at least one bound component outside the central 90% interval, then apply exactly one fixed rule: starter suppression requires pitcher-chain runs above `p90`; starter collapse requires runs below `p10` and workload at or above the median; top-order/recent conversion requires runs, traffic, and extra-base hits all below `p10`; late-bullpen exposure requires no bound-segment exposure and workload at or above `p80`; bullpen protection requires bullpen runs above `p90` and protected close-game entry. Normal sequencing variance or either condition by itself is not a contradiction. See [Deterministic C Contradiction Rules](model.md#deterministic-c-contradiction-rules) for the authoritative contract.
+
+The first delivery supports exactly `injury`, `ejection`, `defensive_error`, and `defensive_error_cluster` for `D`. Injury and ejection do not require unearned runs; `defensive_error` and `defensive_error_cluster` require at least three. Every event must affect a principal-bound component, include a stable non-empty `documented_source_observation_id`, and have that component outside its central 90% interval. Other predeclared exogenous event types require a future approved supported-type extension and are not currently assignable as `D`.
 
 If the legacy market was `pass`, report component matches but no A/B/C/D market class. Traffic alone is not a correct flow; it must be supported by the applicable frozen run, extra-base-hit, starter, and bullpen observations.

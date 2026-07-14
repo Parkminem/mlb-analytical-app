@@ -9,7 +9,7 @@ This model is fixed for day-to-day analysis unless the user explicitly asks to c
 - Score each baseball input once, then reuse that score with different weights for F5, F5 O/U, full-game ML, `+1.5`, and full-game totals.
 - Use RotoWire confirmed lineups when available and RotoWire projected lineups when they are not.
 - Treat official MLB probable pitchers, live feeds, and boxscores as the authoritative pitcher sources.
-- Treat pitch-type plus velocity splits as matchup signals, not standalone picks.
+- Treat pitch-type plus velocity splits as matchup signals, not standalone recommendations.
 - Treat pitch-type plus velocity sample shortage as uncertainty, not as hitter weakness or automatic under support.
 - Downgrade F5 before full-game ML when starter WHIP, BB, HR, or early-collapse risk is high.
 - Use full-game ML only when the bullpen layer supports the starter and lineup edge.
@@ -44,7 +44,7 @@ Keep these output concepts separate:
 ### Three-Stage Daily Operation
 
 1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, then record the normalized pregame capture, deterministic shadow forecast, and capture-to-forecast link.
-2. Refresh with the RotoWire confirmed lineup and current starter and market state. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast, while an exact retry remains idempotent.
+2. Refresh with the RotoWire confirmed lineup and current starter and market state. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast. An exact retry returns the existing capture only when the caller reuses the same caller-supplied idempotency key; the same state with a new key may append another capture while reusing the deterministic forecast.
 3. Ingest the official MLB result, bind it to the selected frozen capture and forecast, perform the objective flow review, and build the calibration report.
 
 Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
@@ -149,7 +149,7 @@ Rules:
 - If a clear power bat is graded `마이너스`, do not treat that hitter as harmless. Use it as a variance flag for ML and totals, not as positive side evidence.
 - If an underdog lineup has seven or more `플러스` slots against a favorite starter, downgrade the favorite's full-game ML confidence.
 - If the model side's core run creators contain three or more `마이너스` pitch-velocity matchups, cap F5 strength even when the opposing starter's season line looks attackable.
-- If the confirmed model-side lineup has broadly weak pitch-velocity fit and the model side is a short favorite at decimal odds of `1.65` or lower, cap full-game ML priority. Starter or bullpen edge can preserve a lean, but the short-priced ML should not remain a top pick.
+- If the confirmed model-side lineup has broadly weak pitch-velocity fit and the model side is a short favorite at decimal odds of `1.65` or lower, cap full-game ML priority. Starter or bullpen edge can preserve a lean, but the short-priced ML should not remain a top-priority recommendation.
 
 ## 3. Lineup Form
 
@@ -315,12 +315,12 @@ Full-game ML emphasizes:
 Rules:
 
 - Full-game ML may survive moderate starter volatility when the bullpen is rested and materially better.
-- Late-inning bullpen risk can move a full-game ML pick toward F5 or pass.
+- Late-inning bullpen risk can move a full-game ML recommendation toward F5 or `pass`.
 - If the model side is a favorite at decimal odds of `1.60` or lower and the starter has command or HR risk, cap the side at `lean`.
 - If a confirmed lineup removes a key power bat or the largest positive pitch-velocity slot, downgrade side priority at least one level.
 - If the model side's starter is returning from injury or had a recent short exit, downgrade full-game ML as well as F5.
 - If the best total case comes from two-sided run volatility, separate the over from the side and downgrade ML.
-- If starter HR/collapse risk is identified and the opponent's top order has three or more pitch-velocity `플러스` slots, do not leave the model side as a primary ML pick. Move first to O/U when the run environment supports it, otherwise pass or reduce the side to a weak lean. If command or HR risk is also present, block full-game ML priority.
+- If starter HR/collapse risk is identified and the opponent's top order has three or more pitch-velocity `플러스` slots, do not leave the model side as a primary ML recommendation. Move first to O/U when the run environment supports it, otherwise `pass` or reduce the side to a weak `lean`. If command or HR risk is also present, block full-game ML priority.
 - If a short favorite's side case depends mainly on elite-starter trust but the opponent top order has multiple extra-base paths, keep the side as a capped lean rather than a priority play.
 - If the opponent lineup is neutral-heavy with limited `마이너스` volume, do not use the absence of `플러스` slots as strong ML support. Cap or downgrade the side because traffic can still build runs.
 - If the opponent has a `마이너스`-graded clear power bat, do not upgrade the model-side ML solely from that grade. Mark one-swing variance and reduce side confidence when the side is already thin.
@@ -333,7 +333,7 @@ Rules:
 
 ### Plus Handicap
 
-The `+1.5` model is not a weaker ML pick. It requires:
+The `+1.5` model is not a weaker ML recommendation. It requires:
 
 - Starter survival
 - A lineup capable of keeping the game close
@@ -359,7 +359,7 @@ Rules:
 - If the underdog has fewer than two credible top-five scoring routes and the opposing starter has recent strikeout length, keep `+1.5` out of the final priority stack. Starter survival and a low-scoring script can support a review lean, but they are not enough for a priority cover without a real run path.
 - A muted favorite offense or low-scoring script does not create a priority `+1.5` by itself. The underdog still needs an independent scoring path through top-order matchup fit, recent run conversion, walks/contact pressure, or a clearly exposed opposing bullpen segment.
 - If the underdog's own recent run creation is cold and it lacks run conversion, pass `+1.5` even when the low-scoring or close-game script is plausible. A muted opponent offense is not enough by itself.
-- If the underdog handicap requires the favorite starter to underperform but the favorite starter can miss bats and limit traffic, keep the handicap as a lean or pass instead of a priority pick.
+- If the underdog handicap requires the favorite starter to underperform but the favorite starter can miss bats and limit traffic, keep the handicap as a `lean` or `pass` instead of a priority recommendation.
 - If the underdog starter has early collapse risk and the opponent top order has a live power path, avoid `+1.5`; review over first when total validation supports it.
 - If the case relies mostly on fastball edges and lower-order continuity is weak, cap the handicap at `lean`.
 - If the fastball-only edge also lacks secondary-pitch support, pass.
@@ -461,7 +461,7 @@ Low-total starter-duel rule:
 
 - At market totals of `7.5` or lower, review the under before a heavy favorite ML when both starters are stable, both bullpens are usable, and both lineups are muted.
 - At market totals of `7.5` or lower, one dominant K/BB starter with a realistic length path can move under ahead of side even if the other starter is only moderate, as long as both lineups are muted, both bullpens are usable, and late HR/variance flags are controlled.
-- At market totals of `7.5` or lower, do not use under as a priority pick unless late variance, bullpen depth, and center-order power variance are all controlled.
+- At market totals of `7.5` or lower, do not use under as a priority recommendation unless late variance, bullpen depth, and center-order power variance are all controlled.
 - At market totals of `7.5` or lower, do not let a starter-duel label override recent power or HR variance. The under remains playable only when those variance paths are controlled.
 - At market totals of `7.5` or lower, if both starters are recently stable and likely to carry the game into the sixth inning, keep under as a candidate even when the lineups have moderate pitch-velocity `플러스` slots. This applies only when late variance, bullpen depth, high sample uncertainty, and clear power-bat variance are controlled.
 - At market totals of `7.0` or lower, do not make over a priority only because the favorite lineup has strong pitch-velocity slots. Require the underdog lineup to have a credible scoring path as well.
@@ -482,8 +482,8 @@ Rules:
 
 - Preserve the legacy price and validation logic as the authority for `play`, `lean`, `pass`, and final priority.
 - Compare shadow model probability with the no-vig market probability in the written review only. This comparison cannot change legacy admission or rank.
-- Market signals are review inputs, not automatic picks.
-- If signals agree with the legacy model, they can confirm the existing pick.
+- Market signals are review inputs, not automatic recommendations.
+- If signals agree with the legacy model, they can confirm the existing recommendation.
 - If signals disagree with the legacy model, review starter, bullpen, and price before changing direction. Shadow comparisons are not market signals for this rule.
 - Do not double count market information inside the baseball-performance score.
 
@@ -498,7 +498,7 @@ Confidence is reduced by:
 - Conflicting model layers
 - Poor price
 
-Confidence does not change which team is stronger. It changes whether the recommendation is `pick`, `lean`, or `pass`.
+Confidence does not change which team is stronger. It changes whether the recommendation is `play`, `lean`, or `pass`.
 
 ### Default Output
 
@@ -537,7 +537,23 @@ Review the official result against the frozen pregame component forecasts and th
 - `A`: the ticket wins, no principal path is contradicted, and at least 75% of principal component observations are inside their central 80% intervals.
 - `B`: no principal path is contradicted and at least 60% of principal component observations are inside their central 80% intervals, but the result does not qualify for `A`. A loss or push can therefore be `B`.
 - `C`: any principal path is contradicted by the fixed rules or fewer than 60% of principal component observations are inside their central 80% intervals, regardless of ticket result. A winning ticket with materially wrong flow is `C`.
-- `D`: a documented injury, ejection, or defensive-error event producing at least three unearned runs affects a principal component and that component falls outside its central 90% interval. `D` requires the external event's stable source-observation provenance; an unsupported narrative is not enough.
+- `D`: a supported, documented external event affects a principal-bound component and that component falls outside its central 90% interval. The exact event contract is defined below.
+
+### Deterministic C Contradiction Rules
+
+A principal path can be contradicted only when at least one component bound to that path falls outside its central 90% interval (`< p05` or `> p95`). After that common gate is met, only the matching fixed binding shape and rule may contradict the path:
+
+- **Starter suppression:** pitcher-chain runs allowed are above `p90`. Because this path binds only that component, the common gate also requires the observation to be above `p95`.
+- **Starter collapse:** pitcher-chain runs allowed are below `p10` and pitcher-chain workload is at or above its forecast median.
+- **Top-order or recent conversion:** the applicable F5 or full-game team runs, traffic, and extra-base hits are all below `p10`.
+- **Late-bullpen exposure:** the bound bullpen segment was not exposed and pitcher-chain workload is at or above `p80`.
+- **Bullpen protection:** bullpen runs allowed are above `p90` and the game entered the protected close-game segment.
+
+Normal sequencing variance is not a contradiction. Neither an isolated central-90 miss nor a fixed-rule shape without the central-90 gate is sufficient; both the common gate and the exact path rule must qualify.
+
+### D External-Event Contract
+
+The first delivery supports exactly `injury`, `ejection`, `defensive_error`, and `defensive_error_cluster`. `injury` and `ejection` have no unearned-run threshold. `defensive_error` and `defensive_error_cluster` require at least three unearned runs. Every event must affect a component bound to a principal path, include a stable non-empty `documented_source_observation_id`, and have that affected component outside its central 90% interval. Any other predeclared exogenous event type requires a future separately approved supported-type extension and cannot currently be assigned `D`.
 
 If the legacy decision was `pass`, record component matches without assigning an A/B/C/D market class. Traffic alone is not a correct flow: a side or total path also needs its frozen run-conversion, extra-base-hit, starter, or bullpen components to satisfy the applicable review rules.
 
