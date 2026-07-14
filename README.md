@@ -24,14 +24,15 @@ python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 
 `analysis.pipeline`은 라이브 데이터를 스크래핑하지 않습니다. 분석에 필요한 단계, 출처 상태, 신뢰도 플래그가 고정 규칙과 맞는지 확인하는 재현성 도구입니다.
 
-## Workflow
+## Daily Workflow
 
-1. 공식 MLB 선발과 오프너/벌크 구조를 확인합니다.
-2. RotoWire 확정 라인업을 사용하고, 미확정이면 예상 라인업을 사용합니다.
-3. Baseball Savant/Statcast로 양 팀 모든 타자의 구종+구속 대응력을 예상 타석과 투수 좌우 기준으로 평가합니다.
-4. 최근 타선 흐름, 선발 안정성, 불펜 가용성과 품질, 심판을 결합합니다.
-5. F5, F5 O/U, ML, `+1.5`, O/U를 서로 다른 가중치로 판단하고 시장 가격을 마지막에 적용합니다. 시장 엔진의 `pass`를 제외한 뒤 동일경기 후보의 증거 경로 중복을 제거합니다.
-6. 경기 후에는 `docs/reviews/README.md` 형식으로 복기합니다.
+이 전달에서 라이브 출처 수집과 정규화는 운영자 또는 외부 수집 절차가 담당합니다. 자동 수집을 가정하지 않으며, 예측에 쓰는 모든 정규화 값은 원본 출처 관측치로 추적할 수 있어야 합니다.
+
+1. **예상 라인업:** 공식 MLB 선발과 오프너/벌크 구조, RotoWire 예상 라인업, Savant/Statcast 매치업, 최근 흐름, 불펜, 심판, 현재 소수 배당을 사용해 기존 고정 모델 분석을 수행합니다. F5, F5 O/U, ML, `+1.5`, O/U의 `play`/`lean`/`pass`와 최종 우선순위를 정한 뒤 같은 상태를 shadow capture와 forecast로 기록합니다. 예상 라인업은 팀 강도가 아니라 신뢰도만 낮춥니다.
+2. **확정 라인업:** RotoWire 확정 라인업과 최신 선발 및 시장 상태로 새로고침합니다. 실제 출처 상태 변화는 새 capture로 남기고, 정규화된 야구 입력이나 의미 있는 시장 조건이 바뀐 경우에만 새 deterministic forecast run을 만듭니다. 비의미적 시각 메타데이터만 달라진 capture는 같은 forecast에 연결할 수 있으며, 동일 요청 재시도는 중복 기록을 만들지 않습니다.
+3. **경기 후:** 공식 MLB 결과를 불변 기록으로 수집하고, 동결된 pregame capture/forecast에 연결해 객관적 A/B/C/D 흐름 복기를 수행한 뒤 calibration report를 갱신합니다.
+
+Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`/`lean`/`pass`, `0-100` 순위 점수, 최종 우선순위를 변경하거나 재정렬하거나 상향/하향할 수 없습니다. `0-100`은 확률이 아닌 legacy rank score입니다. 최소 100개의 확정 라인업 경기 전에는 production 의사결정에 영향을 줄 수 없고, 가능하면 시장군별 300개 decision 전에는 튜닝하지 않습니다. Production 우선권, 규칙 삭제, 가중치 변경은 별도 승인된 새 모델 버전과 설계가 필요합니다.
 
 ## Documentation
 

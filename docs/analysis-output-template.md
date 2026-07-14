@@ -18,7 +18,7 @@ F5 O/U must use a verified F5 line and decimal price. Do not infer it from the f
 
 Before building the final priority stack, remove every market whose own decision engine returned `pass`, regardless of its preliminary score. Then assemble F5 side, F5 O/U, and full-game O/U together. If candidates share starter suppression, starter collapse, top-order matchup, recent conversion, or another canonical evidence path, retain only the higher-scoring candidate. Missing evidence does not establish independence; keep multiple markets only when their distinct non-empty paths are explicitly verified.
 
-Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is not a separate baseball input and must not double count evidence.
+Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is a legacy rank score, **not a probability**, and is not a separate baseball input. It must not double count evidence.
 
 When a same-game side or handicap plus O/U combination is listed, explain the independent total path. Do not list the total only because the side was strong.
 
@@ -29,6 +29,20 @@ When a same-game side or handicap plus O/U combination is listed, explain the in
 **Lineup status:** RotoWire confirmed lineup or RotoWire projected lineup  
 **Starter structure:** confirmed starter, opener/bulk, `PRIM`, or bullpen game  
 **Confidence flags:** projected lineup, starter conflict, high sample uncertainty, missing umpire, or none
+
+When a shadow forecast is available, add the following block to the written review for the evaluated market. Do not add it as a replacement pick column in the summary table.
+
+```text
+Shadow probability: 54.2%
+Fair decimal price: 1.84
+Market no-vig probability: 51.0%
+Shadow edge: +3.2 percentage points
+Legacy authority: play/lean/pass and final priority remain unchanged
+```
+
+Keep the meanings separate: shadow probability and fair decimal price are model outputs; market no-vig probability and shadow edge are price comparisons; predictive intervals describe uncertainty in forecast components; and the legacy admission decision determines `play`/`lean`/`pass`. The `0-100` legacy rank score is not any of these. For a push-capable market, the displayed model and no-vig probabilities are conditional on a non-push result, and shadow edge is their difference in percentage points. If an opposing price or another required value is missing, state that the corresponding comparison is unavailable instead of inventing it.
+
+Mandatory shadow mode cannot mutate, replace, reorder, upgrade, or downgrade any legacy recommendation. A strong or weak shadow edge is written context only.
 
 When MLB and RotoWire list different pitchers, state whether this is an unresolved conflict or an opener/bulk structure. If MLB lists an opener and RotoWire identifies the bulk pitcher, use the bulk pitcher for the main matchup and mention the opener only as first-inning context.
 Do not treat a `PRIM` label alone as stable bulk confirmation. State whether explicit bulk confirmation or a recent workload of roughly 50 or more pitches supports stable bulk treatment; otherwise mark opener/bulk timing uncertainty.
@@ -88,3 +102,14 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 - For `+1.5`, state whether the underdog starter's survival risk overrides an otherwise positive pitch-velocity matchup.
 - For `+1.5`, state whether the underdog has its own run-creation path. Do not make the handicap a priority from opponent run suppression alone.
 - End with one or more consistent final directions when separate markets from the same game both deserve priority.
+
+## Postgame Flow Review
+
+Use the official MLB result and the exact frozen pregame capture-to-forecast link. For every recommended market, compare the observed components with the predeclared principal paths and predictive intervals, then apply the fixed precedence `D > C > A/B`:
+
+- `A`: win, no contradicted principal path, and at least 75% of principal components inside the central 80% intervals.
+- `B`: no contradicted principal path and at least 60% inside the central 80% intervals, but not `A`; losses and pushes can be `B`.
+- `C`: any contradicted principal path or fewer than 60% inside the central 80% intervals, even if the ticket won.
+- `D`: a documented injury, ejection, or defensive-error event with at least three unearned runs affects a principal component outside its central 90% interval. Include the stable source-observation ID for the external event; without that provenance, do not assign `D`.
+
+If the legacy market was `pass`, report component matches but no A/B/C/D market class. Traffic alone is not a correct flow; it must be supported by the applicable frozen run, extra-base-hit, starter, and bullpen observations.

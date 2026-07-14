@@ -11,6 +11,27 @@
 | Weather and park | User-provided BallparkPal or equivalent | Excluded by default |
 | Umpire | Available assignment and tendency source | Missing assignment caps F5 confidence |
 
+## Collection Boundary
+
+Live source collection and normalization remain manual or external in this delivery. The forecasting core and `analysis.pipeline` do not scrape or authenticate to these sources. Before a shadow run, the operator or external collector must supply the normalized values and provenance; no value may be inferred from a later result or an undocumented source.
+
+RotoWire confirmed lineups remain preferred. When only a RotoWire projected lineup is available, use it and lower confidence only. Use decimal odds. Weather remains excluded unless the user provides it or explicitly requests it.
+
+## Provenance and Leakage
+
+Every source observation must contain:
+
+| Field | Required meaning |
+|---|---|
+| `source_record` | A stable identifier or URL for the exact source record |
+| `observed_at` | The source observation's timestamp |
+| `available_at` | The earliest defensible time the observation was available for pregame use |
+| `fetched_at` | When the operator or collector retrieved it |
+| `effective_date` | The game, slate, or statistical date to which it applies |
+| `content_hash` | A stable hash of the captured source content |
+
+Every normalized value must reference its source-observation IDs and record the latest `available_at` used; lookback features must also record their lookback end. Pregame validation requires those times to be at or before `captured_at`. Do not substitute `fetched_at` for an unknown `available_at`. When availability cannot be defended, retain the observation only as retrospective data and exclude its capture from out-of-sample calibration.
+
 ## Data Handling
 
 - Do not commit login credentials, cookies, sportsbook account data, or private reports.
@@ -32,4 +53,4 @@ Only Savant/Statcast historical data may use daily caching by default. All other
 
 ## Reproducibility Boundary
 
-This repository preserves the model and its workflow. It does not guarantee that third-party sites expose the same live data forever, so every analysis should record the lineup status, starter status, market line, and data timestamp used.
+This repository preserves the model and its workflow. It does not guarantee that third-party sites expose the same live data forever, so every analysis must retain the full source provenance above together with lineup status, starter structure, market line, decimal prices, and capture time.

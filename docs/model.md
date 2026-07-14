@@ -30,6 +30,25 @@ This model is fixed for day-to-day analysis unless the user explicitly asks to c
 
 The first six stages create baseball-performance scores. The betting decision engines do not rescore the same evidence; they apply different weights to the existing scores.
 
+## Legacy Authority and Shadow Forecasting
+
+The deterministic forecasting engine runs in mandatory `shadow` mode. It records probabilities, fair prices, predictive distributions, and market comparisons beside the fixed model, but the legacy fixed model remains the only decision authority. Shadow output must never mutate, replace, reorder, upgrade, or downgrade a legacy candidate, its `play`/`lean`/`pass` decision, or the final priority stack.
+
+Keep these output concepts separate:
+
+- **Legacy admission decision:** fixed validation and the same-game candidate assembler determine `play`, `lean`, or `pass` and whether a market may enter final priority. A market-engine `pass` stays excluded regardless of shadow probability.
+- **Legacy `0-100` priority score:** an ordinal rank for admitted legacy recommendations. It is **not a win probability**, model probability, confidence percentage, or fair-price input.
+- **Shadow model probability and fair decimal price:** deterministic forecast outputs for the selected market. They describe the modeled outcome and its corresponding fair price; they do not admit or rank a legacy recommendation.
+- **Uncertainty and predictive intervals:** distributions for scores, traffic, extra-base hits, workload, and other forecast components. They describe outcome dispersion and support objective postgame review; they are not admission decisions or the legacy rank score.
+
+### Three-Stage Daily Operation
+
+1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, then record the normalized pregame capture, deterministic shadow forecast, and capture-to-forecast link.
+2. Refresh with the RotoWire confirmed lineup and current starter and market state. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast, while an exact retry remains idempotent.
+3. Ingest the official MLB result, bind it to the selected frozen capture and forecast, perform the objective flow review, and build the calibration report.
+
+Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
+
 ## 1. Data Integrity
 
 This layer determines whether the analysis inputs are reliable. It changes confidence, not team strength.
@@ -455,16 +474,17 @@ Inputs:
 
 - Decimal odds
 - Implied probability
-- Model probability
 - Market line movement
 - Market signals
+- Shadow model probability, fair decimal price, no-vig market probability, and edge for comparison only
 
 Rules:
 
-- Compare model probability with implied probability to determine value.
+- Preserve the legacy price and validation logic as the authority for `play`, `lean`, `pass`, and final priority.
+- Compare shadow model probability with the no-vig market probability in the written review only. This comparison cannot change legacy admission or rank.
 - Market signals are review inputs, not automatic picks.
-- If signals agree with the model, they can confirm the pick.
-- If signals disagree, review starter, bullpen, and price before changing direction.
+- If signals agree with the legacy model, they can confirm the existing pick.
+- If signals disagree with the legacy model, review starter, bullpen, and price before changing direction. Shadow comparisons are not market signals for this rule.
 - Do not double count market information inside the baseball-performance score.
 
 ### Confidence
@@ -509,6 +529,25 @@ Final priority rules:
 - Avoid listing both ML and `+1.5` for the same team as separate priority entries unless the user explicitly asks for market alternatives, because that duplicates the same side edge.
 - Keep every same-game combination directionally coherent and state why both markets can coexist.
 - Same-game side plus over requires explicit validation that the side can win or cover while the opponent still contributes enough scoring, or that late bullpen exposure can lift the total without breaking the side.
+
+## Objective Postgame Review
+
+Review the official result against the frozen pregame component forecasts and the two to four principal evidence paths recorded for each recommended market. Central 80% and 90% predictive intervals are fixed before the game. Apply classes in strict precedence order `D > C > A/B`:
+
+- `A`: the ticket wins, no principal path is contradicted, and at least 75% of principal component observations are inside their central 80% intervals.
+- `B`: no principal path is contradicted and at least 60% of principal component observations are inside their central 80% intervals, but the result does not qualify for `A`. A loss or push can therefore be `B`.
+- `C`: any principal path is contradicted by the fixed rules or fewer than 60% of principal component observations are inside their central 80% intervals, regardless of ticket result. A winning ticket with materially wrong flow is `C`.
+- `D`: a documented injury, ejection, or defensive-error event producing at least three unearned runs affects a principal component and that component falls outside its central 90% interval. `D` requires the external event's stable source-observation provenance; an unsupported narrative is not enough.
+
+If the legacy decision was `pass`, record component matches without assigning an A/B/C/D market class. Traffic alone is not a correct flow: a side or total path also needs its frozen run-conversion, extra-base-hit, starter, or bullpen components to satisfy the applicable review rules.
+
+Calibration reports may group the frozen decisions by model version, market family, lineup state, starter structure, model-probability bucket, and legacy priority-score bucket. Keep sample size, hit and push rates, Brier score, log loss, ROI, and closing-line value distinct; missing prices omit price-dependent metrics rather than blocking flow review.
+
+## Migration Gates
+
+- Shadow forecasts have no production influence until at least 100 confirmed-lineup games have been collected and evaluated.
+- Avoid tuning an individual market family before 300 decisions for that family when feasible.
+- Production precedence, deletion of a legacy rule, or reweighting requires a separately approved design and a new semantic model version. A postgame review or calibration report cannot make that change by itself.
 
 ## Live Betting
 
