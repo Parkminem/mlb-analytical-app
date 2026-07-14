@@ -2,13 +2,19 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
+import math
 import re
 from types import MappingProxyType
 
 from .bullpen import BullpenForecast, forecast_bullpen
 from .config import SimulationConfig
 from .identity import build_forecast_run_id
-from .inputs import MarketInput, MarketType, NormalizedGameInput
+from .inputs import (
+    MarketInput,
+    MarketType,
+    NormalizedGameInput,
+    SettlementFormat,
+)
 from .market import MarketEvaluation, evaluate_market
 from .offense import OffenseForecast, forecast_offense
 from .simulation import (
@@ -171,6 +177,102 @@ def _freeze_markets(value: object) -> Mapping[str, MarketEvaluation]:
     )
 
 
+def _require_optional_finite_number(value: object, field_name: str) -> None:
+    if value is None:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{field_name} must be a finite number when present")
+
+
+@dataclass(frozen=True)
+class SemanticMarketInput:
+    """Capture-independent market terms required for pricing and settlement."""
+
+    market_key: str
+    market_type: MarketType
+    settlement_format: SettlementFormat
+    selected_side: str
+    line: float | None
+    selected_decimal_price: float | None
+    opposing_decimal_price: float | None
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.market_key, "market_key")
+        if not isinstance(self.market_type, MarketType):
+            raise ValueError("market_type must be MarketType")
+        if not isinstance(self.settlement_format, SettlementFormat):
+            raise ValueError("settlement_format must be SettlementFormat")
+        _require_nonempty_string(self.selected_side, "selected_side")
+        _require_optional_finite_number(self.line, "line")
+        for field_name in (
+            "selected_decimal_price",
+            "opposing_decimal_price",
+        ):
+            value = getattr(self, field_name)
+            _require_optional_finite_number(value, field_name)
+            if value is not None and value <= 0.0:
+                raise ValueError(f"{field_name} must be positive when present")
+
+    @classmethod
+    def from_market_input(cls, market: MarketInput) -> "SemanticMarketInput":
+        if not isinstance(market, MarketInput):
+            raise TypeError("market must be MarketInput")
+        return cls(
+            market_key=market.market_key,
+            market_type=market.market_type,
+            settlement_format=market.settlement_format,
+            selected_side=market.selected_side,
+            line=market.line,
+            selected_decimal_price=market.selected_decimal_price,
+            opposing_decimal_price=market.opposing_decimal_price,
+        )
+
+
+def build_semantic_market_inputs(
+    markets: tuple[MarketInput, ...],
+) -> Mapping[str, SemanticMarketInput]:
+    """Project resolved market inputs into canonical forecast semantics."""
+
+    if not isinstance(markets, tuple) or any(
+        not isinstance(market, MarketInput) for market in markets
+    ):
+        raise TypeError("markets must be a tuple of MarketInput values")
+    projected = {
+        market.market_key: SemanticMarketInput.from_market_input(market)
+        for market in markets
+    }
+    if len(projected) != len(markets):
+        raise ValueError("markets must have unique market_key values")
+    return MappingProxyType(
+        {key: projected[key] for key in sorted(projected)}
+    )
+
+
+def _freeze_market_inputs(
+    value: object,
+    markets: Mapping[str, MarketEvaluation],
+) -> Mapping[str, SemanticMarketInput]:
+    if not isinstance(value, Mapping):
+        raise TypeError("market_inputs must be a mapping")
+    copied = dict(value)
+    if set(copied) != set(markets):
+        raise ValueError("market_inputs keys must exactly match markets")
+    for market_key, market in copied.items():
+        if not isinstance(market, SemanticMarketInput):
+            raise TypeError(
+                "market_inputs must contain SemanticMarketInput values"
+            )
+        if market.market_key != market_key:
+            raise ValueError("market_inputs key and market_key must match")
+    return MappingProxyType(
+        {key: copied[key] for key in sorted(copied)}
+    )
+
+
 def _resolve_market_side(
     market: MarketInput,
     away_team: str,
@@ -222,6 +324,7 @@ class ForecastOutput:
     component_diagnostics: Mapping[str, object]
     component_distributions: Mapping[str, ComponentDistribution]
     intervals: Mapping[str, DistributionSummary]
+    market_inputs: Mapping[str, SemanticMarketInput]
     markets: Mapping[str, MarketEvaluation]
 
     def __post_init__(self) -> None:
@@ -255,10 +358,12 @@ class ForecastOutput:
         )
         intervals = _freeze_intervals(self.intervals, distributions)
         markets = _freeze_markets(self.markets)
+        market_inputs = _freeze_market_inputs(self.market_inputs, markets)
         object.__setattr__(self, "simulation_config", config)
         object.__setattr__(self, "component_diagnostics", diagnostics)
         object.__setattr__(self, "component_distributions", distributions)
         object.__setattr__(self, "intervals", intervals)
+        object.__setattr__(self, "market_inputs", market_inputs)
         object.__setattr__(self, "markets", markets)
 
     @property
@@ -328,6 +433,7 @@ def run_forecast(
         market.market_key: evaluate_market(simulation, market)
         for market in resolved_game.markets
     }
+    market_inputs = build_semantic_market_inputs(resolved_game.markets)
     component_diagnostics = {
         "away_pitcher_chain": away_pitcher_chain,
         "home_pitcher_chain": home_pitcher_chain,
@@ -349,8 +455,15 @@ def run_forecast(
         component_diagnostics=component_diagnostics,
         component_distributions=component_distributions,
         intervals=intervals,
+        market_inputs=market_inputs,
         markets=markets,
     )
 
 
-__all__ = ("ForecastOutput", "resolve_forecast_input", "run_forecast")
+__all__ = (
+    "ForecastOutput",
+    "SemanticMarketInput",
+    "build_semantic_market_inputs",
+    "resolve_forecast_input",
+    "run_forecast",
+)

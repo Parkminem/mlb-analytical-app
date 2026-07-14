@@ -403,6 +403,81 @@ class ForecastEngineTests(unittest.TestCase):
         )
         self.assertEqual(output.config_version, _fast_config().version)
 
+    def test_output_preserves_canonical_resolved_semantic_market_inputs(self):
+        team_market = _market("z:side", MarketType.ML, "SEA", None)
+        total_market = _market(
+            "a:total",
+            MarketType.FULL_TOTAL,
+            "under",
+            8.5,
+        )
+
+        output = run_forecast(
+            _complete_game(markets=(team_market, total_market)),
+            _fast_config(),
+        )
+        market_inputs = getattr(output, "market_inputs", None)
+
+        self.assertIsNotNone(
+            market_inputs,
+            "ForecastOutput must preserve semantic market inputs",
+        )
+        self.assertEqual(tuple(market_inputs), ("a:total", "z:side"))
+        self.assertEqual(tuple(market_inputs), tuple(output.markets))
+        self.assertEqual(market_inputs["z:side"].market_key, "z:side")
+        self.assertEqual(market_inputs["z:side"].selected_side, "away")
+        self.assertEqual(market_inputs["z:side"].market_type, MarketType.ML)
+        self.assertFalse(hasattr(market_inputs["z:side"], "provenance"))
+        payload = json.loads(canonical_json(output))
+        self.assertEqual(
+            set(payload["market_inputs"]["z:side"]),
+            {
+                "line",
+                "market_key",
+                "market_type",
+                "opposing_decimal_price",
+                "selected_decimal_price",
+                "selected_side",
+                "settlement_format",
+            },
+        )
+
+    def test_market_inputs_are_defensively_frozen(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        market_inputs = getattr(output, "market_inputs", None)
+        self.assertIsNotNone(
+            market_inputs,
+            "ForecastOutput must preserve semantic market inputs",
+        )
+        supplied = dict(market_inputs)
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        values["market_inputs"] = supplied
+
+        reconstructed = ForecastOutput(**values)
+        removed_key = next(iter(supplied))
+        supplied.pop(removed_key)
+
+        self.assertIn(removed_key, reconstructed.market_inputs)
+        with self.assertRaises(TypeError):
+            reconstructed.market_inputs["new"] = next(
+                iter(reconstructed.market_inputs.values())
+            )
+
+    def test_market_input_keys_must_exactly_match_evaluated_markets(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        market_inputs = getattr(output, "market_inputs", None)
+        self.assertIsNotNone(
+            market_inputs,
+            "ForecastOutput must preserve semantic market inputs",
+        )
+        values = {field.name: getattr(output, field.name) for field in fields(output)}
+        mismatched = dict(market_inputs)
+        mismatched.pop(next(iter(mismatched)))
+        values["market_inputs"] = mismatched
+
+        with self.assertRaisesRegex(ValueError, "market_inputs.*markets"):
+            ForecastOutput(**values)
+
     def test_capture_availability_does_not_change_forecast_output(self):
         known_game = _complete_game()
         unknown = FeatureProvenance(

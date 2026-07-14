@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 import hashlib
+import inspect
 from pathlib import Path
 import tempfile
 import unittest
@@ -160,7 +161,7 @@ class ShadowComparisonTests(unittest.TestCase):
     def test_shadow_types_are_frozen(self) -> None:
         review_binding = binding()
         legacy = legacy_snapshot()
-        comparison = compare_shadow_forecast(legacy, self.forecast, self.game)
+        comparison = compare_shadow_forecast(legacy, self.forecast)
 
         with self.assertRaises(FrozenInstanceError):
             review_binding.market_key = "other"
@@ -239,7 +240,7 @@ class ShadowComparisonTests(unittest.TestCase):
             ),
         )
 
-        comparison = compare_shadow_forecast(legacy, self.forecast, self.game)
+        comparison = compare_shadow_forecast(legacy, self.forecast)
 
         self.assertEqual(comparison.authority, "legacy")
         self.assertIs(comparison.legacy, legacy)
@@ -266,7 +267,6 @@ class ShadowComparisonTests(unittest.TestCase):
         comparison = compare_shadow_forecast(
             legacy,
             low_probability_forecast,
-            self.game,
         )
 
         self.assertIs(comparison.legacy.candidates[0], legacy_candidate)
@@ -279,7 +279,6 @@ class ShadowComparisonTests(unittest.TestCase):
         comparison = compare_shadow_forecast(
             legacy_snapshot(),
             self.forecast,
-            self.game,
         )
         market = comparison.market_comparisons[0]
         expected = self.forecast.markets["sea_ml"]
@@ -302,7 +301,6 @@ class ShadowComparisonTests(unittest.TestCase):
         comparison = compare_shadow_forecast(
             legacy_snapshot(review_bindings=()),
             self.forecast,
-            self.game,
         )
 
         self.assertEqual(len(comparison.market_comparisons), 1)
@@ -333,7 +331,6 @@ class ShadowComparisonTests(unittest.TestCase):
         market = compare_shadow_forecast(
             legacy,
             self.forecast,
-            self.game,
         ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
@@ -358,7 +355,6 @@ class ShadowComparisonTests(unittest.TestCase):
         market = compare_shadow_forecast(
             legacy,
             self.forecast,
-            self.game,
         ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
@@ -388,7 +384,6 @@ class ShadowComparisonTests(unittest.TestCase):
         market = compare_shadow_forecast(
             legacy,
             self.forecast,
-            self.game,
         ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
@@ -442,7 +437,6 @@ class ShadowComparisonTests(unittest.TestCase):
         valid = compare_shadow_forecast(
             legacy_snapshot(),
             self.forecast,
-            self.game,
         )
 
         with self.assertRaisesRegex(ValueError, "authority.*legacy"):
@@ -453,9 +447,15 @@ class ShadowComparisonTests(unittest.TestCase):
                 market_comparisons=valid.market_comparisons,
             )
 
-    def test_comparison_requires_game_input_for_canonical_market_validation(self) -> None:
-        with self.assertRaisesRegex(TypeError, "game_input"):
-            compare_shadow_forecast(legacy_snapshot(), self.forecast)
+    def test_comparison_has_fixed_two_argument_public_interface(self) -> None:
+        self.assertEqual(
+            tuple(inspect.signature(compare_shadow_forecast).parameters),
+            ("legacy", "forecast"),
+        )
+
+        comparison = compare_shadow_forecast(legacy_snapshot(), self.forecast)
+
+        self.assertEqual(comparison.forecast_run_id, self.forecast.forecast_run_id)
 
 
 class ShadowRecordingTests(unittest.TestCase):
@@ -598,6 +598,11 @@ class ShadowRecordingTests(unittest.TestCase):
         )
         self.assertIn("away_full_runs", outputs["component_distributions"])
         self.assertIn("sea_ml", outputs["markets"])
+        self.assertEqual(outputs["market_inputs"]["sea_ml"]["market_type"], "ml")
+        self.assertEqual(
+            outputs["market_inputs"]["sea_ml"]["selected_side"],
+            "away",
+        )
         self.assertNotIn("shadow_comparison", result.capture.payload)
         self.assertNotIn("legacy", result.capture.payload)
 
@@ -645,6 +650,26 @@ class ShadowRecordingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "forecast_run_id.*game_input"):
             self.record(forecast=other_forecast)
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
+    def test_forecast_with_mismatched_semantic_markets_is_rejected_before_append(
+        self,
+    ) -> None:
+        market_inputs = dict(self.forecast.market_inputs)
+        market_inputs["sea_ml"] = replace(
+            market_inputs["sea_ml"],
+            selected_decimal_price=(
+                market_inputs["sea_ml"].selected_decimal_price + 0.01
+            ),
+        )
+        mismatched_forecast = replace(
+            self.forecast,
+            market_inputs=market_inputs,
+        )
+
+        with self.assertRaisesRegex(ValueError, "market_inputs.*game_input"):
+            self.record(forecast=mismatched_forecast)
 
         self.assertEqual(tuple(self.store.iter_records()), ())
 

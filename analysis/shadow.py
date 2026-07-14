@@ -7,14 +7,19 @@ import json
 import math
 import re
 
-from analysis.forecasting.engine import ForecastOutput, resolve_forecast_input
+from analysis.forecasting.engine import (
+    ForecastOutput,
+    SemanticMarketInput,
+    build_semantic_market_inputs,
+    resolve_forecast_input,
+)
 from analysis.forecasting.identity import (
     build_forecast_run_id,
     canonical_json,
     capture_payload,
     normalized_input_hash,
 )
-from analysis.forecasting.inputs import MarketInput, NormalizedGameInput
+from analysis.forecasting.inputs import NormalizedGameInput
 from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
     CaptureCommand,
@@ -347,7 +352,7 @@ def _comparison_for_candidate(
     candidate: PriorityMarketCandidate,
     binding: CandidateReviewBinding | None,
     forecast: ForecastOutput,
-    market_inputs: Mapping[str, MarketInput] | None,
+    market_inputs: Mapping[str, SemanticMarketInput],
 ) -> ShadowMarketComparison:
     flags: set[str] = set()
     if binding is None:
@@ -361,12 +366,8 @@ def _comparison_for_candidate(
         if binding.legacy_market != candidate.market:
             flags.add("candidate_market_mismatch")
         market_evaluation = forecast.markets.get(market_key)
-        market_input = (
-            None if market_inputs is None else market_inputs.get(market_key)
-        )
-        if market_evaluation is None or (
-            market_inputs is not None and market_input is None
-        ):
+        market_input = market_inputs.get(market_key)
+        if market_evaluation is None or market_input is None:
             flags.add("unknown_market_key")
         if not _paths_have_valid_count_and_identity(principal_paths):
             flags.add("invalid_path_count")
@@ -427,7 +428,6 @@ def _comparison_for_candidate(
 def compare_shadow_forecast(
     legacy: LegacyDecisionSnapshot,
     forecast: ForecastOutput,
-    game_input: NormalizedGameInput,
 ) -> ShadowComparison:
     """Copy forecast metrics beside legacy decisions without changing authority."""
 
@@ -435,22 +435,6 @@ def compare_shadow_forecast(
         raise TypeError("legacy must be LegacyDecisionSnapshot")
     if not isinstance(forecast, ForecastOutput):
         raise TypeError("forecast must be ForecastOutput")
-    if not isinstance(game_input, NormalizedGameInput):
-        raise TypeError("game_input must be NormalizedGameInput")
-    resolved_game = resolve_forecast_input(game_input)
-    expected_forecast_run_id = build_forecast_run_id(
-        resolved_game,
-        forecast.model_version,
-        forecast.simulation_config,
-    )
-    if forecast.forecast_run_id != expected_forecast_run_id:
-        raise ValueError(
-            "forecast_run_id does not match canonical game_input, "
-            "model_version, and simulation_config"
-        )
-    market_inputs = {
-        market.market_key: market for market in resolved_game.markets
-    }
     bindings_by_index = {
         binding.legacy_candidate_index: binding
         for binding in legacy.review_bindings
@@ -461,7 +445,7 @@ def compare_shadow_forecast(
             candidate,
             bindings_by_index.get(index),
             forecast,
-            market_inputs,
+            forecast.market_inputs,
         )
         for index, candidate in enumerate(legacy.candidates)
     )
@@ -610,8 +594,25 @@ def record_shadow_run(
             "idempotency_keys must be ShadowRunIdempotencyKeys"
         )
     validation = validate_pregame_input(game_input)
-    comparison = compare_shadow_forecast(legacy, forecast, game_input)
     resolved_game = resolve_forecast_input(game_input)
+    expected_forecast_run_id = build_forecast_run_id(
+        resolved_game,
+        forecast.model_version,
+        forecast.simulation_config,
+    )
+    if forecast.forecast_run_id != expected_forecast_run_id:
+        raise ValueError(
+            "forecast_run_id does not match canonical game_input, "
+            "model_version, and simulation_config"
+        )
+    expected_market_inputs = build_semantic_market_inputs(
+        resolved_game.markets
+    )
+    if forecast.market_inputs != expected_market_inputs:
+        raise ValueError(
+            "forecast market_inputs do not match canonical game_input markets"
+        )
+    comparison = compare_shadow_forecast(legacy, forecast)
     input_hash = normalized_input_hash(resolved_game)
     capture_command = CaptureCommand(
         game_pk=game_input.identity.game_pk,
