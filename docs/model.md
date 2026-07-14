@@ -49,6 +49,25 @@ Keep these output concepts separate:
 
 Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
 
+### Forecast Feature Ownership and Double-Count Protection
+
+The shadow offense forecast keeps the matchup-neutral offense base separate from the pitcher-specific pitch/velocity matchup:
+
+- `projected_runs_per_9` is the matchup-neutral offense base and already owns recent-form and run-production information. `forecast_offense` derives `base_offense_multiplier` by dividing it by `league_runs_per_team_game` and clipping to the configured offense bounds.
+- Pitcher-specific pitch/velocity response is not pre-applied to that base. `forecast_offense` weights each lineup slot's selected response by opposing-pitcher usage and batting-order plate-appearance share, then stores the resulting clipped `matchup_multiplier` separately for that pitcher.
+- Simulation applies the base offense multiplier, the applicable pitcher/segment matchup multiplier, and the run-prevention multiplier once when forming the half-inning run mean. It does not add a second offense total.
+- Do not preblend a pitcher matchup into `projected_runs_per_9`, and do not multiply `recent_form_index` or another raw recent-form/run-production field into the forecast later. The implementation has no second recent-form multiplier.
+
+### Pregame Principal-Path Binding
+
+Before first pitch and before recording the capture, freeze the review contract for every recommended market:
+
+- Freeze its `market_key` and exact legacy candidate identity. The current contract uses `legacy_candidate_index` plus `legacy_market`, pointing into the immutable `LegacyDecisionSnapshot` that also preserves the candidate score, `play`/`lean`/`pass` rating, evidence paths, and final priority.
+- Freeze two to four unique canonical principal evidence paths. For each path, freeze its exact component IDs and its applicable deterministic contradiction-rule binding.
+- Freeze the `ComponentDistribution` for every referenced component ID, including its `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95` summary. These values fix the central 80% (`p10`-`p90`) and central 90% (`p05`-`p95`) predictive intervals. Every bound ID must exist in that forecast's component distributions.
+
+Postgame review may consume only these frozen bindings and intervals; it cannot invent, replace, or revise a path, component ID, rule, or interval after the outcome is known. A missing binding, candidate/market mismatch, unknown `market_key`, invalid path count or shape, or missing component distribution makes that market review-ineligible. Record the ineligibility reason rather than inferring a replacement review path.
+
 ## 1. Data Integrity
 
 This layer determines whether the analysis inputs are reliable. It changes confidence, not team strength.
@@ -525,7 +544,7 @@ Final priority rules:
 - For ML and `+1.5`, both high-leverage availability and actual late-inning quality must protect the edge. If either fails, cap the full-game side at `71`; rested arms are not automatically good arms.
 - If an over relies on a lineup with at least five `마이너스` slots and zero `중립` slots, require an independent lower-order or walk path, or a verified bullpen-over path. Without one, cap the over at `69`.
 - Acceptable same-game combinations include side plus O/U and `+1.5` plus O/U.
-- In the summary table, do not show both ML and `+1.5` as active side-family recommendations for the same game. If both qualify, choose the higher-probability or higher-scoring side-family market and leave the other as `pass` or review-only.
+- In the summary table, do not show both ML and `+1.5` as active side-family recommendations for the same game. Apply each exact legacy candidate's admission decision, then pass the admitted `PriorityMarketCandidate` values through the legacy same-game assembler. Display the assembler-retained side-family candidate; if both survive as independent candidates but only one display slot is allowed, use the higher legacy `0-100` priority score. An exact-score tie uses the assembler's fixed order: `f5_side`, `f5_total`, `full_total`, `ml`, then `plus_1_5`, so ML precedes `+1.5`. Shadow probability, fair price, no-vig probability, or shadow edge cannot choose or break a tie for the displayed side-family market.
 - Avoid listing both ML and `+1.5` for the same team as separate priority entries unless the user explicitly asks for market alternatives, because that duplicates the same side edge.
 - Keep every same-game combination directionally coherent and state why both markets can coexist.
 - Same-game side plus over requires explicit validation that the side can win or cover while the opponent still contributes enough scoring, or that late bullpen exposure can lift the total without breaking the side.
@@ -533,6 +552,8 @@ Final priority rules:
 ## Objective Postgame Review
 
 Review the official result against the frozen pregame component forecasts and the two to four principal evidence paths recorded for each recommended market. Central 80% and 90% predictive intervals are fixed before the game. Apply classes in strict precedence order `D > C > A/B`:
+
+An official-result correction is a new immutable result revision with a new `source_revision` and `supersedes_record_id` pointing to the latest result record. Never edit the earlier result. Review and calibration use the latest non-superseded official result; review rejects a superseded revision as its selected result.
 
 - `A`: the ticket wins, no principal path is contradicted, and at least 75% of principal component observations are inside their central 80% intervals.
 - `B`: no principal path is contradicted and at least 60% of principal component observations are inside their central 80% intervals, but the result does not qualify for `A`. A loss or push can therefore be `B`.

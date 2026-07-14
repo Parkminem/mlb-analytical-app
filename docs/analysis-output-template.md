@@ -10,7 +10,7 @@ Use this structure for daily MLB analysis. Keep the summary concise, then suppor
 
 Use decimal odds when prices are available.
 
-In the summary table, show only one side-family market per game. If ML and `+1.5` both qualify, choose the higher-probability or higher-scoring option and mark the other side-family column as `pass` or `review only`. Explain the rejected side-family alternative in the written review when useful.
+In the summary table, show only one side-family market per game. Apply legacy admission to the exact ML and `+1.5` candidates, then use the legacy same-game assembler. Display its retained side-family candidate; if both independent candidates survive but only one display slot is allowed, use the higher legacy `0-100` priority score. For an exact-score tie, the assembler's fixed order places `ml` before `plus_1_5`. Mark the other side-family column as `pass` or `review only` and explain it when useful. Shadow probability, fair price, no-vig probability, and shadow edge cannot choose or break a tie for the displayed side-family market.
 
 The final priority stack may include more than one market from the same game when the edges are independently validated, such as ML plus O/U or `+1.5` plus O/U. Do not duplicate the same side edge by listing both ML and `+1.5` unless the user asks for alternatives.
 
@@ -21,6 +21,17 @@ Before building the final priority stack, remove every market whose own decision
 Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is a legacy rank score, **not a probability**, and is not a separate baseball input. It must not double count evidence.
 
 When a same-game side or handicap plus O/U combination is listed, explain the independent total path. Do not list the total only because the side was strong.
+
+## Pregame Principal-Path Binding
+
+Before first pitch and before recording the capture, freeze the review contract for every recommended market:
+
+- Record the `market_key` and exact legacy candidate identity: the current contract uses `legacy_candidate_index` plus `legacy_market`, with the candidate's score and `play`/`lean`/`pass` rating and the final priority preserved in the snapshot.
+- Record two to four unique canonical principal evidence paths.
+- Bind every path to exact component IDs and its exact deterministic contradiction rule.
+- Freeze each bound `ComponentDistribution`, including `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95`; these fix the central 80% and 90% predictive intervals.
+
+Postgame review cannot invent or change these paths, IDs, rules, or intervals. A missing/invalid binding, candidate/market mismatch, unknown market, invalid path count or shape, or missing component distribution makes that market review-ineligible; state the reason and do not infer a substitute. See [Pregame Principal-Path Binding](model.md#pregame-principal-path-binding) for the authoritative contract.
 
 ## Game Review
 
@@ -61,6 +72,7 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 
 **Recent form and starter stability**
 
+- For shadow forecasting, keep `projected_runs_per_9` matchup-neutral; it already owns recent-form and run-production information. Keep pitcher-specific pitch/velocity response in the separate matchup multiplier, and do not apply recent form again later.
 - Compare seven-day lineup form, power, walk pressure, strikeout rate, and run efficiency.
 - State whether pitch-velocity `플러스` volume is being converted into runs or only creating unused traffic.
 - If pitch-velocity `플러스` volume is high but the lineup's recent strikeout rate is high against an unfamiliar or unusual-profile starter, state whether that caps F5/ML strength.
@@ -88,7 +100,7 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 - Explain why F5 and ML may differ.
 - Explain why F5 O/U and full-game O/U may differ. Full-game bullpen risk is not an F5-total input unless a verified opener/bulk arm works inside the first five innings.
 - If the edge is F5-only, state whether bullpen and late path are strong enough to keep ML. If not, avoid duplicating ML into the final priority.
-- Explain why `+1.5` is playable or blocked, but if ML and `+1.5` both qualify, choose one side-family market for the table and final direction.
+- Explain why `+1.5` is playable or blocked. When ML and `+1.5` both pass legacy admission, use only their exact legacy candidates, legacy `0-100` priority scores, and the legacy same-game assembler to choose the one displayed side-family market. Shadow probability cannot choose a displayed side-family market.
 - Explain why O/U is a play, lean, or pass at the current line.
 - For overs, state whether both teams have an on-base path and lower-order continuity, not just pitch-velocity plus slots.
 - For overs, if both starters can realistically reach the sixth inning, state whether walk/on-base pressure or late-bullpen exposure is strong enough to keep the over live.
@@ -106,6 +118,8 @@ Do not treat a `PRIM` label alone as stable bulk confirmation. State whether exp
 ## Postgame Flow Review
 
 Use the official MLB result and the exact frozen pregame capture-to-forecast link. For every recommended market, compare the observed components with the predeclared principal paths and predictive intervals, then apply the fixed precedence `D > C > A/B`:
+
+Use only the latest non-superseded official result. A correction appends a new immutable revision with a new `source_revision` and `supersedes_record_id`; never edit the old result. Review and calibration select the latest non-superseded revision.
 
 - `A`: win, no contradicted principal path, and at least 75% of principal components inside the central 80% intervals.
 - `B`: no contradicted principal path and at least 60% inside the central 80% intervals, but not `A`; losses and pushes can be `B`.

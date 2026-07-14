@@ -34,6 +34,15 @@ python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 
 Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`/`lean`/`pass`, `0-100` 순위 점수, 최종 우선순위를 변경하거나 재정렬하거나 상향/하향할 수 없습니다. `0-100`은 확률이 아닌 legacy rank score입니다. 최소 100개의 확정 라인업 경기 전에는 production 의사결정에 영향을 줄 수 없고, 가능하면 시장군별 300개 decision 전에는 튜닝하지 않습니다. Production 우선권, 규칙 삭제, 가중치 변경은 별도 승인된 새 모델 버전과 설계가 필요합니다.
 
+## Local Shadow Ledger
+
+- 운영자는 설정 가능한 로컬 디렉터리를 선택하고 그 안의 JSONL 파일 경로를 `LedgerStore`에 전달합니다. 예: `data/ledger/shadow.jsonl`. `data/ledger/`는 Git에서 제외되며 커밋하지 않는 private local runtime state입니다.
+- Ledger는 append-only JSONL이 유일한 authoritative state입니다. 각 record envelope에 `record_kind`, idempotency key, canonical payload hash가 영구 기록되고, `LedgerStore`는 로그를 읽어 durable idempotency index를 재구성합니다.
+- 일반적인 shadow 기록의 public application API는 `analysis.shadow.record_shadow_run`입니다. 이 API는 capture, deterministic forecast, capture-to-forecast link를 append하거나 replay하며 별도 CLI를 제공하지 않습니다.
+- 같은 record kind와 같은 caller-supplied idempotency key에 같은 canonical payload를 다시 보내면 기존 record를 반환합니다. 같은 key에 바뀐 payload를 보내면 idempotency conflict입니다. 같은 semantic state라도 새 key를 사용하면 새 capture가 append될 수 있고 deterministic forecast는 재사용될 수 있습니다. 실제 상태 변화에는 새 key를 사용하며, 이전 capture를 대체하는 경우 supersession 관계와 새 capture-to-forecast link를 함께 기록합니다.
+- `record_shadow_run`은 capture supersession 인자를 받지 않습니다. 이전 capture를 명시적으로 대체해야 하면 lower-level `LedgerStore.append_capture`에 `CaptureCommand.supersedes_capture_id`를 설정하고 forecast/link API로 lineage를 완성합니다. 기존 record를 수정하지 않습니다.
+- 공식 결과 정정은 새 `source_revision`과 최신 결과를 가리키는 `supersedes_record_id`로 새 immutable result를 append합니다. 이전 결과는 변경하지 않으며 review와 calibration은 최신 non-superseded official result만 사용합니다.
+
 ## Documentation
 
 - 분석 출력 형식: `docs/analysis-output-template.md`

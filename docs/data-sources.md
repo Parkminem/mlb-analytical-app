@@ -41,6 +41,10 @@ Every normalized value must bind its `FeatureProvenance.observation_ids` to matc
 - Store reproducible source notes and timestamps in analysis reports when needed.
 - When sources conflict, preserve the conflict as a confidence flag unless opener/bulk structure explains it.
 
+## Official Result Corrections
+
+Treat a corrected MLB result as a new immutable official-result revision. Append it with a new `source_revision` and a `supersedes_record_id` that points to the latest result record; never edit or delete the old result. Objective review and calibration select the latest non-superseded official result for the game, and a superseded revision is not eligible to drive either output.
+
 ## Cache Policy
 
 | Source | Cache Policy | Reason |
