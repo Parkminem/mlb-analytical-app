@@ -493,6 +493,9 @@ class CalibrationContractTests(unittest.TestCase):
     def test_calibration_row_derives_push_capability_from_settlement_terms(self):
         cases = (
             ("f5_side", "two_way", 0.0, True),
+            ("f5_side", "two_way", -1.0, True),
+            ("f5_side", "two_way", 0.5, False),
+            ("f5_side", "two_way", -0.5, False),
             ("f5_side", "three_way", 0.0, False),
             ("f5_total", "two_way", 8.0, True),
             ("f5_total", "two_way", 8.5, False),
@@ -569,6 +572,20 @@ class CalibrationContractTests(unittest.TestCase):
                 "market_type": "f5_side",
                 "settlement_format": "three_way",
                 "line": 0.0,
+                "market_result": "push",
+            },
+            {
+                "market_type": "f5_side",
+                "settlement_format": "two_way",
+                "line": 0.5,
+                "p_win": 0.5,
+                "p_push": 0.1,
+                "p_loss": 0.4,
+            },
+            {
+                "market_type": "f5_side",
+                "settlement_format": "two_way",
+                "line": -0.5,
                 "market_result": "push",
             },
         )
@@ -955,6 +972,15 @@ class CalibrationMetricTests(unittest.TestCase):
                 p_win=0.9,
                 p_push=0.0,
                 p_loss=0.1,
+                market_result="win",
+            ),
+            calibration_row(
+                forecast_run_id="half-run-f5-side",
+                market_type="f5_side",
+                line=0.5,
+                p_win=0.8,
+                p_push=0.0,
+                p_loss=0.2,
                 market_result="win",
             ),
         )

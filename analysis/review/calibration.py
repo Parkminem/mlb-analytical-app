@@ -111,7 +111,11 @@ def _push_capable_market(
     line: float | None,
 ) -> bool:
     if market_type == "f5_side":
-        return settlement_format == "two_way"
+        return (
+            settlement_format == "two_way"
+            and line is not None
+            and line.is_integer()
+        )
     if market_type in _TOTAL_MARKET_TYPES:
         return line is not None and line.is_integer()
     return False
