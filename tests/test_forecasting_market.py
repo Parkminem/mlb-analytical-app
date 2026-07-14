@@ -1,6 +1,7 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timezone
 import math
+import sys
 from types import MappingProxyType
 import unittest
 
@@ -176,6 +177,29 @@ class OutcomeProbabilityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     OutcomeProbabilities(win=invalid, push=0.0, loss=1.0)
 
+    def test_exact_one_endpoint_rejects_any_nonzero_residual_mass(self):
+        impossible = (
+            {"win": 1.0, "push": 1e-20, "loss": 0.0},
+            {"win": 1.0, "push": 0.0, "loss": 1e-20},
+            {"win": 1e-20, "push": 1.0, "loss": 0.0},
+            {"win": 0.0, "push": 1.0, "loss": 1e-20},
+            {"win": 1e-20, "push": 0.0, "loss": 1.0},
+            {"win": 0.0, "push": 1e-20, "loss": 1.0},
+        )
+
+        for probabilities in impossible:
+            with self.subTest(probabilities=probabilities):
+                with self.assertRaisesRegex(ValueError, "exact-one"):
+                    OutcomeProbabilities(**probabilities)
+
+    def test_sum_canonicalization_cannot_create_an_impossible_endpoint(self):
+        with self.assertRaisesRegex(ValueError, "exact-one"):
+            OutcomeProbabilities(
+                win=1e-20,
+                push=0.9999999999995,
+                loss=0.0,
+            )
+
 
 @unittest.skipUnless(MARKET_API_AVAILABLE, "forecasting market API is missing")
 class MarketPricingTests(unittest.TestCase):
@@ -235,6 +259,104 @@ class MarketPricingTests(unittest.TestCase):
                 expected_value=0.1,
             )
 
+    def test_market_evaluation_price_context_is_canonical_and_reconstructible(self):
+        result = price_market(
+            OutcomeProbabilities(win=0.5, push=0.1, loss=0.4),
+            selected_price=2,
+            opposing_price=1.9,
+        )
+        field_names = {field.name for field in fields(result)}
+
+        self.assertIn("selected_decimal_price", field_names)
+        self.assertIn("opposing_decimal_price", field_names)
+        self.assertIsInstance(result.selected_decimal_price, float)
+        self.assertIsInstance(result.opposing_decimal_price, float)
+        reconstructed = MarketEvaluation(
+            **{field.name: getattr(result, field.name) for field in fields(result)}
+        )
+        self.assertEqual(reconstructed, result)
+        self.assertEqual(canonical_json(reconstructed), canonical_json(result))
+
+    def test_direct_constructor_rejects_forged_pricing_fields(self):
+        result = price_market(
+            OutcomeProbabilities(win=0.5, push=0.1, loss=0.4),
+            selected_price=2.0,
+            opposing_price=1.9,
+        )
+        baseline = {
+            field.name: getattr(result, field.name) for field in fields(result)
+        }
+        forged_values = {
+            "selected_decimal_price": 2.1,
+            "opposing_decimal_price": 2.1,
+            "model_conditional_win_probability": 0.6,
+            "fair_decimal_price": 2.1,
+            "market_no_vig_probability": 0.4,
+            "edge": 0.2,
+            "expected_value": 0.2,
+        }
+
+        for field_name, forged_value in forged_values.items():
+            values = dict(baseline)
+            values[field_name] = forged_value
+            with self.subTest(field_name=field_name):
+                try:
+                    MarketEvaluation(**values)
+                except ValueError as error:
+                    self.assertIn(field_name, str(error))
+                except TypeError as error:
+                    self.fail(f"primitive pricing context is missing: {error}")
+                else:
+                    self.fail(f"forged {field_name} was accepted")
+
+    def test_direct_constructor_enforces_all_push_degenerates(self):
+        result = price_market(
+            OutcomeProbabilities(win=0.0, push=1.0, loss=0.0),
+            selected_price=2.0,
+            opposing_price=2.0,
+        )
+        baseline = {
+            field.name: getattr(result, field.name) for field in fields(result)
+        }
+        forged_values = {
+            "model_conditional_win_probability": 0.1,
+            "fair_decimal_price": 1.0,
+            "market_no_vig_probability": 0.4,
+            "edge": 0.1,
+            "expected_value": 0.1,
+        }
+
+        for field_name, forged_value in forged_values.items():
+            values = dict(baseline)
+            values[field_name] = forged_value
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(ValueError, field_name):
+                    MarketEvaluation(**values)
+
+    def test_unevaluated_market_rejects_primitive_pricing_context(self):
+        result = evaluate_market(
+            _scores([(3, 2, 5, 4)]),
+            _market(
+                MarketType.F5_SIDE,
+                "away",
+                line=0.0,
+                settlement_format=SettlementFormat.THREE_WAY,
+            ),
+        )
+        values = {
+            field.name: getattr(result, field.name) for field in fields(result)
+        }
+        values["selected_decimal_price"] = 1.91
+
+        try:
+            MarketEvaluation(**values)
+        except ValueError as error:
+            self.assertIn("selected_decimal_price", str(error))
+        except TypeError as error:
+            self.fail(f"primitive pricing context is missing: {error}")
+        else:
+            self.fail("unevaluated market accepted primitive pricing context")
+
     def test_missing_entry_price_keeps_probability_and_flow_review(self):
         probabilities = OutcomeProbabilities(win=0.55, push=0.0, loss=0.45)
 
@@ -286,6 +408,30 @@ class MarketPricingTests(unittest.TestCase):
         self.assertIsNone(result.fair_decimal_price)
         self.assertAlmostEqual(result.edge, -0.5)
         self.assertEqual(result.expected_value, -0.8)
+
+    def test_subnormal_win_caps_fair_price_at_max_finite_float(self):
+        probabilities = OutcomeProbabilities(
+            win=math.ulp(0.0),
+            push=0.5,
+            loss=0.5,
+        )
+
+        try:
+            result = price_market(
+                probabilities,
+                selected_price=2.0,
+                opposing_price=2.0,
+            )
+        except ValueError as error:
+            self.fail(f"subnormal fair-price overflow was rejected: {error}")
+
+        self.assertEqual(result.fair_decimal_price, sys.float_info.max)
+        self.assertEqual(
+            result.expected_value,
+            probabilities.win * (2.0 - 1.0) - probabilities.loss,
+        )
+        self.assertTrue(math.isfinite(result.fair_decimal_price))
+        canonical_json(result)
 
     def test_missing_opposing_price_keeps_model_price_and_ev_only(self):
         result = price_market(

@@ -233,6 +233,54 @@ class ForecastEngineTests(unittest.TestCase):
             game.away_pitching.pitchers,
         )
 
+    def test_team_coded_side_markets_resolve_to_canonical_sides(self):
+        market_shapes = (
+            (MarketType.F5_SIDE, 0.0),
+            (MarketType.ML, None),
+            (MarketType.PLUS_1_5, 1.5),
+        )
+        team_sides = (("SEA", "away"), ("MIN", "home"))
+
+        for market_type, line in market_shapes:
+            for team_id, canonical_side in team_sides:
+                market = _market(
+                    f"team:{market_type.value}:{team_id}",
+                    market_type,
+                    team_id,
+                    line,
+                )
+                game = _complete_game(markets=(market,))
+                with self.subTest(market_type=market_type, team_id=team_id):
+                    with patch.object(
+                        forecast_engine_module,
+                        "evaluate_market",
+                        wraps=forecast_engine_module.evaluate_market,
+                    ) as evaluate:
+                        try:
+                            output = run_forecast(game, _fast_config())
+                        except ValueError as error:
+                            self.fail(f"team-coded side was not resolved: {error}")
+
+                    resolved = evaluate.call_args.args[1]
+                    self.assertEqual(resolved.selected_side, canonical_side)
+                    self.assertEqual(resolved.market_key, market.market_key)
+                    self.assertIs(resolved.provenance, market.provenance)
+                    self.assertIn(market.market_key, output.markets)
+
+    def test_unknown_team_side_is_rejected_before_simulation(self):
+        market = _market("team:ml:unknown", MarketType.ML, "OAK", None)
+        game = _complete_game(markets=(market,))
+
+        with patch.object(
+            forecast_engine_module,
+            "simulate_game_distribution",
+            wraps=forecast_engine_module.simulate_game_distribution,
+        ) as simulate:
+            with self.assertRaisesRegex(ValueError, "away or home team"):
+                run_forecast(game, _fast_config())
+
+        simulate.assert_not_called()
+
     def test_engine_is_reproducible_when_only_captured_at_changes(self):
         first = run_forecast(
             _complete_game(
@@ -281,18 +329,33 @@ class ForecastEngineTests(unittest.TestCase):
         )
         self.assertEqual(output.config_version, _fast_config().version)
 
-    def test_unknown_availability_propagates_validation_result(self):
+    def test_capture_availability_does_not_change_forecast_output(self):
+        known_game = _complete_game()
         unknown = FeatureProvenance(
             observation_ids=("obs:1",),
             latest_available_at=None,
             lookback_end=AVAILABLE_AT,
         )
-        game = replace_all_provenance(_complete_game(), unknown)
+        unknown_game = replace_all_provenance(known_game, unknown)
 
-        output = run_forecast(game, _fast_config())
+        known_output = run_forecast(known_game, _fast_config())
+        unknown_output = run_forecast(unknown_game, _fast_config())
 
-        self.assertFalse(output.out_of_sample_eligible)
-        self.assertEqual(output.validation_flags, ("unknown available_at",))
+        self.assertEqual(unknown_output, known_output)
+        self.assertEqual(
+            canonical_json(unknown_output),
+            canonical_json(known_output),
+        )
+
+    def test_output_excludes_capture_validation_metadata(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        field_names = {field.name for field in fields(output)}
+        payload = json.loads(canonical_json(output))
+
+        for capture_field in ("out_of_sample_eligible", "validation_flags"):
+            with self.subTest(capture_field=capture_field):
+                self.assertNotIn(capture_field, field_names)
+                self.assertNotIn(capture_field, payload)
 
     def test_validation_failure_stops_before_identity_or_component_work(self):
         game = _complete_game()

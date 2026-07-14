@@ -1,14 +1,14 @@
 """Pure orchestration for one deterministic MLB forecast run."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import re
 from types import MappingProxyType
 
 from .bullpen import BullpenForecast, forecast_bullpen
 from .config import SimulationConfig
 from .identity import build_forecast_run_id
-from .inputs import NormalizedGameInput
+from .inputs import MarketInput, MarketType, NormalizedGameInput
 from .market import MarketEvaluation, evaluate_market
 from .offense import OffenseForecast, forecast_offense
 from .simulation import (
@@ -46,6 +46,9 @@ _REQUIRED_COMPONENT_IDS = frozenset(
     f"{side}_{suffix}"
     for side in ("away", "home")
     for suffix in _BASE_COMPONENT_SUFFIXES
+)
+_SIDE_MARKET_TYPES = frozenset(
+    {MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5}
 )
 
 
@@ -168,14 +171,31 @@ def _freeze_markets(value: object) -> Mapping[str, MarketEvaluation]:
     )
 
 
+def _resolve_market_side(
+    market: MarketInput,
+    away_team: str,
+    home_team: str,
+) -> MarketInput:
+    if market.market_type not in _SIDE_MARKET_TYPES:
+        return market
+    if market.selected_side in {"away", "home"}:
+        return market
+    team_sides = {away_team: "away", home_team: "home"}
+    canonical_side = team_sides.get(market.selected_side)
+    if canonical_side is None:
+        raise ValueError(
+            "side market selected_side must be away, home, or match the "
+            "away or home team"
+        )
+    return replace(market, selected_side=canonical_side)
+
+
 @dataclass(frozen=True)
 class ForecastOutput:
     forecast_run_id: str
     config_version: str
     simulation_config: Mapping[str, object]
     simulation_count: int
-    out_of_sample_eligible: bool
-    validation_flags: tuple[str, ...]
     component_diagnostics: Mapping[str, object]
     component_distributions: Mapping[str, ComponentDistribution]
     intervals: Mapping[str, DistributionSummary]
@@ -201,18 +221,6 @@ class ForecastOutput:
             raise ValueError("simulation_count must be a positive integer")
         if config["simulations"] != self.simulation_count:
             raise ValueError("simulation_count must match simulation_config")
-        if not isinstance(self.out_of_sample_eligible, bool):
-            raise ValueError("out_of_sample_eligible must be a boolean")
-        if not isinstance(self.validation_flags, tuple):
-            raise ValueError("validation_flags must be a tuple")
-        for flag in self.validation_flags:
-            _require_nonempty_string(flag, "validation_flags")
-        if len(set(self.validation_flags)) != len(self.validation_flags):
-            raise ValueError("validation_flags must be unique")
-        if self.out_of_sample_eligible == bool(self.validation_flags):
-            raise ValueError(
-                "validation eligibility and flags must describe the same result"
-            )
 
         diagnostics = _freeze_component_diagnostics(
             self.component_diagnostics
@@ -234,10 +242,6 @@ class ForecastOutput:
     def model_version(self) -> str:
         return self.config_version
 
-    @property
-    def flags(self) -> tuple[str, ...]:
-        return self.validation_flags
-
 
 def run_forecast(
     normalized_game: NormalizedGameInput,
@@ -245,7 +249,7 @@ def run_forecast(
 ) -> ForecastOutput:
     """Build one deterministic forecast without external writes."""
 
-    validation = validate_pregame_input(normalized_game)
+    validate_pregame_input(normalized_game)
     if not isinstance(config, SimulationConfig):
         raise TypeError("config must be SimulationConfig")
     try:
@@ -255,6 +259,14 @@ def run_forecast(
     if validated_config != config:
         raise ValueError("config is invalid or noncanonical")
 
+    resolved_markets = tuple(
+        _resolve_market_side(
+            market,
+            normalized_game.identity.away_team,
+            normalized_game.identity.home_team,
+        )
+        for market in normalized_game.markets
+    )
     config_mapping = config.to_mapping()
     forecast_run_id = build_forecast_run_id(
         normalized_game,
@@ -299,7 +311,7 @@ def run_forecast(
     markets = {
         market.market_key: evaluate_market(simulation, market)
         for market in sorted(
-            normalized_game.markets,
+            resolved_markets,
             key=lambda item: item.market_key,
         )
     }
@@ -321,8 +333,6 @@ def run_forecast(
         config_version=config.version,
         simulation_config=config_mapping,
         simulation_count=simulation.simulation_count,
-        out_of_sample_eligible=validation.out_of_sample_eligible,
-        validation_flags=validation.flags,
         component_diagnostics=component_diagnostics,
         component_distributions=component_distributions,
         intervals=intervals,

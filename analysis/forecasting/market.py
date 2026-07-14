@@ -2,16 +2,25 @@
 
 from dataclasses import dataclass
 import math
+import sys
 
 from .inputs import MarketInput, MarketType, SettlementFormat
 from .simulation import SimulatedGame, SimulationResult
 
 
 _PROBABILITY_TOLERANCE = 1e-12
+_MAX_FINITE_DECIMAL_PRICE = sys.float_info.max
 _SIDE_MARKETS = frozenset(
     {MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5}
 )
 _TOTAL_MARKETS = frozenset({MarketType.F5_TOTAL, MarketType.FULL_TOTAL})
+_DERIVED_PRICING_FIELDS = (
+    "model_conditional_win_probability",
+    "fair_decimal_price",
+    "market_no_vig_probability",
+    "edge",
+    "expected_value",
+)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -57,6 +66,82 @@ def _canonical_derived_probability(value: float, field_name: str) -> float:
     raise ValueError(f"{field_name} must be in [0, 1]")
 
 
+def _fair_decimal_price(probabilities: "OutcomeProbabilities") -> float | None:
+    """Return 1 + loss / win, capping binary64 overflow at its finite maximum."""
+
+    if probabilities.win == 0.0:
+        return None
+    fair_decimal_price = 1.0 + probabilities.loss / probabilities.win
+    if not math.isfinite(fair_decimal_price):
+        return _MAX_FINITE_DECIMAL_PRICE
+    return fair_decimal_price
+
+
+def _require_consistent_probability_endpoints(
+    values: dict[str, float],
+) -> None:
+    for endpoint_field, endpoint_value in values.items():
+        if endpoint_value != 1.0:
+            continue
+        if any(
+            value != 0.0
+            for field_name, value in values.items()
+            if field_name != endpoint_field
+        ):
+            raise ValueError(
+                f"{endpoint_field} exact-one endpoint requires all other "
+                "probabilities to be zero"
+            )
+
+
+def _derive_market_pricing(
+    probabilities: "OutcomeProbabilities",
+    selected_decimal_price: float | None,
+    opposing_decimal_price: float | None,
+) -> dict[str, float | None]:
+    all_push = probabilities.push == 1.0
+    if all_push:
+        model_conditional = None
+        fair_decimal_price = None
+    else:
+        model_conditional = _canonical_derived_probability(
+            probabilities.win / (1.0 - probabilities.push),
+            "model_conditional_win_probability",
+        )
+        fair_decimal_price = _fair_decimal_price(probabilities)
+
+    market_no_vig = None
+    if selected_decimal_price is not None and opposing_decimal_price is not None:
+        selected_implied = 1.0 / selected_decimal_price
+        opposing_implied = 1.0 / opposing_decimal_price
+        market_no_vig = _canonical_derived_probability(
+            selected_implied / (selected_implied + opposing_implied),
+            "market_no_vig_probability",
+        )
+
+    edge = (
+        None
+        if model_conditional is None or market_no_vig is None
+        else model_conditional - market_no_vig
+    )
+    if selected_decimal_price is None:
+        expected_value = None
+    elif all_push:
+        expected_value = 0.0
+    else:
+        expected_value = (
+            probabilities.win * (selected_decimal_price - 1.0)
+            - probabilities.loss
+        )
+    return {
+        "model_conditional_win_probability": model_conditional,
+        "fair_decimal_price": fair_decimal_price,
+        "market_no_vig_probability": market_no_vig,
+        "edge": edge,
+        "expected_value": expected_value,
+    }
+
+
 @dataclass(frozen=True)
 class OutcomeProbabilities:
     win: float
@@ -72,6 +157,7 @@ class OutcomeProbabilities:
                     f"{field_name} must be a finite probability in [0, 1]"
                 )
             values[field_name] = float(value)
+        _require_consistent_probability_endpoints(values)
         total = math.fsum(values.values())
         if not math.isclose(
             total,
@@ -87,6 +173,7 @@ class OutcomeProbabilities:
                 for field_name, value in values.items()
                 if field_name != adjusted_field
             )
+        _require_consistent_probability_endpoints(values)
         for field_name, value in values.items():
             object.__setattr__(self, field_name, value)
 
@@ -99,42 +186,43 @@ class MarketEvaluation:
     market_no_vig_probability: float | None
     edge: float | None
     expected_value: float | None
+    selected_decimal_price: float | None = None
+    opposing_decimal_price: float | None = None
     evaluated: bool = True
     reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.evaluated, bool):
             raise ValueError("evaluated must be a boolean")
-        if self.evaluated:
-            if not isinstance(self.probabilities, OutcomeProbabilities):
-                raise ValueError(
-                    "evaluated markets must contain OutcomeProbabilities"
-                )
-            if self.reason is not None:
-                raise ValueError("evaluated markets cannot contain a reason")
-        else:
+        if not self.evaluated:
             _require_nonempty_string(self.reason, "reason")
-            if self.probabilities is not None or any(
-                value is not None
-                for value in (
-                    self.model_conditional_win_probability,
-                    self.fair_decimal_price,
-                    self.market_no_vig_probability,
-                    self.edge,
-                    self.expected_value,
-                )
+            for field_name in (
+                "probabilities",
+                "selected_decimal_price",
+                "opposing_decimal_price",
+                *_DERIVED_PRICING_FIELDS,
             ):
-                raise ValueError(
-                    "unevaluated markets cannot contain probabilities or prices"
-                )
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"unevaluated markets cannot contain {field_name}"
+                    )
+            return
+
+        if not isinstance(self.probabilities, OutcomeProbabilities):
+            raise ValueError("evaluated markets must contain OutcomeProbabilities")
+        if self.reason is not None:
+            raise ValueError("evaluated markets cannot contain a reason")
 
         for field_name in (
-            "model_conditional_win_probability",
-            "fair_decimal_price",
-            "market_no_vig_probability",
-            "edge",
-            "expected_value",
+            "selected_decimal_price",
+            "opposing_decimal_price",
         ):
+            value = getattr(self, field_name)
+            _require_optional_price(value, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, float(value))
+
+        for field_name in _DERIVED_PRICING_FIELDS:
             _require_optional_finite(getattr(self, field_name), field_name)
         for field_name in (
             "model_conditional_win_probability",
@@ -143,15 +231,19 @@ class MarketEvaluation:
             value = getattr(self, field_name)
             if value is not None and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{field_name} must be in [0, 1] when present")
-        if self.fair_decimal_price is not None and self.fair_decimal_price < 1.0:
-            raise ValueError("fair_decimal_price must be at least one when present")
-        if self.edge is not None and not -1.0 <= self.edge <= 1.0:
-            raise ValueError("edge must be in [-1, 1] when present")
-        if self.edge is not None and (
-            self.model_conditional_win_probability is None
-            or self.market_no_vig_probability is None
-        ):
-            raise ValueError("edge requires model and market probabilities")
+
+        expected = _derive_market_pricing(
+            self.probabilities,
+            self.selected_decimal_price,
+            self.opposing_decimal_price,
+        )
+        for field_name, expected_value in expected.items():
+            if getattr(self, field_name) != expected_value:
+                raise ValueError(
+                    f"{field_name} must match probabilities, "
+                    "selected_decimal_price, and opposing_decimal_price"
+                )
+            object.__setattr__(self, field_name, expected_value)
 
 
 def price_market(
@@ -165,52 +257,23 @@ def price_market(
         raise TypeError("probabilities must be OutcomeProbabilities")
     _require_optional_price(selected_price, "selected_price")
     _require_optional_price(opposing_price, "opposing_price")
-
-    all_push = probabilities.push == 1.0
-    if all_push:
-        model_conditional = None
-        fair_decimal_price = None
-    else:
-        model_conditional = _canonical_derived_probability(
-            probabilities.win / (1.0 - probabilities.push),
-            "model_conditional_win_probability",
-        )
-        fair_decimal_price = (
-            None
-            if probabilities.win == 0.0
-            else 1.0 + probabilities.loss / probabilities.win
-        )
-
-    market_no_vig = None
-    if selected_price is not None and opposing_price is not None:
-        selected_implied = 1.0 / selected_price
-        opposing_implied = 1.0 / opposing_price
-        market_no_vig = _canonical_derived_probability(
-            selected_implied / (selected_implied + opposing_implied),
-            "market_no_vig_probability",
-        )
-
-    edge = (
-        None
-        if model_conditional is None or market_no_vig is None
-        else model_conditional - market_no_vig
+    selected_decimal_price = (
+        None if selected_price is None else float(selected_price)
     )
-    if selected_price is None:
-        expected_value = None
-    elif all_push:
-        expected_value = 0.0
-    else:
-        expected_value = (
-            probabilities.win * (selected_price - 1.0) - probabilities.loss
-        )
+    opposing_decimal_price = (
+        None if opposing_price is None else float(opposing_price)
+    )
+    pricing = _derive_market_pricing(
+        probabilities,
+        selected_decimal_price,
+        opposing_decimal_price,
+    )
 
     return MarketEvaluation(
         probabilities=probabilities,
-        model_conditional_win_probability=model_conditional,
-        fair_decimal_price=fair_decimal_price,
-        market_no_vig_probability=market_no_vig,
-        edge=edge,
-        expected_value=expected_value,
+        selected_decimal_price=selected_decimal_price,
+        opposing_decimal_price=opposing_decimal_price,
+        **pricing,
     )
 
 
