@@ -16,7 +16,7 @@ from analysis.forecasting.inputs import (
     MarketType,
     SettlementFormat,
 )
-from analysis.forecasting.market import MarketEvaluation
+from analysis.forecasting.market import MarketEvaluation, price_market
 from tests.test_forecasting_inputs import (
     AVAILABLE_AT,
     CAPTURED_AT,
@@ -477,6 +477,67 @@ class ForecastEngineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "market_inputs.*markets"):
             ForecastOutput(**values)
+
+    def test_evaluated_market_prices_must_match_semantic_market_input(self):
+        output = run_forecast(_complete_game(), _fast_config())
+        market_key = "sea_ml"
+        evaluation = output.markets[market_key]
+        semantic_market = output.market_inputs[market_key]
+        self.assertTrue(evaluation.evaluated)
+        for field_name in (
+            "selected_decimal_price",
+            "opposing_decimal_price",
+        ):
+            with self.subTest(field_name=field_name):
+                selected_price = semantic_market.selected_decimal_price
+                opposing_price = semantic_market.opposing_decimal_price
+                if field_name == "selected_decimal_price":
+                    selected_price += 0.01
+                else:
+                    opposing_price += 0.01
+                mismatched_markets = dict(output.markets)
+                mismatched_markets[market_key] = price_market(
+                    evaluation.probabilities,
+                    selected_price,
+                    opposing_price,
+                )
+                values = {
+                    field.name: getattr(output, field.name)
+                    for field in fields(output)
+                }
+                values["markets"] = mismatched_markets
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{field_name}.*market_inputs",
+                ):
+                    ForecastOutput(**values)
+
+    def test_unevaluated_market_keeps_semantic_prices_without_evaluation_prices(
+        self,
+    ):
+        market = replace(
+            _market("three-way-f5", MarketType.F5_SIDE, "away", 0.0),
+            settlement_format=SettlementFormat.THREE_WAY,
+        )
+
+        output = run_forecast(
+            _complete_game(markets=(market,)),
+            _fast_config(),
+        )
+        evaluation = output.markets[market.market_key]
+        reconstructed = ForecastOutput(
+            **{field.name: getattr(output, field.name) for field in fields(output)}
+        )
+
+        self.assertFalse(evaluation.evaluated)
+        self.assertEqual(
+            output.market_inputs[market.market_key].selected_decimal_price,
+            market.selected_decimal_price,
+        )
+        self.assertIsNone(evaluation.selected_decimal_price)
+        self.assertIsNone(evaluation.opposing_decimal_price)
+        self.assertEqual(reconstructed, output)
 
     def test_capture_availability_does_not_change_forecast_output(self):
         known_game = _complete_game()

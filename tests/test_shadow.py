@@ -6,7 +6,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from analysis.forecasting import OutcomeProbabilities, price_market, run_forecast
+from analysis.forecasting import (
+    MarketType,
+    OutcomeProbabilities,
+    SettlementFormat,
+    price_market,
+    run_forecast,
+)
 from analysis.forecasting.identity import (
     canonical_json,
     capture_payload,
@@ -35,6 +41,7 @@ from analysis.shadow import (
 from tests.test_forecasting_engine import (
     _complete_game,
     _fast_config,
+    _market,
     forecast_engine_module,
 )
 
@@ -110,6 +117,41 @@ def legacy_snapshot(
         review_bindings=resolved_bindings,
         notes=("legacy remains authoritative",),
     )
+
+
+def three_way_f5_scenario():
+    market_key = "sea_f5_three_way"
+    market_input = replace(
+        _market(market_key, MarketType.F5_SIDE, "away", 0.0),
+        settlement_format=SettlementFormat.THREE_WAY,
+    )
+    game = _complete_game(markets=(market_input,))
+    forecast = run_forecast(game, _fast_config())
+    f5_paths = (
+        principal_paths()[0],
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            component_ids=(
+                "away_f5_runs",
+                "away_f5_traffic",
+                "away_f5_extra_base_hits",
+            ),
+            contradiction_rule=(
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+        ),
+    )
+    legacy = legacy_snapshot(
+        candidates=(candidate(market="f5_side"),),
+        review_bindings=(
+            binding(
+                market_key=market_key,
+                legacy_market="f5_side",
+                paths=f5_paths,
+            ),
+        ),
+    )
+    return game, forecast, legacy
 
 
 class TrackingStore:
@@ -296,6 +338,24 @@ class ShadowComparisonTests(unittest.TestCase):
             expected.market_no_vig_probability,
         )
         self.assertEqual(market.edge, expected.edge)
+
+    def test_known_unevaluated_market_remains_review_eligible(self) -> None:
+        _, forecast, legacy = three_way_f5_scenario()
+        evaluation = forecast.markets["sea_f5_three_way"]
+        self.assertFalse(evaluation.evaluated)
+
+        market = compare_shadow_forecast(
+            legacy,
+            forecast,
+        ).market_comparisons[0]
+
+        self.assertTrue(market.review_eligible)
+        self.assertEqual(market.review_ineligibility_flags, ())
+        self.assertEqual(len(market.principal_paths), 2)
+        self.assertIsNone(market.model_win_probability)
+        self.assertIsNone(market.fair_decimal_price)
+        self.assertIsNone(market.market_no_vig_probability)
+        self.assertIsNone(market.edge)
 
     def test_missing_binding_emits_explicit_ineligible_comparison(self) -> None:
         comparison = compare_shadow_forecast(
@@ -563,6 +623,25 @@ class ShadowRecordingTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result.capture = result.capture
 
+    def test_known_unevaluated_market_records_without_invented_pricing(self) -> None:
+        game, forecast, legacy = three_way_f5_scenario()
+
+        result = self.record(
+            game=game,
+            forecast=forecast,
+            legacy=legacy,
+            keys=self.keys("three-way-f5"),
+        )
+        market = result.forecast.outputs["shadow_comparison"][
+            "market_comparisons"
+        ][0]
+
+        self.assertTrue(market["review_eligible"])
+        self.assertIsNone(market["model_win_probability"])
+        self.assertIsNone(market["fair_decimal_price"])
+        self.assertIsNone(market["edge"])
+        self.assertEqual(len(tuple(self.store.iter_records())), 3)
+
     def test_recording_keeps_full_capture_and_semantic_hash_separate(self) -> None:
         result = self.record()
         expected_hash = normalized_input_hash(self.game)
@@ -659,9 +738,7 @@ class ShadowRecordingTests(unittest.TestCase):
         market_inputs = dict(self.forecast.market_inputs)
         market_inputs["sea_ml"] = replace(
             market_inputs["sea_ml"],
-            selected_decimal_price=(
-                market_inputs["sea_ml"].selected_decimal_price + 0.01
-            ),
+            selected_side="home",
         )
         mismatched_forecast = replace(
             self.forecast,

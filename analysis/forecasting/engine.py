@@ -268,6 +268,17 @@ def _freeze_market_inputs(
             )
         if market.market_key != market_key:
             raise ValueError("market_inputs key and market_key must match")
+        evaluation = markets[market_key]
+        if evaluation.evaluated:
+            for field_name in (
+                "selected_decimal_price",
+                "opposing_decimal_price",
+            ):
+                if getattr(evaluation, field_name) != getattr(market, field_name):
+                    raise ValueError(
+                        f"{field_name} must match market_inputs for evaluated "
+                        "markets"
+                    )
     return MappingProxyType(
         {key: copied[key] for key in sorted(copied)}
     )

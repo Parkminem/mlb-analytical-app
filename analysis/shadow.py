@@ -262,10 +262,6 @@ class ShadowMarketComparison:
                     "eligible comparisons require two to four unique canonical "
                     "principal paths"
                 )
-            if self.model_win_probability is None:
-                raise ValueError(
-                    "eligible comparisons require model_win_probability"
-                )
         elif self.principal_paths:
             raise ValueError(
                 "ineligible comparisons cannot retain principal paths"
@@ -387,13 +383,6 @@ def _comparison_for_candidate(
             flags.add("missing_component_distribution")
 
     review_eligible = not flags
-    if review_eligible and (
-        market_evaluation is None
-        or market_evaluation.model_conditional_win_probability is None
-    ):
-        raise ValueError(
-            f"bound forecast market {market_key!r} has no model win probability"
-        )
     ordered_flags = tuple(
         flag for flag in _INELIGIBILITY_FLAG_ORDER if flag in flags
     )
