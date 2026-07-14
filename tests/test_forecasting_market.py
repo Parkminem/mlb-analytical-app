@@ -202,6 +202,39 @@ class MarketPricingTests(unittest.TestCase):
         self.assertAlmostEqual(result.market_no_vig_probability, 0.50)
         self.assertAlmostEqual(result.edge, 0.0)
 
+    def test_conditional_probability_clamps_float_roundoff_at_one(self):
+        probabilities = OutcomeProbabilities(win=0.1, push=0.9, loss=0.0)
+
+        try:
+            result = price_market(
+                probabilities,
+                selected_price=2.0,
+                opposing_price=2.0,
+            )
+        except ValueError as error:
+            self.fail(f"mathematical probability boundary was rejected: {error}")
+
+        self.assertEqual(result.model_conditional_win_probability, 1.0)
+        self.assertEqual(result.fair_decimal_price, 1.0)
+        self.assertEqual(result.market_no_vig_probability, 0.5)
+        self.assertEqual(result.edge, 0.5)
+        self.assertEqual(result.expected_value, 0.1)
+
+    def test_materially_invalid_derived_probability_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"must be in \[0, 1\]"):
+            MarketEvaluation(
+                probabilities=OutcomeProbabilities(
+                    win=0.1,
+                    push=0.9,
+                    loss=0.0,
+                ),
+                model_conditional_win_probability=1.000001,
+                fair_decimal_price=1.0,
+                market_no_vig_probability=0.5,
+                edge=0.5,
+                expected_value=0.1,
+            )
+
     def test_missing_entry_price_keeps_probability_and_flow_review(self):
         probabilities = OutcomeProbabilities(win=0.55, push=0.0, loss=0.45)
 

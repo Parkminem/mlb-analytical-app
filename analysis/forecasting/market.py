@@ -41,6 +41,22 @@ def _require_optional_finite(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be finite when present")
 
 
+def _canonical_derived_probability(value: float, field_name: str) -> float:
+    if not _is_finite_number(value):
+        raise ValueError(f"{field_name} must be finite")
+    if 0.0 <= value <= 1.0:
+        return value
+    boundary = 0.0 if value < 0.0 else 1.0
+    if math.isclose(
+        value,
+        boundary,
+        rel_tol=0.0,
+        abs_tol=_PROBABILITY_TOLERANCE,
+    ):
+        return boundary
+    raise ValueError(f"{field_name} must be in [0, 1]")
+
+
 @dataclass(frozen=True)
 class OutcomeProbabilities:
     win: float
@@ -155,7 +171,10 @@ def price_market(
         model_conditional = None
         fair_decimal_price = None
     else:
-        model_conditional = probabilities.win / (1.0 - probabilities.push)
+        model_conditional = _canonical_derived_probability(
+            probabilities.win / (1.0 - probabilities.push),
+            "model_conditional_win_probability",
+        )
         fair_decimal_price = (
             None
             if probabilities.win == 0.0
@@ -166,8 +185,9 @@ def price_market(
     if selected_price is not None and opposing_price is not None:
         selected_implied = 1.0 / selected_price
         opposing_implied = 1.0 / opposing_price
-        market_no_vig = selected_implied / (
-            selected_implied + opposing_implied
+        market_no_vig = _canonical_derived_probability(
+            selected_implied / (selected_implied + opposing_implied),
+            "market_no_vig_probability",
         )
 
     edge = (
