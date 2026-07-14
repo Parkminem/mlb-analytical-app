@@ -7,14 +7,24 @@ import random
 import sys
 import unittest
 
+import analysis.forecasting.bullpen as bullpen_module
 import analysis.forecasting.config as config_module
 import analysis.forecasting.offense as offense_module
 import analysis.forecasting.randomness as randomness_module
 import analysis.forecasting.starter as starter_module
+from analysis.forecasting.bullpen import (
+    BullpenForecast,
+    BullpenSegmentForecast,
+    forecast_bullpen,
+    select_bullpen_segment,
+)
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import (
     BooleanFeature,
+    BullpenInput,
+    BullpenRole,
+    BullpenSegmentInput,
     FeatureProvenance,
     IntegerFeature,
     LineupInput,
@@ -26,6 +36,7 @@ from analysis.forecasting.inputs import (
     PitcherRole,
     PitchUsage,
     PitchVelocityResponse,
+    RelieverAppearanceInput,
     StarterProjectionComponents,
     WorkloadHistory,
 )
@@ -438,6 +449,84 @@ def _convolved_bucket_probabilities(first, second):
                     bucket = 0 if combined_outs < 15 else 1 if combined_outs < 18 else 2
                     probabilities[bucket] += probability
     return tuple(probabilities)
+
+
+_BULLPEN_ROLE_ORDER = (
+    BullpenRole.BRIDGE,
+    BullpenRole.MIDDLE,
+    BullpenRole.HIGH_LEVERAGE,
+    BullpenRole.CLOSER,
+)
+_BULLPEN_RA9_BY_ROLE = {
+    BullpenRole.BRIDGE: 6.75,
+    BullpenRole.MIDDLE: 4.50,
+    BullpenRole.HIGH_LEVERAGE: 3.60,
+    BullpenRole.CLOSER: 3.15,
+}
+
+
+def _bullpen_provenance():
+    return FeatureProvenance(
+        observation_ids=("obs:bullpen",),
+        latest_available_at=None,
+        lookback_end=None,
+    )
+
+
+def _bullpen_numeric(value):
+    return NumericFeature(value=value, provenance=_bullpen_provenance())
+
+
+def _bullpen_boolean(value=False):
+    return BooleanFeature(value=value, provenance=_bullpen_provenance())
+
+
+def _bullpen_appearance(pitcher_id, days_ago, pitches):
+    return RelieverAppearanceInput(
+        pitcher_id=pitcher_id,
+        days_ago=days_ago,
+        pitches=pitches,
+        provenance=_bullpen_provenance(),
+    )
+
+
+def _bullpen_segment(
+    role,
+    *,
+    segment_id=None,
+    projected_ra9=None,
+    log_standard_error=0.20,
+    appearances=(),
+    available=True,
+    limited=False,
+):
+    return BullpenSegmentInput(
+        segment_id=segment_id or f"bullpen:{role.value}",
+        role=role,
+        projected_ra9=_bullpen_numeric(
+            _BULLPEN_RA9_BY_ROLE[role]
+            if projected_ra9 is None
+            else projected_ra9
+        ),
+        log_standard_error=_bullpen_numeric(log_standard_error),
+        appearances=appearances,
+        available=_bullpen_boolean(available),
+        limited_performance_or_use_risk=_bullpen_boolean(limited),
+    )
+
+
+def _bullpen_input(role_changes=None, *, segments=None):
+    if segments is not None:
+        return BullpenInput(team="SEA", segments=segments)
+
+    changes = role_changes or {}
+    return BullpenInput(
+        team="SEA",
+        segments=tuple(
+            replace(_bullpen_segment(role), **changes.get(role, {}))
+            for role in _BULLPEN_ROLE_ORDER
+        ),
+    )
 
 
 class SimulationConfigTests(unittest.TestCase):
@@ -919,6 +1008,7 @@ class ForecastRandomnessTests(unittest.TestCase):
 
     def test_modules_use_only_standard_library_dependencies(self):
         for module in (
+            bullpen_module,
             config_module,
             offense_module,
             randomness_module,
@@ -2859,6 +2949,641 @@ class OffenseForecastTests(unittest.TestCase):
         self.assertEqual(diagnostics[0].labels, ("표본 부족",))
         self.assertEqual(diagnostics[1].adjusted_wobas["FF"], 0.500)
         self.assertEqual(diagnostics[1].unknown_exposure, 0.0)
+
+
+class BullpenForecastTests(unittest.TestCase):
+    def test_roles_stay_separate_and_multipliers_use_configured_ra9_and_bounds(self):
+        config = SimulationConfig(
+            league_runs_per_team_game=5.0,
+            bullpen_ra9_bounds=(0.60, 1.90),
+        )
+        bullpen = _bullpen_input(
+            {
+                BullpenRole.BRIDGE: {
+                    "projected_ra9": _bullpen_numeric(2.0),
+                },
+                BullpenRole.MIDDLE: {
+                    "projected_ra9": _bullpen_numeric(4.5),
+                },
+                BullpenRole.HIGH_LEVERAGE: {
+                    "projected_ra9": _bullpen_numeric(6.0),
+                },
+                BullpenRole.CLOSER: {
+                    "projected_ra9": _bullpen_numeric(12.0),
+                },
+            }
+        )
+
+        forecast = forecast_bullpen(bullpen, config)
+
+        self.assertEqual(
+            tuple(segment.role for segment in forecast.segments),
+            _BULLPEN_ROLE_ORDER,
+        )
+        self.assertEqual(tuple(forecast.by_role), _BULLPEN_ROLE_ORDER)
+        self.assertEqual(
+            {
+                role: forecast.by_role[role].run_prevention_multiplier
+                for role in _BULLPEN_ROLE_ORDER
+            },
+            {
+                BullpenRole.BRIDGE: 0.60,
+                BullpenRole.MIDDLE: 0.90,
+                BullpenRole.HIGH_LEVERAGE: 1.20,
+                BullpenRole.CLOSER: 1.90,
+            },
+        )
+        self.assertFalse(hasattr(forecast, "team_average_multiplier"))
+
+    def test_projected_ra9_is_rejected_before_clipping_when_not_positive_finite(self):
+        for invalid in (0.0, -0.1, math.nan, math.inf, -math.inf, True):
+            with self.subTest(invalid=invalid):
+                projected_ra9 = _bullpen_numeric(4.5)
+                object.__setattr__(projected_ra9, "value", invalid)
+                bullpen = _bullpen_input(
+                    {
+                        BullpenRole.BRIDGE: {
+                            "projected_ra9": projected_ra9,
+                        }
+                    }
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "projected_ra9.*finite positive",
+                ):
+                    forecast_bullpen(bullpen, SimulationConfig())
+
+    def test_base_log_standard_error_must_be_finite_and_nonnegative(self):
+        for invalid in (-0.1, math.nan, math.inf, -math.inf, True):
+            with self.subTest(invalid=invalid):
+                log_standard_error = _bullpen_numeric(0.2)
+                object.__setattr__(log_standard_error, "value", invalid)
+                bullpen = _bullpen_input(
+                    {
+                        BullpenRole.MIDDLE: {
+                            "log_standard_error": log_standard_error,
+                        }
+                    }
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "log_standard_error.*finite nonnegative",
+                ):
+                    forecast_bullpen(bullpen, SimulationConfig())
+
+    def test_rested_high_leverage_is_distinct_from_used_lower_relief(self):
+        tired_lower = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.BRIDGE: {
+                        "limited_performance_or_use_risk": _bullpen_boolean(True),
+                    }
+                }
+            ),
+            SimulationConfig(),
+        )
+        protected_only = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "limited_performance_or_use_risk": _bullpen_boolean(True),
+                    },
+                    BullpenRole.CLOSER: {
+                        "available": _bullpen_boolean(False),
+                    },
+                }
+            ),
+            SimulationConfig(),
+        )
+        unavailable_setup = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "available": _bullpen_boolean(False),
+                    }
+                }
+            ),
+            SimulationConfig(),
+        )
+
+        self.assertTrue(tired_lower.high_leverage_available)
+        self.assertTrue(tired_lower.lower_relief_risk)
+        self.assertTrue(protected_only.high_leverage_available)
+        self.assertFalse(protected_only.lower_relief_risk)
+        self.assertFalse(unavailable_setup.high_leverage_available)
+        self.assertFalse(unavailable_setup.lower_relief_risk)
+
+    def test_limited_arm_stays_available_and_adds_sigma_in_quadrature(self):
+        config = SimulationConfig(limited_reliever_log_se_penalty=0.30)
+        forecast = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "log_standard_error": _bullpen_numeric(0.40),
+                        "limited_performance_or_use_risk": _bullpen_boolean(True),
+                    }
+                }
+            ),
+            config,
+        )
+
+        setup = forecast.by_role[BullpenRole.HIGH_LEVERAGE]
+        selected = select_bullpen_segment(
+            forecast,
+            inning=8,
+            margin=1,
+            bridge_needed=False,
+            verified_opener_bulk=False,
+        )
+
+        self.assertTrue(setup.available)
+        self.assertTrue(setup.limited_performance_or_use_risk)
+        self.assertEqual(setup.base_log_standard_error, 0.40)
+        self.assertEqual(setup.log_standard_error, math.hypot(0.40, 0.30))
+        self.assertEqual(setup.notes, ("limited_performance_or_use_risk",))
+        self.assertIs(selected, setup)
+
+    def test_limited_and_unavailable_normalized_flags_are_inconsistent(self):
+        bullpen = _bullpen_input(
+            {
+                BullpenRole.HIGH_LEVERAGE: {
+                    "available": _bullpen_boolean(False),
+                    "limited_performance_or_use_risk": _bullpen_boolean(True),
+                }
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "limited.*available"):
+            forecast_bullpen(bullpen, SimulationConfig())
+
+    def test_recent_appearances_are_not_recalculated_into_normalized_flags(self):
+        heavy_usage = (
+            _bullpen_appearance("reliever:used", 0, 45),
+            _bullpen_appearance("reliever:used", 1, 35),
+            _bullpen_appearance("reliever:used", 2, 25),
+        )
+        used = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.BRIDGE: {"appearances": heavy_usage},
+                    BullpenRole.HIGH_LEVERAGE: {"appearances": heavy_usage},
+                }
+            ),
+            SimulationConfig(),
+        )
+        baseline = forecast_bullpen(_bullpen_input(), SimulationConfig())
+
+        self.assertEqual(used, baseline)
+        self.assertTrue(used.high_leverage_available)
+        self.assertFalse(used.lower_relief_risk)
+        self.assertEqual(
+            used.by_role[BullpenRole.HIGH_LEVERAGE].log_standard_error,
+            used.by_role[BullpenRole.HIGH_LEVERAGE].base_log_standard_error,
+        )
+
+    def test_unverified_early_relief_uses_neutral_f5_prior_not_team_relief(self):
+        config = SimulationConfig(
+            unscheduled_f5_relief_log_standard_error=0.37,
+        )
+        forecast = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.BRIDGE: {
+                        "projected_ra9": _bullpen_numeric(40.0),
+                        "available": _bullpen_boolean(False),
+                    },
+                    BullpenRole.MIDDLE: {
+                        "projected_ra9": _bullpen_numeric(0.5),
+                        "available": _bullpen_boolean(False),
+                    },
+                }
+            ),
+            config,
+        )
+
+        for inning in (1, 5):
+            with self.subTest(inning=inning):
+                segment = select_bullpen_segment(
+                    forecast,
+                    inning=inning,
+                    margin=1,
+                    bridge_needed=True,
+                    verified_opener_bulk=False,
+                )
+
+                self.assertIs(segment, forecast.unscheduled_f5_relief)
+                self.assertEqual(segment.segment_id, "league_unscheduled_f5_relief")
+                self.assertEqual(segment.run_prevention_multiplier, 1.0)
+                self.assertEqual(segment.base_log_standard_error, 0.37)
+                self.assertEqual(segment.log_standard_error, 0.37)
+                self.assertTrue(segment.synthetic)
+                self.assertTrue(segment.available)
+                self.assertNotEqual(
+                    segment.run_prevention_multiplier,
+                    forecast.by_role[BullpenRole.BRIDGE].run_prevention_multiplier,
+                )
+
+    def test_verified_early_opener_bulk_stays_in_initial_pitcher_chain(self):
+        forecast = forecast_bullpen(_bullpen_input(), SimulationConfig())
+
+        with self.assertRaisesRegex(ValueError, "initial pitcher chain"):
+            select_bullpen_segment(
+                forecast,
+                inning=5,
+                margin=1,
+                bridge_needed=False,
+                verified_opener_bulk=True,
+            )
+
+        self.assertEqual(
+            select_bullpen_segment(
+                forecast,
+                inning=6,
+                margin=1,
+                bridge_needed=False,
+                verified_opener_bulk=True,
+            ).role,
+            BullpenRole.MIDDLE,
+        )
+
+    def test_role_selection_follows_inning_margin_and_bridge_state(self):
+        forecast = forecast_bullpen(_bullpen_input(), SimulationConfig())
+        cases = (
+            (6, 1, True, BullpenRole.BRIDGE),
+            (6, 1, False, BullpenRole.MIDDLE),
+            (7, 1, True, BullpenRole.BRIDGE),
+            (7, 1, False, BullpenRole.HIGH_LEVERAGE),
+            (7, 4, False, BullpenRole.MIDDLE),
+            (8, -3, False, BullpenRole.HIGH_LEVERAGE),
+            (8, -4, False, BullpenRole.MIDDLE),
+            (8, 4, True, BullpenRole.BRIDGE),
+            (9, 3, False, BullpenRole.CLOSER),
+            (10, -3, False, BullpenRole.CLOSER),
+            (10, 4, False, BullpenRole.MIDDLE),
+        )
+
+        for inning, margin, bridge_needed, expected_role in cases:
+            with self.subTest(
+                inning=inning,
+                margin=margin,
+                bridge_needed=bridge_needed,
+            ):
+                selected = select_bullpen_segment(
+                    forecast,
+                    inning=inning,
+                    margin=margin,
+                    bridge_needed=bridge_needed,
+                    verified_opener_bulk=False,
+                )
+                self.assertEqual(selected.role, expected_role)
+
+    def test_unavailable_high_leverage_falls_back_without_mutation(self):
+        forecast = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "available": _bullpen_boolean(False),
+                    }
+                }
+            ),
+            SimulationConfig(),
+        )
+        before = canonical_json(forecast)
+
+        segment = select_bullpen_segment(
+            forecast,
+            inning=8,
+            margin=1,
+            bridge_needed=False,
+            verified_opener_bulk=False,
+        )
+
+        self.assertEqual(segment.role, BullpenRole.MIDDLE)
+        self.assertFalse(forecast.by_role[BullpenRole.HIGH_LEVERAGE].available)
+        self.assertEqual(canonical_json(forecast), before)
+
+    def test_requested_roles_fall_back_in_deterministic_order(self):
+        def with_unavailable(*roles):
+            return forecast_bullpen(
+                _bullpen_input(
+                    {
+                        role: {"available": _bullpen_boolean(False)}
+                        for role in roles
+                    }
+                ),
+                SimulationConfig(),
+            )
+
+        cases = (
+            (
+                with_unavailable(BullpenRole.BRIDGE),
+                6,
+                1,
+                True,
+                BullpenRole.MIDDLE,
+            ),
+            (
+                with_unavailable(BullpenRole.MIDDLE),
+                8,
+                4,
+                False,
+                BullpenRole.BRIDGE,
+            ),
+            (
+                with_unavailable(BullpenRole.CLOSER),
+                9,
+                1,
+                False,
+                BullpenRole.HIGH_LEVERAGE,
+            ),
+            (
+                with_unavailable(
+                    BullpenRole.CLOSER,
+                    BullpenRole.HIGH_LEVERAGE,
+                ),
+                9,
+                1,
+                False,
+                BullpenRole.MIDDLE,
+            ),
+        )
+
+        for forecast, inning, margin, bridge_needed, expected_role in cases:
+            with self.subTest(
+                inning=inning,
+                bridge_needed=bridge_needed,
+                expected_role=expected_role,
+            ):
+                selected = select_bullpen_segment(
+                    forecast,
+                    inning=inning,
+                    margin=margin,
+                    bridge_needed=bridge_needed,
+                    verified_opener_bulk=False,
+                )
+                self.assertEqual(selected.role, expected_role)
+
+    def test_late_fallback_exhaustion_never_synthesizes_or_forces_protected_arms(self):
+        lower_unavailable = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.BRIDGE: {
+                        "available": _bullpen_boolean(False),
+                    },
+                    BullpenRole.MIDDLE: {
+                        "available": _bullpen_boolean(False),
+                    },
+                }
+            ),
+            SimulationConfig(),
+        )
+        close_chain_unavailable = forecast_bullpen(
+            _bullpen_input(
+                {
+                    BullpenRole.MIDDLE: {
+                        "available": _bullpen_boolean(False),
+                    },
+                    BullpenRole.HIGH_LEVERAGE: {
+                        "available": _bullpen_boolean(False),
+                    },
+                    BullpenRole.CLOSER: {
+                        "available": _bullpen_boolean(False),
+                    },
+                }
+            ),
+            SimulationConfig(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "no available team bullpen segment"):
+            select_bullpen_segment(
+                lower_unavailable,
+                inning=8,
+                margin=4,
+                bridge_needed=False,
+                verified_opener_bulk=False,
+            )
+        with self.assertRaisesRegex(ValueError, "no available team bullpen segment"):
+            select_bullpen_segment(
+                close_chain_unavailable,
+                inning=9,
+                margin=1,
+                bridge_needed=False,
+                verified_opener_bulk=False,
+            )
+
+    def test_duplicate_ids_duplicate_roles_and_missing_roles_are_rejected(self):
+        baseline = _bullpen_input()
+        duplicate_ids = list(baseline.segments)
+        duplicate_ids[1] = replace(
+            duplicate_ids[1],
+            segment_id=duplicate_ids[0].segment_id,
+        )
+        duplicate_roles = list(baseline.segments)
+        duplicate_roles[-1] = replace(
+            duplicate_roles[-1],
+            role=BullpenRole.HIGH_LEVERAGE,
+        )
+        invalid_inputs = (
+            ("segment_id", _bullpen_input(segments=tuple(duplicate_ids))),
+            ("role", _bullpen_input(segments=tuple(duplicate_roles))),
+            ("roles", _bullpen_input(segments=baseline.segments[:-1])),
+        )
+
+        for message, bullpen in invalid_inputs:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    forecast_bullpen(bullpen, SimulationConfig())
+
+    def test_public_functions_validate_types_ranges_and_booleans(self):
+        config = SimulationConfig()
+        forecast = forecast_bullpen(_bullpen_input(), config)
+
+        with self.assertRaisesRegex(TypeError, "bullpen"):
+            forecast_bullpen(None, config)
+        with self.assertRaisesRegex(TypeError, "config"):
+            forecast_bullpen(_bullpen_input(), None)
+        with self.assertRaisesRegex(TypeError, "forecast"):
+            select_bullpen_segment(
+                None,
+                inning=6,
+                margin=1,
+                bridge_needed=False,
+                verified_opener_bulk=False,
+            )
+
+        for inning in (1.0, True, math.nan, math.inf, "6", None):
+            with self.subTest(inning=inning):
+                with self.assertRaisesRegex(TypeError, "inning"):
+                    select_bullpen_segment(
+                        forecast,
+                        inning=inning,
+                        margin=1,
+                        bridge_needed=False,
+                        verified_opener_bulk=False,
+                    )
+        for inning in (0, -1):
+            with self.subTest(inning=inning):
+                with self.assertRaisesRegex(ValueError, "inning"):
+                    select_bullpen_segment(
+                        forecast,
+                        inning=inning,
+                        margin=1,
+                        bridge_needed=False,
+                        verified_opener_bulk=False,
+                    )
+        for margin in (1.0, True, math.nan, math.inf, "1", None):
+            with self.subTest(margin=margin):
+                with self.assertRaisesRegex(TypeError, "margin"):
+                    select_bullpen_segment(
+                        forecast,
+                        inning=6,
+                        margin=margin,
+                        bridge_needed=False,
+                        verified_opener_bulk=False,
+                    )
+        for field_name in ("bridge_needed", "verified_opener_bulk"):
+            for invalid in (0, 1, None, "false"):
+                with self.subTest(field_name=field_name, invalid=invalid):
+                    arguments = {
+                        "forecast": forecast,
+                        "inning": 6,
+                        "margin": 1,
+                        "bridge_needed": False,
+                        "verified_opener_bulk": False,
+                    }
+                    arguments[field_name] = invalid
+                    with self.assertRaisesRegex(TypeError, field_name):
+                        select_bullpen_segment(**arguments)
+
+    def test_results_and_role_mapping_are_defensively_immutable(self):
+        forecast = forecast_bullpen(_bullpen_input(), SimulationConfig())
+        segment = forecast.by_role[BullpenRole.BRIDGE]
+
+        with self.assertRaises(FrozenInstanceError):
+            segment.available = False
+        with self.assertRaises(FrozenInstanceError):
+            forecast.lower_relief_risk = True
+        with self.assertRaises(TypeError):
+            forecast.by_role[BullpenRole.BRIDGE] = segment
+
+        source_mapping = dict(forecast.by_role)
+        direct = replace(forecast, by_role=source_mapping)
+        source_mapping[BullpenRole.BRIDGE] = forecast.by_role[BullpenRole.MIDDLE]
+
+        self.assertEqual(
+            direct.by_role[BullpenRole.BRIDGE].role,
+            BullpenRole.BRIDGE,
+        )
+
+    def test_direct_segment_construction_rejects_invalid_or_inconsistent_values(self):
+        forecast = forecast_bullpen(_bullpen_input(), SimulationConfig())
+        segment = forecast.by_role[BullpenRole.BRIDGE]
+        invalid_changes = (
+            {"segment_id": ""},
+            {"role": "bridge"},
+            {"projected_ra9": 0.0},
+            {"projected_ra9": math.nan},
+            {"projected_ra9": 4.5},
+            {"run_prevention_multiplier": 0.0},
+            {"run_prevention_multiplier": math.inf},
+            {"run_prevention_multiplier": 1.1},
+            {"base_log_standard_error": -0.1},
+            {"base_log_standard_error": math.inf},
+            {"base_log_standard_error": 0.4},
+            {"log_standard_error": -0.1},
+            {"log_standard_error": math.nan},
+            {"available": 1},
+            {"limited_performance_or_use_risk": 1},
+            {"synthetic": 1},
+            {"notes": []},
+            {"notes": ("invented",)},
+        )
+
+        for changes in invalid_changes:
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(segment, **changes)
+
+        synthetic = forecast.unscheduled_f5_relief
+        for changes in (
+            {"segment_id": "bullpen:fake-prior"},
+            {"synthetic": False},
+            {"run_prevention_multiplier": 1.1},
+        ):
+            with self.subTest(synthetic_changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(synthetic, **changes)
+
+    def test_direct_forecast_construction_rejects_relationship_inconsistency(self):
+        forecast = forecast_bullpen(_bullpen_input(), SimulationConfig())
+        bridge = forecast.by_role[BullpenRole.BRIDGE]
+        middle = forecast.by_role[BullpenRole.MIDDLE]
+        duplicate_role = replace(middle, role=BullpenRole.BRIDGE)
+        duplicate_id = replace(middle, segment_id=bridge.segment_id)
+        duplicate_role_segments = list(forecast.segments)
+        duplicate_role_segments[1] = duplicate_role
+        duplicate_id_segments = list(forecast.segments)
+        duplicate_id_segments[1] = duplicate_id
+        wrong_mapping = dict(forecast.by_role)
+        wrong_mapping[BullpenRole.BRIDGE] = middle
+        invalid_changes = (
+            {"team": ""},
+            {"segments": list(forecast.segments)},
+            {"segments": forecast.segments[:-1]},
+            {"segments": tuple(duplicate_role_segments)},
+            {"segments": tuple(duplicate_id_segments)},
+            {"by_role": {}},
+            {"by_role": wrong_mapping},
+            {
+                "high_leverage_available": (
+                    not forecast.high_leverage_available
+                )
+            },
+            {"lower_relief_risk": not forecast.lower_relief_risk},
+            {"unscheduled_f5_relief": bridge},
+        )
+
+        for changes in invalid_changes:
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(forecast, **changes)
+
+        for value in (bridge, forecast):
+            with self.subTest(result_type=type(value).__name__):
+                public_values = {
+                    result_field.name: getattr(value, result_field.name)
+                    for result_field in fields(value)
+                    if not result_field.name.startswith("_")
+                }
+                with self.assertRaisesRegex(ValueError, "forecast_bullpen"):
+                    type(value)(**public_values)
+
+    def test_canonical_serialization_is_deterministic_and_input_order_independent(self):
+        baseline = _bullpen_input()
+        first = forecast_bullpen(baseline, SimulationConfig())
+        second = forecast_bullpen(
+            BullpenInput(
+                team=baseline.team,
+                segments=tuple(reversed(baseline.segments)),
+            ),
+            SimulationConfig(),
+        )
+
+        first_json = canonical_json(first)
+        payload = json.loads(first_json)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first_json, canonical_json(second))
+        self.assertEqual(
+            [segment["role"] for segment in payload["segments"]],
+            [role.value for role in _BULLPEN_ROLE_ORDER],
+        )
+        self.assertEqual(
+            set(payload["by_role"]),
+            {role.value for role in _BULLPEN_ROLE_ORDER},
+        )
 
 
 if __name__ == "__main__":
