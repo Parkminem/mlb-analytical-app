@@ -19,7 +19,6 @@ _EXOGENOUS_EVENT_TYPES = frozenset(
         "ejection",
         "defensive_error",
         "defensive_error_cluster",
-        "predeclared",
     )
 )
 _DEFENSIVE_ERROR_EVENT_TYPES = frozenset(
@@ -48,6 +47,13 @@ _MARKET_HORIZONS = {
     MarketType.PLUS_1_5: "full",
     MarketType.FULL_TOTAL: "full",
 }
+_F5_MARKET_TYPES = frozenset((MarketType.F5_SIDE, MarketType.F5_TOTAL))
+_FULL_GAME_ONLY_EVIDENCE_PATHS = frozenset(
+    (
+        PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+        PriorityEvidencePath.BULLPEN_PROTECTION,
+    )
+)
 _EVIDENCE_PATH_ORDER = {
     evidence_path: index
     for index, evidence_path in enumerate(PriorityEvidencePath)
@@ -147,13 +153,16 @@ class ComponentForecast:
             raise ValueError("interval must be PredictiveInterval")
         interval_values = _interval_values(self.interval)
         if self.component_id in _COUNT_COMPONENT_IDS and any(
-            value < 0.0 for value in interval_values
+            value < 0.0 or not float(value).is_integer()
+            for value in interval_values
         ):
-            raise ValueError("count forecast interval must be nonnegative")
+            raise ValueError(
+                "count forecast interval must contain nonnegative integers"
+            )
         if _is_binary_component_id(self.component_id) and any(
-            not 0.0 <= value <= 1.0 for value in interval_values
+            value not in (0.0, 1.0) for value in interval_values
         ):
-            raise ValueError("binary forecast interval must stay in [0, 1]")
+            raise ValueError("binary forecast interval must contain only 0 or 1")
         if not isinstance(self.direction, str) or self.direction not in _DIRECTIONS:
             raise ValueError(
                 "direction must be high_is_supportive or low_is_supportive"
@@ -263,6 +272,11 @@ class PrincipalPathBinding:
             is not _CONTRADICTION_RULE_BY_EVIDENCE_PATH[self.evidence_path]
         ):
             raise ValueError("contradiction_rule must match evidence_path")
+        object.__setattr__(
+            self,
+            "component_ids",
+            tuple(sorted(component_ids)),
+        )
 
 
 @dataclass(frozen=True)
@@ -387,6 +401,39 @@ def _validate_binding_shape(
         raise ValueError(f"invalid binding shape for {rule.value}")
 
 
+def _validate_candidate_path_compatibility(
+    market_type: MarketType,
+    principal_paths: tuple[PrincipalPathBinding, ...],
+) -> None:
+    if market_type in _F5_MARKET_TYPES and any(
+        path.evidence_path in _FULL_GAME_ONLY_EVIDENCE_PATHS
+        for path in principal_paths
+    ):
+        raise ValueError(
+            "F5 markets cannot bind late bullpen exposure or bullpen protection"
+        )
+
+    starter_sides = {}
+    for path in principal_paths:
+        if path.evidence_path not in (
+            PriorityEvidencePath.STARTER_SUPPRESSION,
+            PriorityEvidencePath.STARTER_COLLAPSE,
+        ):
+            continue
+        starter_sides[path.evidence_path] = next(
+            side
+            for side in _SIDES
+            if f"{side}_pitcher_chain_runs_allowed" in path.component_ids
+        )
+    if (
+        len(starter_sides) == 2
+        and len(set(starter_sides.values())) == 1
+    ):
+        raise ValueError(
+            "starter suppression and collapse cannot target the same pitching side"
+        )
+
+
 @dataclass(frozen=True)
 class ReviewCandidate:
     capture_forecast_link_record_id: str
@@ -473,6 +520,16 @@ class ReviewCandidate:
             raise ValueError(
                 "principal_paths must contain PrincipalPathBinding values"
             )
+        object.__setattr__(
+            self,
+            "principal_paths",
+            tuple(
+                sorted(
+                    self.principal_paths,
+                    key=lambda path: _EVIDENCE_PATH_ORDER[path.evidence_path],
+                )
+            ),
+        )
         if self.recommended and not 2 <= len(self.principal_paths) <= 4:
             raise ValueError(
                 "recommended candidates require two to four principal paths"
@@ -496,6 +553,10 @@ class ReviewCandidate:
                 bound_paths_by_component.setdefault(component_id, set()).add(
                     path.evidence_path
                 )
+        _validate_candidate_path_compatibility(
+            self.market_type,
+            self.principal_paths,
+        )
 
         if any(
             forecasts_by_id[component_id].evidence_path not in evidence_paths
@@ -526,6 +587,7 @@ class ReviewClassification:
     contradicted_paths: tuple[PriorityEvidencePath, ...]
     path_reviews: tuple[PathReview, ...]
     notes: tuple[str, ...] = ()
+    qualifying_exogenous_source_observation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.classification is not None and (
@@ -559,6 +621,18 @@ class ReviewClassification:
         if self.contradicted_paths != expected_paths:
             raise ValueError(
                 "contradicted_paths must match contradicted path reviews"
+            )
+        source_observation_ids = _require_string_tuple(
+            self.qualifying_exogenous_source_observation_ids,
+            "qualifying_exogenous_source_observation_ids",
+        )
+        if self.classification == "D" and not source_observation_ids:
+            raise ValueError(
+                "D requires qualifying exogenous source observation IDs"
+            )
+        if self.classification != "D" and source_observation_ids:
+            raise ValueError(
+                "non-D classifications require empty qualifying source IDs"
             )
         has_contradictions = bool(self.contradicted_paths)
         if self.classification == "A" and (
@@ -712,11 +786,12 @@ def _review_path(
     )
 
 
-def _has_qualifying_exogenous_event(
+def _qualifying_exogenous_source_observation_ids(
     candidate: ReviewCandidate,
     forecasts: dict[str, ComponentForecast],
     observations: dict[str, ComponentObservation],
-) -> bool:
+) -> tuple[str, ...]:
+    source_observation_ids = set()
     for event in candidate.exogenous_events:
         if (
             event.event_type in _DEFENSIVE_ERROR_EVENT_TYPES
@@ -725,8 +800,10 @@ def _has_qualifying_exogenous_event(
             continue
         component_id = event.affected_component_id
         if _outside_90(forecasts[component_id], observations[component_id]):
-            return True
-    return False
+            source_observation_ids.add(
+                event.documented_source_observation_id
+            )
+    return tuple(sorted(source_observation_ids))
 
 
 def classify_review(candidate: ReviewCandidate) -> ReviewClassification:
@@ -768,10 +845,19 @@ def classify_review(candidate: ReviewCandidate) -> ReviewClassification:
         if principal_component_ids
         else 1.0
     )
+    qualifying_source_observation_ids = (
+        _qualifying_exogenous_source_observation_ids(
+            candidate,
+            forecasts,
+            observations,
+        )
+        if candidate.recommended
+        else ()
+    )
 
     if not candidate.recommended:
         classification = None
-    elif _has_qualifying_exogenous_event(candidate, forecasts, observations):
+    elif qualifying_source_observation_ids:
         classification = "D"
     elif contradicted_paths or inside_80_ratio < 0.60:
         classification = "C"
@@ -785,6 +871,11 @@ def classify_review(candidate: ReviewCandidate) -> ReviewClassification:
         inside_80_ratio=inside_80_ratio,
         contradicted_paths=contradicted_paths,
         path_reviews=path_reviews,
+        qualifying_exogenous_source_observation_ids=(
+            qualifying_source_observation_ids
+            if classification == "D"
+            else ()
+        ),
     )
 
 
