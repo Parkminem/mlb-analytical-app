@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
 
+from analysis.forecasting.identity import canonical_json
 from analysis.ledger.records import (
     CaptureRecord,
     MarketObservationRecord,
@@ -29,6 +30,7 @@ GROUPING_DIMENSIONS = (
 )
 _MARKET_RESULTS = frozenset(("win", "loss", "push"))
 _PROBABILITY_TOLERANCE = 1e-12
+_AGGREGATION_TOLERANCE = 1e-12
 _UNAVAILABLE = "unavailable"
 PRIORITY_SCORE_BUCKETS = (
     (0, 69),
@@ -169,6 +171,15 @@ class CalibrationRow:
             field_name: _require_probability(getattr(self, field_name), field_name)
             for field_name in ("p_win", "p_push", "p_loss")
         }
+        for field_name, probability in probabilities.items():
+            if probability == 1.0 and any(
+                other_probability != 0.0
+                for other_name, other_probability in probabilities.items()
+                if other_name != field_name
+            ):
+                raise ValueError(
+                    f"{field_name} exact-one probability requires zero residual mass"
+                )
         if not math.isclose(
             math.fsum(probabilities.values()),
             1.0,
@@ -215,6 +226,11 @@ class CalibrationMetrics:
     wins: int
     losses: int
     pushes: int
+    binary_sample_size: int
+    multiclass_sample_size: int
+    priced_stake_count: int
+    probability_clv_sample_size: int
+    price_clv_sample_size: int
     hit_rate: float | None
     push_rate: float | None
     binary_brier: float | None
@@ -226,10 +242,41 @@ class CalibrationMetrics:
     mean_price_clv: float | None
 
     def __post_init__(self) -> None:
-        for field_name in ("sample_size", "wins", "losses", "pushes"):
+        count_fields = (
+            "sample_size",
+            "wins",
+            "losses",
+            "pushes",
+            "binary_sample_size",
+            "multiclass_sample_size",
+            "priced_stake_count",
+            "probability_clv_sample_size",
+            "price_clv_sample_size",
+        )
+        for field_name in count_fields:
             _require_nonnegative_integer(getattr(self, field_name), field_name)
         if self.wins + self.losses + self.pushes != self.sample_size:
             raise ValueError("outcome counts must sum to sample_size")
+        if self.binary_sample_size != self.wins + self.losses:
+            raise ValueError(
+                "binary_sample_size must equal the non-push outcome count"
+            )
+        for field_name in (
+            "multiclass_sample_size",
+            "priced_stake_count",
+            "probability_clv_sample_size",
+            "price_clv_sample_size",
+        ):
+            if getattr(self, field_name) > self.sample_size:
+                raise ValueError(f"{field_name} cannot exceed sample_size")
+        if self.multiclass_sample_size < self.pushes:
+            raise ValueError(
+                "multiclass_sample_size must include every push outcome"
+            )
+        if self.price_clv_sample_size > self.priced_stake_count:
+            raise ValueError(
+                "price_clv_sample_size cannot exceed priced_stake_count"
+            )
         if self.sample_size == 0:
             if self.push_rate is not None:
                 raise ValueError("push_rate must be None for an empty sample")
@@ -241,12 +288,11 @@ class CalibrationMetrics:
             ):
                 raise ValueError("push_rate must match outcome counts")
 
-        non_push_count = self.wins + self.losses
-        if non_push_count == 0:
+        if self.binary_sample_size == 0:
             if self.hit_rate is not None:
                 raise ValueError("hit_rate must be None without non-push outcomes")
         else:
-            expected_hit_rate = self.wins / non_push_count
+            expected_hit_rate = self.wins / self.binary_sample_size
             if (
                 not _is_finite_number(self.hit_rate)
                 or self.hit_rate != expected_hit_rate
@@ -269,7 +315,7 @@ class CalibrationMetrics:
             not _is_finite_number(self.log_loss) or self.log_loss < 0.0
         ):
             raise ValueError("log_loss must be a finite nonnegative number")
-        if non_push_count == 0:
+        if self.binary_sample_size == 0:
             if self.binary_brier is not None:
                 raise ValueError(
                     "binary_brier must be None without non-push outcomes"
@@ -283,6 +329,14 @@ class CalibrationMetrics:
                 )
             if self.log_loss is None:
                 raise ValueError("log_loss is required with non-push outcomes")
+        if (self.multiclass_brier is None) != (
+            self.multiclass_sample_size == 0
+        ):
+            requirement = "None" if self.multiclass_sample_size == 0 else "required"
+            raise ValueError(
+                "multiclass_brier must be "
+                f"{requirement} for multiclass_sample_size"
+            )
         for field_name in (
             "profit_units",
             "roi",
@@ -294,6 +348,32 @@ class CalibrationMetrics:
                 raise ValueError(f"{field_name} must be finite when present")
         if (self.profit_units is None) != (self.roi is None):
             raise ValueError("profit_units and roi must be available together")
+        if (self.profit_units is None) != (self.priced_stake_count == 0):
+            requirement = "None" if self.priced_stake_count == 0 else "available"
+            raise ValueError(
+                f"profit_units and roi must be {requirement} for priced_stake_count"
+            )
+        if self.roi is not None and not math.isclose(
+            self.roi,
+            self.profit_units / self.priced_stake_count,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("roi must equal profit_units divided by priced_stake_count")
+        availability_fields = (
+            (
+                "mean_probability_clv",
+                self.probability_clv_sample_size,
+            ),
+            ("mean_price_clv", self.price_clv_sample_size),
+        )
+        for field_name, denominator in availability_fields:
+            if (getattr(self, field_name) is None) != (denominator == 0):
+                requirement = "None" if denominator == 0 else "required"
+                raise ValueError(
+                    f"{field_name} must be {requirement} when its sample size is "
+                    f"{denominator}"
+                )
         if self.sample_size == 0:
             unavailable_fields = (
                 "hit_rate",
@@ -368,10 +448,75 @@ class CalibrationReport:
             raise ValueError("groups must have unique dimension values")
         if dimension_values != tuple(sorted(dimension_values)):
             raise ValueError("groups must be deterministically sorted")
-        if self.groups and sum(
-            group.metrics.sample_size for group in self.groups
-        ) != self.overall.sample_size:
-            raise ValueError("group sample sizes must sum to overall sample_size")
+        if not self.groups:
+            return
+        partition_fields = (
+            "sample_size",
+            "wins",
+            "losses",
+            "pushes",
+            "binary_sample_size",
+            "multiclass_sample_size",
+            "priced_stake_count",
+            "probability_clv_sample_size",
+            "price_clv_sample_size",
+        )
+        for field_name in partition_fields:
+            grouped_count = sum(
+                getattr(group.metrics, field_name) for group in self.groups
+            )
+            if grouped_count != getattr(self.overall, field_name):
+                raise ValueError(
+                    f"group {field_name} values must sum to overall {field_name}"
+                )
+
+        if self.overall.priced_stake_count > 0:
+            grouped_profit = math.fsum(
+                group.metrics.profit_units
+                for group in self.groups
+                if group.metrics.priced_stake_count > 0
+            )
+            if not math.isclose(
+                grouped_profit,
+                self.overall.profit_units,
+                rel_tol=_AGGREGATION_TOLERANCE,
+                abs_tol=_AGGREGATION_TOLERANCE,
+            ):
+                raise ValueError(
+                    "group profit_units values must sum to overall profit_units"
+                )
+
+        weighted_metrics = (
+            ("hit_rate", "binary_sample_size"),
+            ("push_rate", "sample_size"),
+            ("binary_brier", "binary_sample_size"),
+            ("multiclass_brier", "multiclass_sample_size"),
+            ("log_loss", "binary_sample_size"),
+            ("roi", "priced_stake_count"),
+            ("mean_probability_clv", "probability_clv_sample_size"),
+            ("mean_price_clv", "price_clv_sample_size"),
+        )
+        for metric_name, denominator_name in weighted_metrics:
+            denominator = getattr(self.overall, denominator_name)
+            if denominator == 0:
+                continue
+            weighted_total = math.fsum(
+                getattr(group.metrics, metric_name)
+                * getattr(group.metrics, denominator_name)
+                for group in self.groups
+                if getattr(group.metrics, denominator_name) > 0
+            )
+            reconstructed = weighted_total / denominator
+            if not math.isclose(
+                reconstructed,
+                getattr(self.overall, metric_name),
+                rel_tol=_AGGREGATION_TOLERANCE,
+                abs_tol=_AGGREGATION_TOLERANCE,
+            ):
+                raise ValueError(
+                    f"group-weighted {metric_name} must reconstruct overall "
+                    f"{metric_name}"
+                )
 
 
 def probability_bucket(probability: float) -> str:
@@ -415,25 +560,14 @@ def _validate_group_by(group_by: object) -> tuple[str, ...]:
 
 
 def _conditional_probability(row: CalibrationRow) -> float | None:
-    non_push_probability = 1.0 - row.p_push
+    non_push_probability = math.fsum((row.p_win, row.p_loss))
     if non_push_probability == 0.0:
         return None
-    probability = row.p_win / non_push_probability
-    if probability < 0.0 and math.isclose(
-        probability,
-        0.0,
-        rel_tol=0.0,
-        abs_tol=_PROBABILITY_TOLERANCE,
-    ):
+    if row.p_win == 0.0:
         return 0.0
-    if probability > 1.0 and math.isclose(
-        probability,
-        1.0,
-        rel_tol=0.0,
-        abs_tol=_PROBABILITY_TOLERANCE,
-    ):
+    if row.p_loss == 0.0:
         return 1.0
-    return probability
+    return row.p_win / non_push_probability
 
 
 def _dimension_value(row: CalibrationRow, dimension: str) -> str:
@@ -469,7 +603,7 @@ def _metrics_for_rows(rows: tuple[CalibrationRow, ...]) -> CalibrationMetrics:
     price_clv_values: list[float] = []
 
     for row in rows:
-        if row.p_push > 0.0:
+        if row.p_push > 0.0 or row.market_result == "push":
             outcome = {
                 "win": (1.0, 0.0, 0.0),
                 "push": (0.0, 1.0, 0.0),
@@ -536,6 +670,11 @@ def _metrics_for_rows(rows: tuple[CalibrationRow, ...]) -> CalibrationMetrics:
         wins=wins,
         losses=losses,
         pushes=pushes,
+        binary_sample_size=len(binary_brier_values),
+        multiclass_sample_size=len(multiclass_brier_values),
+        priced_stake_count=len(priced_profits),
+        probability_clv_sample_size=len(probability_clv_values),
+        price_clv_sample_size=len(price_clv_values),
         hit_rate=None if non_push_count == 0 else wins / non_push_count,
         push_rate=None if not rows else pushes / len(rows),
         binary_brier=_mean(binary_brier_values),
@@ -732,14 +871,45 @@ def _forecast_market(
         nested = outputs.get(field_name)
         if nested is not None:
             roots.append(_require_mapping(nested, field_name))
+    matching_markets: list[Mapping[str, object]] = []
     for root in roots:
         if "markets" not in root:
             continue
         markets = _market_mappings(root["markets"], "forecast markets")
         market = markets.get(market_key)
         if market is not None:
-            return _require_mapping(market, f"forecast market {market_key}")
-    raise ValueError(f"forecast output is missing market_key {market_key}")
+            matching_markets.append(
+                _require_mapping(market, f"forecast market {market_key}")
+            )
+    if not matching_markets:
+        raise ValueError(f"forecast output is missing market_key {market_key}")
+    canonical_markets = {
+        canonical_json(market) for market in matching_markets
+    }
+    if len(canonical_markets) != 1:
+        raise ValueError(
+            f"conflicting forecast market mappings for market_key {market_key}"
+        )
+    return matching_markets[0]
+
+
+def _review_semantic_json(review: ReviewRecord) -> str:
+    return canonical_json(
+        {
+            "capture_forecast_link_record_id": (
+                review.capture_forecast_link_record_id
+            ),
+            "capture_id": review.capture_id,
+            "forecast_run_id": review.forecast_run_id,
+            "official_result_record_id": review.official_result_record_id,
+            "market_key": review.market_key,
+            "market_result": review.market_result,
+            "classification": review.classification,
+            "inside_80_ratio": review.inside_80_ratio,
+            "contradicted_paths": review.contradicted_paths,
+            "component_reviews": review.component_reviews,
+        }
+    )
 
 
 def _capture_market(
@@ -841,9 +1011,8 @@ def _starter_structure(payload: Mapping[str, object]) -> str:
 def _matching_close(
     capture: CaptureRecord,
     market: Mapping[str, object],
-    market_key: str,
     observations: tuple[MarketObservationRecord, ...],
-    superseded_record_ids: frozenset[str],
+    relationships: Mapping[str, object],
 ) -> MarketObservationRecord | None:
     market_type = market.get("market_type")
     settlement_format = market.get("settlement_format")
@@ -855,28 +1024,78 @@ def _matching_close(
         (selected_side, "selected_side"),
     ):
         _require_nonempty_string(value, field_name)
+    observations_by_record_id = {
+        observation.envelope.record_id: observation for observation in observations
+    }
+
+    def has_eligible_successor(record_id: str) -> bool:
+        visited = {record_id}
+        successor_id = relationships.get(record_id)
+        while successor_id is not None:
+            if not isinstance(successor_id, str) or not successor_id:
+                raise ValueError(
+                    "market supersession relationships must contain record IDs"
+                )
+            if successor_id in visited:
+                raise ValueError(
+                    "market supersession relationships cannot contain cycles"
+                )
+            successor = observations_by_record_id.get(successor_id)
+            if successor is None:
+                raise ValueError(
+                    "market supersession relationship references missing record"
+                )
+            if (
+                successor.observed_at <= capture.first_pitch
+                and successor.available_at is not None
+                and successor.available_at <= capture.first_pitch
+            ):
+                return True
+            visited.add(successor_id)
+            successor_id = relationships.get(successor_id)
+        return False
+
     matches = [
         observation
         for observation in observations
-        if observation.envelope.record_id not in superseded_record_ids
-        and observation.observation_kind == "close"
+        if observation.observation_kind == "close"
         and observation.game_pk == capture.game_pk
-        and observation.market_key == market_key
         and observation.market_type == market_type
         and observation.settlement_format == settlement_format
         and observation.selected_side == selected_side
         and observation.line == line
+        and observation.observed_at <= capture.first_pitch
+        and observation.available_at is not None
+        and observation.available_at <= capture.first_pitch
+        and not has_eligible_successor(observation.envelope.record_id)
     ]
     if not matches:
         return None
     latest_timestamp = max(observation.observed_at for observation in matches)
-    return min(
+    latest_matches = tuple(
+        observation
+        for observation in matches
+        if observation.observed_at == latest_timestamp
+    )
+    quote_values = {
         (
-            observation
-            for observation in matches
-            if observation.observed_at == latest_timestamp
+            observation.selected_decimal_price,
+            observation.opposing_decimal_price,
+        )
+        for observation in latest_matches
+    }
+    if len(quote_values) != 1:
+        raise ValueError(
+            "conflicting closing quotes exist at the latest eligible timestamp"
+        )
+    return min(
+        latest_matches,
+        key=lambda observation: (
+            observation.source_name,
+            observation.source_record,
+            observation.source_revision,
+            observation.market_key,
         ),
-        key=lambda observation: observation.envelope.record_id,
     )
 
 
@@ -905,7 +1124,7 @@ def _row_for_review(
     forecast,
     review: ReviewRecord,
     observations: tuple[MarketObservationRecord, ...],
-    superseded_market_record_ids: frozenset[str],
+    market_relationships: Mapping[str, object],
 ) -> CalibrationRow:
     outputs = _require_mapping(forecast.outputs, "forecast outputs")
     forecast_market = _forecast_market(outputs, review.market_key)
@@ -933,9 +1152,8 @@ def _row_for_review(
     close = _matching_close(
         capture,
         capture_market,
-        review.market_key,
         observations,
-        superseded_market_record_ids,
+        market_relationships,
     )
     closing_price = None if close is None else close.selected_decimal_price
     closing_no_vig = (
@@ -1009,8 +1227,6 @@ def select_primary_rows(
     market_relationships = store.records_superseded_by("market_observation")
     if not isinstance(market_relationships, Mapping):
         raise ValueError("market supersession relationships must be a mapping")
-    superseded_market_record_ids = frozenset(market_relationships)
-
     candidate_rows: list[CalibrationRow] = []
     for capture in primary_captures:
         latest_result = store.latest_official_result(capture.game_pk)
@@ -1027,36 +1243,52 @@ def select_primary_rows(
         )
         for link in links:
             forecast = store.forecast_for_link(link.envelope.record_id)
-            exact_reviews = sorted(
-                (
-                    review
-                    for review in reviews
-                    if review.capture_forecast_link_record_id
-                    == link.envelope.record_id
-                    and review.capture_id == capture.capture_id
-                    and review.forecast_run_id == forecast.forecast_run_id
-                    and review.official_result_record_id
-                    == latest_result.envelope.record_id
-                ),
-                key=lambda review: (
-                    review.market_key,
-                    review.envelope.record_id,
-                ),
+            matching_reviews = tuple(
+                review
+                for review in reviews
+                if review.capture_forecast_link_record_id
+                == link.envelope.record_id
+                and review.capture_id == capture.capture_id
+                and review.forecast_run_id == forecast.forecast_run_id
+                and review.official_result_record_id
+                == latest_result.envelope.record_id
             )
+            reviews_by_market: dict[str, list[ReviewRecord]] = {}
+            for review in matching_reviews:
+                reviews_by_market.setdefault(review.market_key, []).append(review)
+            exact_reviews: list[ReviewRecord] = []
+            for market_key in sorted(reviews_by_market):
+                canonical_reviews: dict[str, ReviewRecord] = {}
+                for review in reviews_by_market[market_key]:
+                    canonical_reviews.setdefault(
+                        _review_semantic_json(review),
+                        review,
+                    )
+                if len(canonical_reviews) != 1:
+                    raise ValueError(
+                        "conflicting review records for one link, result, "
+                        f"and market: {market_key}"
+                    )
+                exact_reviews.append(next(iter(canonical_reviews.values())))
             candidate_rows.extend(
                 _row_for_review(
                     capture,
                     forecast,
                     review,
                     observations,
-                    superseded_market_record_ids,
+                    market_relationships,
                 )
                 for review in exact_reviews
             )
 
     deduplicated: dict[tuple[str, str], CalibrationRow] = {}
     for row in candidate_rows:
-        deduplicated.setdefault((row.forecast_run_id, row.market_key), row)
+        key = (row.forecast_run_id, row.market_key)
+        existing = deduplicated.setdefault(key, row)
+        if existing != row:
+            raise ValueError(
+                "conflicting calibration rows share forecast_run_id and market_key"
+            )
     return tuple(
         sorted(
             deduplicated.values(),

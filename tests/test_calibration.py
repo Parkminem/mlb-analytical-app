@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
@@ -30,6 +30,7 @@ from analysis.review.calibration import (
 
 UTC = timezone.utc
 FIRST_PITCH = datetime(2026, 7, 14, 23, 0, tzinfo=UTC)
+_USE_OBSERVED_AT = object()
 
 
 def calibration_row(**overrides: object) -> CalibrationRow:
@@ -151,6 +152,7 @@ def append_capture_link(
     opposing_price: float | None = 1.9,
     entry_no_vig: float | None = 0.52,
     legacy_score: int | None = 80,
+    forecast_outputs_override: dict[str, object] | None = None,
 ):
     normalized_hash = f"input:{forecast_run_id}"
     capture = store.append_capture(
@@ -179,18 +181,22 @@ def append_capture_link(
             model_version="forecast-v1",
             simulation_config_hash="simulation-v1",
             normalized_input_hash=normalized_hash,
-            outputs=forecast_outputs(
-                game_pk,
-                market_type=market_type,
-                line=line,
-                selected_side=selected_side,
-                p_win=p_win,
-                p_push=p_push,
-                p_loss=p_loss,
-                selected_price=selected_price,
-                opposing_price=opposing_price,
-                entry_no_vig=entry_no_vig,
-                legacy_score=legacy_score,
+            outputs=(
+                forecast_outputs(
+                    game_pk,
+                    market_type=market_type,
+                    line=line,
+                    selected_side=selected_side,
+                    p_win=p_win,
+                    p_push=p_push,
+                    p_loss=p_loss,
+                    selected_price=selected_price,
+                    opposing_price=opposing_price,
+                    entry_no_vig=entry_no_vig,
+                    legacy_score=legacy_score,
+                )
+                if forecast_outputs_override is None
+                else forecast_outputs_override
             ),
         )
     )
@@ -262,8 +268,12 @@ def append_review(
     market_result: str = "win",
     market_type: str = "ml",
     id_suffix: str = "1",
-) -> None:
-    store.append_review(
+    classification: str | None = "A",
+    inside_80_ratio: float = 1.0,
+    contradicted_paths: tuple[str, ...] = (),
+    component_reviews: tuple[dict[str, object], ...] = (),
+):
+    return store.append_review(
         ReviewCommand(
             capture_forecast_link_record_id=link.envelope.record_id,
             capture_id=capture.capture_id,
@@ -271,10 +281,10 @@ def append_review(
             official_result_record_id=result.envelope.record_id,
             market_key=market_key(capture.game_pk, market_type),
             market_result=market_result,
-            classification="A",
-            inside_80_ratio=1.0,
-            contradicted_paths=(),
-            component_reviews=(),
+            classification=classification,
+            inside_80_ratio=inside_80_ratio,
+            contradicted_paths=contradicted_paths,
+            component_reviews=component_reviews,
         ),
         idempotency_key=(
             f"review:{capture.capture_id}:{result.envelope.record_id}:"
@@ -289,21 +299,28 @@ def append_close_market(
     game_pk: int,
     id_suffix: str,
     observed_at: datetime,
-    selected_price: float,
-    opposing_price: float,
+    selected_price: float | None,
+    opposing_price: float | None,
+    available_at: datetime | None | object = _USE_OBSERVED_AT,
     market_type: str = "ml",
     line: float | None = None,
     selected_side: str = "away",
+    close_market_key: str | None = None,
+    source_name: str = "book",
+    source_record: str | None = None,
     supersedes_record_id: str | None = None,
 ):
+    resolved_available_at = (
+        observed_at if available_at is _USE_OBSERVED_AT else available_at
+    )
     return store.append_market_observation(
         MarketObservationCommand(
             game_pk=game_pk,
-            source_name="book",
-            source_record=f"close:{game_pk}",
+            source_name=source_name,
+            source_record=source_record or f"close:{game_pk}",
             source_revision=id_suffix,
             observation_kind="close",
-            market_key=market_key(game_pk, market_type),
+            market_key=close_market_key or market_key(game_pk, market_type),
             market_type=market_type,
             settlement_format="two_way",
             selected_side=selected_side,
@@ -311,7 +328,7 @@ def append_close_market(
             selected_decimal_price=selected_price,
             opposing_decimal_price=opposing_price,
             observed_at=observed_at,
-            available_at=observed_at,
+            available_at=resolved_available_at,
             supersedes_record_id=supersedes_record_id,
         )
     )
@@ -398,6 +415,22 @@ class CalibrationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "p_push"):
             calibration_row(p_win=0.0, p_push=float("nan"), p_loss=0.0)
 
+    def test_calibration_row_rejects_exact_one_with_residual_probability(self):
+        invalid_rows = (
+            {"p_win": 1.0, "p_push": 0.0, "p_loss": 5e-13},
+            {
+                "p_win": 5e-13,
+                "p_push": 1.0,
+                "p_loss": 0.0,
+                "market_result": "push",
+            },
+            {"p_win": 5e-13, "p_push": 0.0, "p_loss": 1.0},
+        )
+        for overrides in invalid_rows:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "exact-one"):
+                    calibration_row(**overrides)
+
     def test_calibration_row_validates_identifiers_scores_results_and_prices(self):
         invalid_rows = (
             ({"game_pk": 0}, "game_pk"),
@@ -420,6 +453,11 @@ class CalibrationContractTests(unittest.TestCase):
             wins=1,
             losses=0,
             pushes=0,
+            binary_sample_size=1,
+            multiclass_sample_size=1,
+            priced_stake_count=1,
+            probability_clv_sample_size=1,
+            price_clv_sample_size=1,
             hit_rate=1.0,
             push_rate=0.0,
             binary_brier=0.25,
@@ -444,6 +482,11 @@ class CalibrationContractTests(unittest.TestCase):
                 wins=1,
                 losses=0,
                 pushes=0,
+                binary_sample_size=1,
+                multiclass_sample_size=1,
+                priced_stake_count=1,
+                probability_clv_sample_size=1,
+                price_clv_sample_size=1,
                 hit_rate=1.0,
                 push_rate=0.0,
                 binary_brier=0.25,
@@ -466,6 +509,11 @@ class CalibrationContractTests(unittest.TestCase):
             "wins": 1,
             "losses": 0,
             "pushes": 0,
+            "binary_sample_size": 1,
+            "multiclass_sample_size": 1,
+            "priced_stake_count": 0,
+            "probability_clv_sample_size": 0,
+            "price_clv_sample_size": 0,
             "hit_rate": 1.0,
             "push_rate": 0.0,
             "binary_brier": 0.25,
@@ -484,6 +532,7 @@ class CalibrationContractTests(unittest.TestCase):
                     CalibrationMetrics(**invalid)
 
         no_multiclass = dict(values)
+        no_multiclass["multiclass_sample_size"] = 0
         no_multiclass["multiclass_brier"] = None
         self.assertIsNone(
             CalibrationMetrics(**no_multiclass).multiclass_brier
@@ -495,6 +544,7 @@ class CalibrationContractTests(unittest.TestCase):
             pushes=1,
             hit_rate=None,
             push_rate=1.0,
+            binary_sample_size=0,
             binary_brier=0.25,
             log_loss=None,
         )
@@ -507,6 +557,11 @@ class CalibrationContractTests(unittest.TestCase):
             "wins": 1,
             "losses": 0,
             "pushes": 1,
+            "binary_sample_size": 1,
+            "multiclass_sample_size": 1,
+            "priced_stake_count": 0,
+            "probability_clv_sample_size": 0,
+            "price_clv_sample_size": 0,
             "hit_rate": 1.0,
             "push_rate": 0.5,
             "binary_brier": 0.25,
@@ -530,6 +585,8 @@ class CalibrationContractTests(unittest.TestCase):
             sample_size=0,
             wins=0,
             pushes=0,
+            binary_sample_size=0,
+            multiclass_sample_size=0,
             hit_rate=None,
             push_rate=0.0,
             binary_brier=None,
@@ -538,6 +595,98 @@ class CalibrationContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "push_rate"):
             CalibrationMetrics(**empty)
+
+    def test_metric_denominators_validate_domains_and_metric_availability(self):
+        values: dict[str, object] = {
+            "sample_size": 1,
+            "wins": 1,
+            "losses": 0,
+            "pushes": 0,
+            "binary_sample_size": 1,
+            "multiclass_sample_size": 0,
+            "priced_stake_count": 0,
+            "probability_clv_sample_size": 0,
+            "price_clv_sample_size": 0,
+            "hit_rate": 1.0,
+            "push_rate": 0.0,
+            "binary_brier": 0.25,
+            "multiclass_brier": None,
+            "log_loss": math.log(2.0),
+            "profit_units": None,
+            "roi": None,
+            "mean_probability_clv": None,
+            "mean_price_clv": None,
+        }
+        invalid_counts = (
+            ("binary_sample_size", 0),
+            ("multiclass_sample_size", 2),
+            ("priced_stake_count", 2),
+            ("probability_clv_sample_size", 2),
+            ("price_clv_sample_size", 1),
+        )
+        for field_name, value in invalid_counts:
+            with self.subTest(field_name=field_name, value=value):
+                invalid = dict(values)
+                invalid[field_name] = value
+                with self.assertRaisesRegex(ValueError, field_name):
+                    CalibrationMetrics(**invalid)
+
+        unavailable_cases = (
+            {"multiclass_brier": 0.5},
+            {"profit_units": 0.0, "roi": 0.0},
+            {"mean_probability_clv": 0.1},
+            {"mean_price_clv": 0.1},
+        )
+        for overrides in unavailable_cases:
+            with self.subTest(overrides=overrides):
+                invalid = dict(values)
+                invalid.update(overrides)
+                with self.assertRaisesRegex(ValueError, next(iter(overrides))):
+                    CalibrationMetrics(**invalid)
+
+        required_cases = (
+            ({"multiclass_sample_size": 1}, "multiclass_brier"),
+            ({"priced_stake_count": 1}, "profit_units"),
+            ({"probability_clv_sample_size": 1}, "mean_probability_clv"),
+            (
+                {
+                    "priced_stake_count": 1,
+                    "profit_units": 0.0,
+                    "roi": 0.0,
+                    "price_clv_sample_size": 1,
+                },
+                "mean_price_clv",
+            ),
+        )
+        for overrides, message in required_cases:
+            with self.subTest(overrides=overrides):
+                invalid = dict(values)
+                invalid.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    CalibrationMetrics(**invalid)
+
+    def test_roi_must_use_priced_stake_count_as_its_denominator(self):
+        with self.assertRaisesRegex(ValueError, "roi"):
+            CalibrationMetrics(
+                sample_size=2,
+                wins=1,
+                losses=1,
+                pushes=0,
+                binary_sample_size=2,
+                multiclass_sample_size=0,
+                priced_stake_count=2,
+                probability_clv_sample_size=0,
+                price_clv_sample_size=0,
+                hit_rate=0.5,
+                push_rate=0.0,
+                binary_brier=0.25,
+                multiclass_brier=None,
+                log_loss=math.log(2.0),
+                profit_units=0.5,
+                roi=0.3,
+                mean_probability_clv=None,
+                mean_price_clv=None,
+            )
 
     def test_group_and_report_validate_fixed_partition_contract(self):
         metrics = build_calibration_report(
@@ -592,6 +741,26 @@ class CalibrationMetricTests(unittest.TestCase):
 
         self.assertAlmostEqual(report.overall.binary_brier, (0.50 - 1.0) ** 2)
         self.assertAlmostEqual(report.overall.log_loss, -math.log(0.50))
+
+    def test_conditional_probability_uses_explicit_win_and_loss_mass(self):
+        p_win = 0.45
+        p_loss = 0.4500000000005
+        report = build_calibration_report(
+            (
+                calibration_row(
+                    p_win=p_win,
+                    p_push=0.10,
+                    p_loss=p_loss,
+                ),
+            ),
+            group_by=(),
+        )
+
+        expected_probability = p_win / math.fsum((p_win, p_loss))
+        self.assertEqual(
+            report.overall.binary_brier,
+            (expected_probability - 1.0) ** 2,
+        )
 
     def test_log_loss_clips_endpoint_probabilities(self):
         report = build_calibration_report(
@@ -650,6 +819,22 @@ class CalibrationMetricTests(unittest.TestCase):
         expected = (0.4 - 1.0) ** 2 + 0.2**2 + 0.4**2
         self.assertAlmostEqual(report.overall.multiclass_brier, expected)
 
+    def test_multiclass_brier_penalizes_zero_push_forecast_that_pushes(self):
+        report = build_calibration_report(
+            (
+                calibration_row(
+                    p_win=1.0,
+                    p_push=0.0,
+                    p_loss=0.0,
+                    market_result="push",
+                ),
+            ),
+            group_by=(),
+        )
+
+        self.assertEqual(report.overall.multiclass_sample_size, 1)
+        self.assertEqual(report.overall.multiclass_brier, 2.0)
+
     def test_multiclass_brier_is_none_without_push_probability(self):
         report = build_calibration_report(
             (calibration_row(p_win=0.6, p_push=0.0, p_loss=0.4),),
@@ -698,6 +883,47 @@ class CalibrationMetricTests(unittest.TestCase):
         self.assertAlmostEqual(report.overall.profit_units, 0.2)
         self.assertAlmostEqual(report.overall.roi, 0.1)
 
+    def test_metric_denominators_track_each_eligible_subset(self):
+        rows = (
+            calibration_row(forecast_run_id="priced-win"),
+            calibration_row(
+                forecast_run_id="unpriced-loss",
+                market_result="loss",
+                selected_decimal_price=None,
+                closing_selected_decimal_price=None,
+                entry_no_vig_probability=None,
+                closing_no_vig_probability=None,
+            ),
+            calibration_row(
+                forecast_run_id="zero-push-actual-push",
+                p_win=0.6,
+                p_push=0.0,
+                p_loss=0.4,
+                market_result="push",
+                closing_selected_decimal_price=None,
+                entry_no_vig_probability=None,
+                closing_no_vig_probability=None,
+            ),
+            calibration_row(
+                forecast_run_id="push-capable-win",
+                p_win=0.5,
+                p_push=0.2,
+                p_loss=0.3,
+                selected_decimal_price=None,
+                closing_selected_decimal_price=None,
+                entry_no_vig_probability=0.50,
+                closing_no_vig_probability=0.55,
+            ),
+        )
+
+        metrics = build_calibration_report(rows, group_by=()).overall
+
+        self.assertEqual(metrics.binary_sample_size, 3)
+        self.assertEqual(metrics.multiclass_sample_size, 2)
+        self.assertEqual(metrics.priced_stake_count, 2)
+        self.assertEqual(metrics.probability_clv_sample_size, 2)
+        self.assertEqual(metrics.price_clv_sample_size, 1)
+
     def test_clv_uses_matching_available_pairs_and_selected_direction(self):
         rows = (
             calibration_row(
@@ -744,6 +970,11 @@ class CalibrationMetricTests(unittest.TestCase):
         self.assertEqual(report.overall.wins, 0)
         self.assertEqual(report.overall.losses, 0)
         self.assertEqual(report.overall.pushes, 0)
+        self.assertEqual(report.overall.binary_sample_size, 0)
+        self.assertEqual(report.overall.multiclass_sample_size, 0)
+        self.assertEqual(report.overall.priced_stake_count, 0)
+        self.assertEqual(report.overall.probability_clv_sample_size, 0)
+        self.assertEqual(report.overall.price_clv_sample_size, 0)
         self.assertIsNone(report.overall.hit_rate)
         self.assertIsNone(report.overall.push_rate)
         self.assertIsNone(report.overall.multiclass_brier)
@@ -751,6 +982,47 @@ class CalibrationMetricTests(unittest.TestCase):
 
 
 class CalibrationGroupingTests(unittest.TestCase):
+    def _fully_observed_report(self) -> CalibrationReport:
+        rows = (
+            calibration_row(
+                forecast_run_id="partition-ml-win",
+                market_type="ml",
+                p_win=0.6,
+                p_push=0.1,
+                p_loss=0.3,
+                market_result="win",
+                selected_decimal_price=2.0,
+                closing_selected_decimal_price=1.8,
+                entry_no_vig_probability=0.52,
+                closing_no_vig_probability=0.56,
+            ),
+            calibration_row(
+                forecast_run_id="partition-total-loss",
+                market_type="full_total",
+                p_win=0.4,
+                p_push=0.2,
+                p_loss=0.4,
+                market_result="loss",
+                selected_decimal_price=1.9,
+                closing_selected_decimal_price=2.0,
+                entry_no_vig_probability=0.55,
+                closing_no_vig_probability=0.50,
+            ),
+            calibration_row(
+                forecast_run_id="partition-total-push",
+                market_type="full_total",
+                p_win=0.5,
+                p_push=0.0,
+                p_loss=0.5,
+                market_result="push",
+                selected_decimal_price=2.1,
+                closing_selected_decimal_price=2.0,
+                entry_no_vig_probability=0.50,
+                closing_no_vig_probability=0.50,
+            ),
+        )
+        return build_calibration_report(rows, group_by=("market_type",))
+
     def test_all_fixed_grouping_dimensions_are_supported_and_deterministic(self):
         self.assertEqual(
             GROUPING_DIMENSIONS,
@@ -844,6 +1116,89 @@ class CalibrationGroupingTests(unittest.TestCase):
             with self.subTest(group_by=group_by):
                 with self.assertRaisesRegex(ValueError, message):
                     build_calibration_report((calibration_row(),), group_by=group_by)
+
+    def test_report_rejects_outcome_and_denominator_partition_mismatches(self):
+        report = self._fully_observed_report()
+        full_total_group = report.groups[0]
+        self.assertEqual(
+            full_total_group.dimensions,
+            (("market_type", "full_total"),),
+        )
+        mismatches = (
+            (
+                "wins",
+                {
+                    "wins": 1,
+                    "losses": 0,
+                    "hit_rate": 1.0,
+                },
+            ),
+            (
+                "multiclass_sample_size",
+                {"multiclass_sample_size": 1},
+            ),
+            (
+                "priced_stake_count",
+                {
+                    "priced_stake_count": 1,
+                    "price_clv_sample_size": 1,
+                    "roi": -1.0,
+                },
+            ),
+            (
+                "probability_clv_sample_size",
+                {"probability_clv_sample_size": 1},
+            ),
+            (
+                "price_clv_sample_size",
+                {"price_clv_sample_size": 1},
+            ),
+        )
+        for field_name, overrides in mismatches:
+            with self.subTest(field_name=field_name):
+                invalid_group = replace(
+                    full_total_group,
+                    metrics=replace(full_total_group.metrics, **overrides),
+                )
+                with self.assertRaisesRegex(ValueError, field_name):
+                    CalibrationReport(
+                        overall=report.overall,
+                        groups=(invalid_group, *report.groups[1:]),
+                        group_by=report.group_by,
+                    )
+
+    def test_report_reconstructs_weighted_metrics_and_additive_profit(self):
+        report = self._fully_observed_report()
+        metric_overrides = (
+            ("binary_brier", report.overall.binary_brier + 0.01),
+            ("multiclass_brier", report.overall.multiclass_brier + 0.01),
+            ("log_loss", report.overall.log_loss + 0.01),
+            (
+                "mean_probability_clv",
+                report.overall.mean_probability_clv + 0.01,
+            ),
+            ("mean_price_clv", report.overall.mean_price_clv + 0.01),
+        )
+        for field_name, value in metric_overrides:
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(ValueError, field_name):
+                    CalibrationReport(
+                        overall=replace(report.overall, **{field_name: value}),
+                        groups=report.groups,
+                        group_by=report.group_by,
+                    )
+
+        profit_units = report.overall.profit_units + 0.1
+        with self.assertRaisesRegex(ValueError, "profit_units"):
+            CalibrationReport(
+                overall=replace(
+                    report.overall,
+                    profit_units=profit_units,
+                    roi=profit_units / report.overall.priced_stake_count,
+                ),
+                groups=report.groups,
+                group_by=report.group_by,
+            )
 
 
 class CalibrationSelectionTests(unittest.TestCase):
@@ -1211,6 +1566,167 @@ class CalibrationSelectionTests(unittest.TestCase):
 
         self.assertEqual(select_primary_rows(self.store), ())
 
+    def test_identical_forecast_market_across_all_roots_is_accepted(self):
+        game_pk = 910028
+        outputs = forecast_outputs(game_pk)
+        nested_market = outputs["forecast_output"]["markets"][market_key(game_pk)]
+        outputs["markets"] = {
+            market_key(game_pk): dict(reversed(tuple(nested_market.items())))
+        }
+        outputs["forecast"] = {
+            "markets": {market_key(game_pk): dict(nested_market)}
+        }
+        context = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="identical-forecast-roots",
+            id_suffix="capture",
+            forecast_outputs_override=outputs,
+        )
+        self._complete_reviews(game_pk, (context,))
+
+        rows = select_primary_rows(self.store)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].p_win, 0.55)
+
+    def test_conflicting_forecast_market_in_later_root_raises(self):
+        game_pk = 910029
+        outputs = forecast_outputs(game_pk)
+        nested_market = outputs["forecast_output"]["markets"][market_key(game_pk)]
+        outputs["markets"] = {market_key(game_pk): dict(nested_market)}
+        conflicting_market = dict(nested_market)
+        conflicting_market["probabilities"] = {
+            "win": 0.60,
+            "push": 0.0,
+            "loss": 0.40,
+        }
+        outputs["forecast"] = {
+            "markets": {market_key(game_pk): conflicting_market}
+        }
+        context = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-forecast-roots",
+            id_suffix="capture",
+            forecast_outputs_override=outputs,
+        )
+        self._complete_reviews(game_pk, (context,))
+
+        with self.assertRaisesRegex(ValueError, "conflicting forecast market"):
+            select_primary_rows(self.store)
+
+    def test_exact_duplicate_reviews_are_deduplicated_semantically(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910030,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="duplicate-review",
+            id_suffix="capture",
+        )
+        append_entry_market(self.store, game_pk=910030, id_suffix="entry")
+        result = append_result(self.store, game_pk=910030)
+        for id_suffix in ("a", "b"):
+            append_review(
+                self.store,
+                capture=context[0],
+                forecast=context[1],
+                link=context[2],
+                result=result,
+                id_suffix=id_suffix,
+            )
+
+        normal = select_primary_rows(self.store)
+        reordered = select_primary_rows(ReorderedLedgerView(self.store))
+
+        self.assertEqual(normal, reordered)
+        self.assertEqual(len(normal), 1)
+
+    def test_duplicate_reviews_with_conflicting_results_raise(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910031,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-review-result",
+            id_suffix="capture",
+        )
+        append_entry_market(self.store, game_pk=910031, id_suffix="entry")
+        result = append_result(self.store, game_pk=910031)
+        for id_suffix, market_result in (("win", "win"), ("loss", "loss")):
+            append_review(
+                self.store,
+                capture=context[0],
+                forecast=context[1],
+                link=context[2],
+                result=result,
+                id_suffix=id_suffix,
+                market_result=market_result,
+            )
+
+        with self.assertRaisesRegex(ValueError, "conflicting review records"):
+            select_primary_rows(self.store)
+
+    def test_duplicate_reviews_with_conflicting_classifications_raise(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910032,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-review-classification",
+            id_suffix="capture",
+        )
+        append_entry_market(self.store, game_pk=910032, id_suffix="entry")
+        result = append_result(self.store, game_pk=910032)
+        for classification in ("A", "B"):
+            append_review(
+                self.store,
+                capture=context[0],
+                forecast=context[1],
+                link=context[2],
+                result=result,
+                id_suffix=classification,
+                classification=classification,
+            )
+
+        with self.assertRaisesRegex(ValueError, "conflicting review records"):
+            select_primary_rows(self.store)
+
+    def test_duplicate_reviews_with_conflicting_component_reviews_raise(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910033,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-review-component",
+            id_suffix="capture",
+        )
+        append_entry_market(self.store, game_pk=910033, id_suffix="entry")
+        result = append_result(self.store, game_pk=910033)
+        for classification in ("A", "B"):
+            append_review(
+                self.store,
+                capture=context[0],
+                forecast=context[1],
+                link=context[2],
+                result=result,
+                id_suffix=classification,
+                component_reviews=(
+                    {
+                        "component_id": "away_full_runs",
+                        "classification": classification,
+                    },
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "conflicting review records"):
+            select_primary_rows(self.store)
+
     def test_close_must_match_selected_market_contract(self):
         context = append_capture_link(
             self.store,
@@ -1288,6 +1804,199 @@ class CalibrationSelectionTests(unittest.TestCase):
         rows = select_primary_rows(self.store)
 
         self.assertEqual(rows[0].closing_selected_decimal_price, 1.85)
+
+    def test_close_requires_observation_and_availability_by_first_pitch(self):
+        invalid_times = (
+            (
+                "future-observation",
+                FIRST_PITCH + timedelta(minutes=1),
+                FIRST_PITCH - timedelta(minutes=1),
+            ),
+            (
+                "missing-availability",
+                FIRST_PITCH - timedelta(minutes=1),
+                None,
+            ),
+            (
+                "future-availability",
+                FIRST_PITCH - timedelta(minutes=1),
+                FIRST_PITCH + timedelta(minutes=1),
+            ),
+        )
+        for index, (name, observed_at, available_at) in enumerate(invalid_times):
+            with self.subTest(name=name):
+                game_pk = 910020 + index
+                context = append_capture_link(
+                    self.store,
+                    game_pk=game_pk,
+                    captured_at=FIRST_PITCH - timedelta(hours=1),
+                    lineup_state="confirmed",
+                    forecast_run_id=f"close-time-{index}",
+                    id_suffix="capture",
+                )
+                self._complete_reviews(game_pk, (context,))
+                append_close_market(
+                    self.store,
+                    game_pk=game_pk,
+                    id_suffix="eligible",
+                    observed_at=FIRST_PITCH - timedelta(minutes=10),
+                    selected_price=1.95,
+                    opposing_price=1.95,
+                )
+                append_close_market(
+                    self.store,
+                    game_pk=game_pk,
+                    id_suffix="ineligible",
+                    observed_at=observed_at,
+                    available_at=available_at,
+                    selected_price=1.70,
+                    opposing_price=2.20,
+                    source_record=f"invalid-close:{game_pk}",
+                )
+
+                row = next(
+                    row
+                    for row in select_primary_rows(self.store)
+                    if row.game_pk == game_pk
+                )
+                self.assertEqual(row.closing_selected_decimal_price, 1.95)
+
+    def test_post_pitch_successor_does_not_hide_eligible_close(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910023,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="close-future-revision",
+            id_suffix="capture",
+        )
+        self._complete_reviews(910023, (context,))
+        eligible = append_close_market(
+            self.store,
+            game_pk=910023,
+            id_suffix="1",
+            observed_at=FIRST_PITCH - timedelta(minutes=5),
+            selected_price=1.90,
+            opposing_price=2.00,
+        )
+        append_close_market(
+            self.store,
+            game_pk=910023,
+            id_suffix="2",
+            observed_at=FIRST_PITCH + timedelta(minutes=1),
+            selected_price=1.70,
+            opposing_price=2.20,
+            supersedes_record_id=eligible.envelope.record_id,
+        )
+
+        rows = select_primary_rows(self.store)
+
+        self.assertEqual(rows[0].closing_selected_decimal_price, 1.90)
+
+    def test_close_matches_semantic_market_terms_without_identical_market_key(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910024,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="semantic-close-key",
+            id_suffix="capture",
+            market_type="full_total",
+            line=8.5,
+            selected_side="over",
+        )
+        self._complete_reviews(910024, (context,), market_type="full_total")
+        append_close_market(
+            self.store,
+            game_pk=910024,
+            id_suffix="semantic",
+            observed_at=FIRST_PITCH - timedelta(minutes=2),
+            selected_price=1.82,
+            opposing_price=2.08,
+            market_type="full_total",
+            line=8.5,
+            selected_side="over",
+            close_market_key="sportsbook:rotation:910024:total:over",
+        )
+
+        rows = select_primary_rows(self.store)
+
+        self.assertEqual(rows[0].closing_selected_decimal_price, 1.82)
+
+    def test_identical_latest_close_quotes_are_canonicalized(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910025,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="duplicate-close-quotes",
+            id_suffix="capture",
+        )
+        self._complete_reviews(910025, (context,))
+        for source_name in ("z-book", "a-book"):
+            append_close_market(
+                self.store,
+                game_pk=910025,
+                id_suffix="1",
+                observed_at=FIRST_PITCH - timedelta(minutes=2),
+                selected_price=1.84,
+                opposing_price=2.06,
+                source_name=source_name,
+            )
+
+        normal = select_primary_rows(self.store)
+        reordered = select_primary_rows(ReorderedLedgerView(self.store))
+
+        self.assertEqual(normal, reordered)
+        self.assertEqual(normal[0].closing_selected_decimal_price, 1.84)
+
+    def test_conflicting_latest_close_selected_prices_raise(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910026,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-close-price",
+            id_suffix="capture",
+        )
+        self._complete_reviews(910026, (context,))
+        for source_name, selected_price in (("a-book", 1.80), ("b-book", 1.90)):
+            append_close_market(
+                self.store,
+                game_pk=910026,
+                id_suffix="1",
+                observed_at=FIRST_PITCH - timedelta(minutes=2),
+                selected_price=selected_price,
+                opposing_price=2.05,
+                source_name=source_name,
+            )
+
+        with self.assertRaisesRegex(ValueError, "conflicting closing quotes"):
+            select_primary_rows(self.store)
+
+    def test_conflicting_latest_close_no_vig_inputs_raise(self):
+        context = append_capture_link(
+            self.store,
+            game_pk=910027,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="conflicting-close-no-vig",
+            id_suffix="capture",
+        )
+        self._complete_reviews(910027, (context,))
+        for source_name, opposing_price in (("a-book", 2.00), ("b-book", 2.20)):
+            append_close_market(
+                self.store,
+                game_pk=910027,
+                id_suffix="1",
+                observed_at=FIRST_PITCH - timedelta(minutes=2),
+                selected_price=1.85,
+                opposing_price=opposing_price,
+                source_name=source_name,
+            )
+
+        with self.assertRaisesRegex(ValueError, "conflicting closing quotes"):
+            select_primary_rows(self.store)
 
     def test_missing_matching_close_is_explicitly_unavailable(self):
         context = append_capture_link(
