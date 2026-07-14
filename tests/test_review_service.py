@@ -6,8 +6,16 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from analysis.forecasting import MarketType, SettlementFormat, run_forecast
-from analysis.forecasting.identity import canonical_json
+from analysis.forecasting import (
+    LineupState,
+    MarketType,
+    SettlementFormat,
+    run_forecast,
+)
+from analysis.forecasting.identity import (
+    build_forecast_run_id_from_capture_payload,
+    canonical_json,
+)
 from analysis.forecasting.market import (
     OutcomeProbabilities,
     market_semantic_fingerprint,
@@ -210,11 +218,13 @@ class ReviewServiceTests(unittest.TestCase):
         result_finalized_at=None,
         market_observation_side="home",
         forecast_run_id=None,
+        model_version=None,
         stored_normalized_input_hash=None,
         simulation_config_hash=None,
         mutate_capture_payload=None,
         record_captured_at=None,
         record_first_pitch=None,
+        record_lineup_state="confirmed",
     ) -> RecordedFixture:
         outputs = self._fresh_outputs()
         if mutate_outputs is not None:
@@ -247,7 +257,7 @@ class ReviewServiceTests(unittest.TestCase):
                     if record_first_pitch is None
                     else record_first_pitch
                 ),
-                lineup_state="confirmed",
+                lineup_state=record_lineup_state,
                 out_of_sample_eligible=True,
                 normalized_input_hash=record_input_hash,
                 payload=capture_payload,
@@ -256,7 +266,11 @@ class ReviewServiceTests(unittest.TestCase):
         forecast = self.store.append_forecast(
             ForecastCommand(
                 forecast_run_id=record_forecast_run_id,
-                model_version=self.engine_forecast.model_version,
+                model_version=(
+                    self.engine_forecast.model_version
+                    if model_version is None
+                    else model_version
+                ),
                 simulation_config_hash=(
                     self.simulation_config_hash
                     if simulation_config_hash is None
@@ -990,6 +1004,58 @@ class ReviewServiceTests(unittest.TestCase):
                 MARKET_KEY,
             )
 
+    def test_review_accepts_exact_mlb_original_and_correction_results(self):
+        fixture = self.fixture()
+
+        original = build_review_candidate(
+            self.store,
+            fixture.link.envelope.record_id,
+            fixture.result.envelope.record_id,
+            MARKET_KEY,
+        )
+        correction = self.append_correction(fixture)
+        corrected = build_review_candidate(
+            self.store,
+            fixture.link.envelope.record_id,
+            correction.envelope.record_id,
+            MARKET_KEY,
+        )
+
+        self.assertEqual(fixture.result.source_name, "MLB")
+        self.assertEqual(correction.source_name, "MLB")
+        self.assertEqual(
+            original.official_result_record_id,
+            fixture.result.envelope.record_id,
+        )
+        self.assertEqual(
+            corrected.official_result_record_id,
+            correction.envelope.record_id,
+        )
+
+    def test_review_rejects_latest_result_from_noncanonical_source(self):
+        for source_name in ("unofficial-blog", "unofficial-MLB-blog"):
+            with self.subTest(source_name=source_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture()
+                    correction = self.store.append_official_result(
+                        replace(
+                            self.correction_command(fixture),
+                            source_name=source_name,
+                        )
+                    )
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "source_name.*MLB|official MLB",
+                    ):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            correction.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
     def test_malformed_forecast_schema_and_fingerprint_are_rejected(self):
         mutations = (
             (
@@ -1170,6 +1236,102 @@ class ReviewServiceTests(unittest.TestCase):
                             MARKET_KEY,
                         )
 
+    def test_capture_lineup_state_must_match_frozen_payload(self):
+        def project_away_lineup(payload):
+            payload["away_lineup"]["state"] = "projected"
+
+        cases = (
+            ({"record_lineup_state": "projected"}, "confirmed payload"),
+            (
+                {"mutate_capture_payload": project_away_lineup},
+                "projected payload",
+            ),
+        )
+        for fixture_kwargs, label in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(**fixture_kwargs)
+
+                    with self.assertRaisesRegex(ValueError, "lineup_state"):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
+
+    def test_review_accepts_confirmed_mixed_and_projected_lineups(self):
+        cases = (
+            (LineupState.CONFIRMED, LineupState.CONFIRMED, "confirmed"),
+            (LineupState.CONFIRMED, LineupState.PROJECTED, "projected"),
+            (LineupState.PROJECTED, LineupState.PROJECTED, "projected"),
+        )
+        for index, (away_state, home_state, expected) in enumerate(cases):
+            with self.subTest(away_state=away_state, home_state=home_state):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    game = replace(
+                        self.game,
+                        away_lineup=replace(
+                            self.game.away_lineup,
+                            state=away_state,
+                        ),
+                        home_lineup=replace(
+                            self.game.home_lineup,
+                            state=home_state,
+                        ),
+                    )
+                    forecast = run_forecast(game, _fast_config())
+                    records = record_shadow_run(
+                        store,
+                        game,
+                        _legacy_snapshot(),
+                        forecast,
+                        ShadowRunIdempotencyKeys(
+                            capture=f"capture:review:lineup:{index}"
+                        ),
+                    )
+                    component_values = {}
+                    for path in _principal_paths():
+                        for component_id in path.component_ids:
+                            summary = records.forecast.outputs[
+                                "component_distributions"
+                            ][component_id]["summary"]
+                            component_values[component_id] = float(
+                                summary["median"]
+                            )
+                    component_values["away_full_runs"] = 4.0
+                    result = store.append_official_result(
+                        OfficialResultCommand(
+                            game_pk=game.identity.game_pk,
+                            source_name="MLB",
+                            source_record=(
+                                f"game/{game.identity.game_pk}/boxscore"
+                            ),
+                            source_revision="1",
+                            finalized_at=(
+                                game.identity.first_pitch + timedelta(hours=4)
+                            ),
+                            away_f5_runs=2,
+                            home_f5_runs=1,
+                            away_full_runs=4,
+                            home_full_runs=3,
+                            component_values=component_values,
+                            documented_events=(),
+                        )
+                    )
+
+                    candidate = build_review_candidate(
+                        store,
+                        records.link.envelope.record_id,
+                        result.envelope.record_id,
+                        MARKET_KEY,
+                    )
+
+                    self.assertEqual(records.capture.lineup_state, expected)
+                    self.assertEqual(candidate.capture_id, records.capture.capture_id)
+
     def test_market_evaluation_revalidates_probability_derived_fields(self):
         def forge_probability_and_edge(outputs):
             evaluation = outputs["markets"][MARKET_KEY]
@@ -1339,6 +1501,46 @@ class ReviewServiceTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "outputs forecast_run_id"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_forecast_model_version_must_match_frozen_config_version(self):
+        forged_model_version = "forged-model-v2"
+        forged_run_id = build_forecast_run_id_from_capture_payload(
+            self.capture_payload,
+            forged_model_version,
+            self.engine_forecast.simulation_config,
+        )
+
+        def forge_version_bound_ids(outputs):
+            outputs["forecast_run_id"] = forged_run_id
+            outputs["shadow_comparison"]["forecast_run_id"] = forged_run_id
+
+        fixture = self.fixture(
+            mutate_outputs=forge_version_bound_ids,
+            forecast_run_id=forged_run_id,
+            model_version=forged_model_version,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "model_version.*config_version|simulation_config.*version",
+        ):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_simulation_config_hash_must_match_frozen_config(self):
+        fixture = self.fixture(simulation_config_hash="f" * 64)
+
+        with self.assertRaisesRegex(ValueError, "simulation_config_hash"):
             build_review_candidate(
                 self.store,
                 fixture.link.envelope.record_id,

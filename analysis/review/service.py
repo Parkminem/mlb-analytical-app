@@ -12,7 +12,7 @@ from analysis.forecasting.identity import (
     normalized_input_hash_from_capture_payload,
     semantic_forecast_payload_from_capture_payload,
 )
-from analysis.forecasting.inputs import MarketType, NormalizedGameInput
+from analysis.forecasting.inputs import LineupState, MarketType, NormalizedGameInput
 from analysis.forecasting.market import settle_observed_market
 from analysis.forecasting.simulation import (
     ComponentDistribution,
@@ -48,6 +48,7 @@ _SIDE_MARKETS = frozenset(
 _SUPPORTED_EVENT_TYPES = frozenset(
     ("injury", "ejection", "defensive_error", "defensive_error_cluster")
 )
+_OFFICIAL_RESULT_SOURCE_NAME = "MLB"
 _SUMMARY_FIELDS = ("p05", "p10", "p20", "median", "p80", "p90", "p95")
 _EVIDENCE_PATH_ORDER = {
     evidence_path: index
@@ -194,6 +195,19 @@ def _validated_capture_game(capture: CaptureRecord) -> NormalizedGameInput:
     if game.identity.first_pitch != capture.first_pitch:
         raise ValueError(
             "capture payload identity.first_pitch must exactly match CaptureRecord"
+        )
+    expected_lineup_state = (
+        "confirmed"
+        if (
+            game.away_lineup.state,
+            game.home_lineup.state,
+        )
+        == (LineupState.CONFIRMED, LineupState.CONFIRMED)
+        else "projected"
+    )
+    if capture.lineup_state != expected_lineup_state:
+        raise ValueError(
+            "CaptureRecord lineup_state must exactly match frozen lineup states"
         )
     validation = validate_pregame_input(game)
     if validation.out_of_sample_eligible != capture.out_of_sample_eligible:
@@ -514,6 +528,8 @@ def build_review_candidate(
     )
     capture = _capture_for_link(records, link)
     forecast = _forecast_for_link(records, link)
+    if result.source_name != _OFFICIAL_RESULT_SOURCE_NAME:
+        raise ValueError("official result source_name must be exactly MLB")
     if capture.normalized_input_hash != forecast.normalized_input_hash:
         raise ValueError(
             "linked CaptureRecord and ForecastRecord normalized_input_hash mismatch"
@@ -541,6 +557,15 @@ def build_review_candidate(
         away_team=away_team,
         home_team=home_team,
     )
+    if not (
+        forecast.model_version
+        == forecast_context.config_version
+        == forecast_context.simulation_config.version
+    ):
+        raise ValueError(
+            "ForecastRecord model_version must match frozen config_version "
+            "and simulation_config version"
+        )
     _require_deterministic_forecast_identity(
         capture,
         forecast,
