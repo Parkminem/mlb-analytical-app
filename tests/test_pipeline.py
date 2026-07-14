@@ -1,4 +1,9 @@
+import copy
+import hashlib
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from analysis.pipeline import (
     MODEL_LAYERS,
@@ -8,7 +13,117 @@ from analysis.pipeline import (
 )
 
 
+EXPECTED_FORECASTING_CONFIG = {
+    "enabled": True,
+    "mode": "shadow",
+    "model_version": "shadow-forecast-2026-07-14.1",
+    "may_change_recommendations": False,
+    "simulations": 20_000,
+    "league_runs_per_team_game": 4.5,
+    "league_woba": 0.320,
+    "gamma_poisson_shape": 1.6,
+    "extra_inning_multiplier": 1.8,
+    "max_innings": 30,
+    "offense_bounds": [0.65, 1.45],
+    "matchup_bounds": [0.80, 1.20],
+    "starter_ra9_bounds": [0.55, 1.75],
+    "bullpen_ra9_bounds": [0.60, 1.90],
+    "pitch_limit_high_bucket_transfer": 1.0,
+    "pitch_limit_transfer_to_under_five": 0.4,
+    "sample_shortage_log_se_penalty": 0.12,
+    "unknown_bullpen_matchup_log_se_penalty": 0.08,
+    "handoff_uncertainty_log_se_penalty": 0.10,
+    "injury_return_log_se_penalty": 0.12,
+    "recent_short_exit_log_se_penalty": 0.10,
+    "limited_reliever_log_se_penalty": 0.10,
+    "unscheduled_f5_relief_log_standard_error": 0.15,
+    "pa_weights": [1.11, 1.08, 1.06, 1.04, 1.01, 0.98, 0.94, 0.91, 0.87],
+    "confirmed_lineup_validation_games": 100,
+    "market_family_tuning_decisions": 300,
+}
+
+LEGACY_CONFIG_SHA256 = "7e981caaf826989612b421149d3dd5ebbfafe7b3cafff6f3bf5ce49b50d9cd7d"
+
+
 class ModelConfigTests(unittest.TestCase):
+    @staticmethod
+    def _load_config_payload(payload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "model.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            return load_model_config(config_path)
+
+    def test_forecasting_block_matches_approved_shadow_configuration(self):
+        config = load_model_config()
+
+        self.assertEqual(config["version"], "2026-07-13")
+        self.assertEqual(config.get("forecasting"), EXPECTED_FORECASTING_CONFIG)
+
+    def test_forecasting_addition_preserves_every_legacy_config_value(self):
+        config = load_model_config()
+        legacy_config = {
+            key: value for key, value in config.items() if key != "forecasting"
+        }
+        canonical = json.dumps(
+            legacy_config,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+        self.assertEqual(hashlib.sha256(canonical).hexdigest(), LEGACY_CONFIG_SHA256)
+
+    def test_loader_rejects_authority_changing_forecasting_metadata(self):
+        base_config = load_model_config()
+
+        for field, value in (
+            ("mode", "production"),
+            ("may_change_recommendations", True),
+        ):
+            with self.subTest(field=field, value=value):
+                config = copy.deepcopy(base_config)
+                config["forecasting"] = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+                config["forecasting"][field] = value
+
+                with self.assertRaises(ValueError):
+                    self._load_config_payload(config)
+
+    def test_loader_rejects_malformed_forecasting_block(self):
+        base_config = load_model_config()
+        missing_simulations = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+        missing_simulations.pop("simulations")
+        invalid_simulations = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+        invalid_simulations["simulations"] = 0
+        invalid_enabled = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+        invalid_enabled["enabled"] = "true"
+
+        for forecasting in (
+            None,
+            missing_simulations,
+            invalid_simulations,
+            invalid_enabled,
+        ):
+            with self.subTest(forecasting=forecasting):
+                config = copy.deepcopy(base_config)
+                config["forecasting"] = forecasting
+
+                with self.assertRaises(ValueError):
+                    self._load_config_payload(config)
+
+    def test_loader_rejects_missing_forecasting_block(self):
+        config = load_model_config()
+        config.pop("forecasting", None)
+
+        with self.assertRaises(ValueError):
+            self._load_config_payload(config)
+
+    def test_loader_rejects_changed_legacy_version(self):
+        config = load_model_config()
+        config["version"] = "2026-07-14"
+        config["forecasting"] = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+
+        with self.assertRaises(ValueError):
+            self._load_config_payload(config)
+
     def test_default_config_preserves_fixed_source_and_weather_rules(self):
         config = load_model_config()
 
@@ -240,6 +355,85 @@ class PitchVelocitySlotTests(unittest.TestCase):
 
 
 class AnalysisManifestTests(unittest.TestCase):
+    def test_manifest_declares_legacy_as_decision_authority(self):
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+        )
+
+        self.assertEqual(manifest.get("decision_authority"), "legacy_fixed_model")
+        forecasting = manifest.get("forecasting", {})
+        self.assertEqual(forecasting.get("mode"), "shadow")
+        self.assertFalse(forecasting.get("may_change_recommendations", True))
+
+    def test_manifest_exposes_detached_forecasting_metadata(self):
+        config = load_model_config()
+        config["forecasting"] = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+            config=config,
+        )
+
+        self.assertIn("forecasting", manifest)
+        config["forecasting"]["mode"] = "production"
+        config["forecasting"]["pa_weights"][0] = 99.0
+        self.assertEqual(manifest["forecasting"], EXPECTED_FORECASTING_CONFIG)
+
+    def test_shadow_metadata_does_not_change_legacy_manifest_contract(self):
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+        )
+
+        self.assertEqual(manifest["model_version"], "2026-07-13")
+        self.assertTrue(manifest["fixed_model"])
+        self.assertEqual(manifest["strength_adjustments"], [])
+        self.assertNotIn("picks", manifest)
+        self.assertNotIn("scores", manifest)
+        self.assertNotIn("thresholds", manifest)
+        self.assertEqual(
+            set(manifest),
+            {
+                "model_version",
+                "fixed_model",
+                "decision_authority",
+                "forecasting",
+                "layers",
+                "lineup_source",
+                "include_weather",
+                "cache_policy",
+                "required_inputs",
+                "confidence_flags",
+                "strength_adjustments",
+                "priority_candidate_assembler",
+                "required_outputs",
+            },
+        )
+
+    def test_shadow_metadata_does_not_change_required_outputs(self):
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+        )
+
+        self.assertEqual(
+            manifest["required_outputs"],
+            ["F5", "F5 O/U", "ML", "+1.5", "O/U", "review"],
+        )
+
+    def test_manifest_rejects_authority_changing_inline_config(self):
+        config = load_model_config()
+        config["forecasting"] = copy.deepcopy(EXPECTED_FORECASTING_CONFIG)
+        config["forecasting"]["mode"] = "production"
+
+        with self.assertRaises(ValueError):
+            build_analysis_manifest(
+                lineup_confirmed=True,
+                starter_confirmed=True,
+                config=config,
+            )
+
     def test_projected_lineup_changes_confidence_not_team_strength(self):
         manifest = build_analysis_manifest(
             lineup_confirmed=False,
