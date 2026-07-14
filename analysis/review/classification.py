@@ -334,6 +334,10 @@ class ReviewCandidate:
         )
         if len(set(forecast_ids)) != len(forecast_ids):
             raise ValueError("duplicate component forecast ID")
+        forecasts_by_id = {
+            forecast.component_id: forecast
+            for forecast in self.component_forecasts
+        }
 
         if not isinstance(self.component_observations, tuple):
             raise ValueError("component_observations must be a tuple")
@@ -380,6 +384,14 @@ class ReviewCandidate:
             if missing:
                 raise ValueError(
                     "every bound component must exist in forecasts and observations"
+                )
+            if any(
+                forecasts_by_id[component_id].evidence_path
+                != path.evidence_path
+                for component_id in path.component_ids
+            ):
+                raise ValueError(
+                    "bound component forecast must match binding evidence_path"
                 )
 
         if not isinstance(self.exogenous_events, tuple):
@@ -609,11 +621,20 @@ def classify_review(candidate: ReviewCandidate) -> ReviewClassification:
     contradicted_paths = tuple(
         review.evidence_path for review in path_reviews if review.contradicted
     )
-    inside_80_count = sum(
-        _inside_80(forecast, observations[component_id])
-        for component_id, forecast in forecasts.items()
+    principal_component_ids = frozenset(
+        component_id
+        for path in candidate.principal_paths
+        for component_id in path.component_ids
     )
-    inside_80_ratio = inside_80_count / len(forecasts)
+    inside_80_count = sum(
+        _inside_80(forecasts[component_id], observations[component_id])
+        for component_id in principal_component_ids
+    )
+    inside_80_ratio = (
+        inside_80_count / len(principal_component_ids)
+        if principal_component_ids
+        else 1.0
+    )
 
     if not candidate.recommended:
         classification = None

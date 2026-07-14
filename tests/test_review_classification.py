@@ -63,10 +63,17 @@ def candidate(
         if principal_paths
         else PriorityEvidencePath.TOP_ORDER_MATCHUP
     )
+    bound_evidence_paths = {}
+    for path in principal_paths:
+        for component_id in path.component_ids:
+            bound_evidence_paths.setdefault(component_id, path.evidence_path)
     forecasts = tuple(
         ComponentForecast(
             component_id=component_id,
-            evidence_path=evidence_paths.get(component_id, default_path),
+            evidence_path=evidence_paths.get(
+                component_id,
+                bound_evidence_paths.get(component_id, default_path),
+            ),
             interval=intervals.get(component_id, INTERVAL),
             direction="high_is_supportive",
         )
@@ -159,22 +166,10 @@ class ReviewClassificationTests(unittest.TestCase):
         self.assertAlmostEqual(result.inside_80_ratio, 2 / 3)
 
     def test_winning_ticket_with_wrong_flow_is_c(self):
-        paths = (
-            standard_paths()[0],
-            binding(
-                PriorityEvidencePath.STARTER_COLLAPSE,
-                ContradictionRule.STARTER_COLLAPSE,
-                "away_pitcher_chain_runs_allowed",
-                "away_pitcher_chain_workload_outs",
-            ),
-        )
         result = classify_review(
             candidate(
-                values={
-                    "away_pitcher_chain_runs_allowed": 3.0,
-                    "away_pitcher_chain_workload_outs": 7.0,
-                },
-                principal_paths=paths,
+                values=standard_values(traffic=7.0, xbh=7.0),
+                principal_paths=standard_paths(),
                 market_result="win",
             )
         )
@@ -183,22 +178,10 @@ class ReviewClassificationTests(unittest.TestCase):
         self.assertEqual(result.inside_80_ratio, 0.5)
 
     def test_documented_injury_outside_90_takes_d_precedence(self):
-        paths = (
-            standard_paths()[0],
-            binding(
-                PriorityEvidencePath.STARTER_COLLAPSE,
-                ContradictionRule.STARTER_COLLAPSE,
-                "away_pitcher_chain_runs_allowed",
-                "away_pitcher_chain_workload_outs",
-            ),
-        )
         result = classify_review(
             candidate(
-                values={
-                    "away_pitcher_chain_runs_allowed": 7.0,
-                    "away_pitcher_chain_workload_outs": 3.0,
-                },
-                principal_paths=paths,
+                values=standard_values(chain_runs=7.0),
+                principal_paths=standard_paths(),
                 market_result="loss",
                 events=(
                     ExogenousEvent(
@@ -243,20 +226,33 @@ class ReviewClassificationTests(unittest.TestCase):
         self.assertEqual(result.classification, "C")
 
     def test_b_is_the_fallback_for_a_win_below_the_a_threshold(self):
-        values = standard_values(xbh=5.5)
-        values["away_full_runs"] = 5.5
+        paths = standard_paths() + (
+            binding(
+                PriorityEvidencePath.BULLPEN_PROTECTION,
+                ContradictionRule.BULLPEN_PROTECTION,
+                "home_bullpen_runs_allowed",
+                "home_protected_bullpen_close_entry",
+            ),
+        )
         result = classify_review(
             candidate(
-                values=values,
-                principal_paths=standard_paths(),
+                values={
+                    **standard_values(xbh=5.5),
+                    "home_bullpen_runs_allowed": 5.5,
+                    "home_protected_bullpen_close_entry": 1.0,
+                },
+                principal_paths=paths,
+                intervals={
+                    "home_protected_bullpen_close_entry": BINARY_TRUE_INTERVAL,
+                },
                 market_result="win",
             )
         )
 
-        self.assertEqual(result.inside_80_ratio, 0.6)
+        self.assertAlmostEqual(result.inside_80_ratio, 2 / 3)
         self.assertEqual(result.classification, "B")
 
-    def test_shared_component_is_counted_once_in_global_ratio(self):
+    def test_component_shared_by_distinct_paths_is_rejected(self):
         paths = (
             standard_paths()[0],
             binding(
@@ -266,7 +262,8 @@ class ReviewClassificationTests(unittest.TestCase):
                 "away_pitcher_chain_workload_outs",
             ),
         )
-        result = classify_review(
+
+        with self.assertRaisesRegex(ValueError, "binding evidence_path"):
             candidate(
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
@@ -275,25 +272,58 @@ class ReviewClassificationTests(unittest.TestCase):
                 principal_paths=paths,
                 market_result="loss",
             )
-        )
 
-        self.assertEqual(result.inside_80_ratio, 0.5)
-        self.assertEqual(result.path_reviews[0].inside_80_count, 1)
-        self.assertEqual(result.path_reviews[1].inside_80_count, 1)
-        self.assertEqual(result.classification, "C")
-
-    def test_c_threshold_is_strictly_below_sixty_percent(self):
-        values = standard_values(xbh=5.5)
-        values["away_full_runs"] = 3.0
+    def test_inside_80_ratio_ignores_components_outside_principal_paths(self):
+        values = standard_values()
+        values["away_full_runs"] = 7.0
         result = classify_review(
             candidate(
                 values=values,
                 principal_paths=standard_paths(),
+                evidence_paths={
+                    "away_full_runs": PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+                },
+                market_result="win",
+            )
+        )
+
+        self.assertEqual(result.inside_80_ratio, 1.0)
+        self.assertEqual(result.classification, "A")
+
+    def test_c_threshold_is_strictly_below_sixty_percent(self):
+        paths = (
+            standard_paths()[0],
+            binding(
+                PriorityEvidencePath.STARTER_COLLAPSE,
+                ContradictionRule.STARTER_COLLAPSE,
+                "home_pitcher_chain_runs_allowed",
+                "home_pitcher_chain_workload_outs",
+            ),
+            binding(
+                PriorityEvidencePath.BULLPEN_PROTECTION,
+                ContradictionRule.BULLPEN_PROTECTION,
+                "away_bullpen_runs_allowed",
+                "away_protected_bullpen_close_entry",
+            ),
+        )
+        result = classify_review(
+            candidate(
+                values={
+                    "away_pitcher_chain_runs_allowed": 3.0,
+                    "home_pitcher_chain_runs_allowed": 3.0,
+                    "home_pitcher_chain_workload_outs": 5.5,
+                    "away_bullpen_runs_allowed": 5.5,
+                    "away_protected_bullpen_close_entry": 1.0,
+                },
+                principal_paths=paths,
+                intervals={
+                    "away_protected_bullpen_close_entry": BINARY_TRUE_INTERVAL,
+                },
                 market_result="loss",
             )
         )
 
-        self.assertEqual(result.inside_80_ratio, 0.8)
+        self.assertEqual(result.inside_80_ratio, 0.6)
         self.assertEqual(result.classification, "B")
 
 
@@ -721,6 +751,25 @@ class ReviewValidationTests(unittest.TestCase):
             replace(
                 base,
                 principal_paths=(base.principal_paths[0], invalid_path),
+            )
+
+    def test_bound_component_forecast_must_match_binding_evidence_path(self):
+        path = binding(
+            PriorityEvidencePath.STARTER_SUPPRESSION,
+            ContradictionRule.STARTER_SUPPRESSION,
+            "away_pitcher_chain_runs_allowed",
+        )
+
+        with self.assertRaisesRegex(ValueError, "binding evidence_path"):
+            candidate(
+                values={"away_pitcher_chain_runs_allowed": 3.0},
+                principal_paths=(path,),
+                evidence_paths={
+                    "away_pitcher_chain_runs_allowed": (
+                        PriorityEvidencePath.STARTER_COLLAPSE
+                    ),
+                },
+                recommended=False,
             )
 
     def test_candidate_scalars_and_event_metadata_are_validated(self):
