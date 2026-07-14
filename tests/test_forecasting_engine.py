@@ -267,6 +267,50 @@ class ForecastEngineTests(unittest.TestCase):
                     self.assertIs(resolved.provenance, market.provenance)
                     self.assertIn(market.market_key, output.markets)
 
+    def test_team_side_aliases_share_canonical_identity_seed_and_output(self):
+        team_market = _market("z:side", MarketType.ML, "SEA", None)
+        canonical_market = replace(team_market, selected_side="away")
+        total_market = _market(
+            "a:total",
+            MarketType.FULL_TOTAL,
+            "under",
+            8.5,
+        )
+        team_game = _complete_game(markets=(team_market, total_market))
+        canonical_game = _complete_game(
+            markets=(total_market, canonical_market)
+        )
+
+        with (
+            patch.object(
+                forecast_engine_module,
+                "build_forecast_run_id",
+                wraps=forecast_engine_module.build_forecast_run_id,
+            ) as identity,
+            patch.object(
+                forecast_engine_module,
+                "simulate_game_distribution",
+                wraps=forecast_engine_module.simulate_game_distribution,
+            ) as simulate,
+        ):
+            team_output = run_forecast(team_game, _fast_config())
+            canonical_output = run_forecast(canonical_game, _fast_config())
+
+        identity_games = [call.args[0] for call in identity.call_args_list]
+        for identity_game in identity_games:
+            self.assertEqual(
+                tuple(market.market_key for market in identity_game.markets),
+                ("a:total", "z:side"),
+            )
+            self.assertEqual(identity_game.markets[1].selected_side, "away")
+        simulation_ids = [call.args[1] for call in simulate.call_args_list]
+        simulation_seeds = [int(run_id[:16], 16) for run_id in simulation_ids]
+        self.assertEqual(team_output.forecast_run_id, canonical_output.forecast_run_id)
+        self.assertEqual(simulation_ids[0], simulation_ids[1])
+        self.assertEqual(simulation_seeds[0], simulation_seeds[1])
+        self.assertEqual(team_output, canonical_output)
+        self.assertEqual(canonical_json(team_output), canonical_json(canonical_output))
+
     def test_unknown_team_side_is_rejected_before_simulation(self):
         market = _market("team:ml:unknown", MarketType.ML, "OAK", None)
         game = _complete_game(markets=(market,))

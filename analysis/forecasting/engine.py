@@ -260,40 +260,46 @@ def run_forecast(
         raise ValueError("config is invalid or noncanonical")
 
     resolved_markets = tuple(
-        _resolve_market_side(
-            market,
-            normalized_game.identity.away_team,
-            normalized_game.identity.home_team,
+        sorted(
+            (
+                _resolve_market_side(
+                    market,
+                    normalized_game.identity.away_team,
+                    normalized_game.identity.home_team,
+                )
+                for market in normalized_game.markets
+            ),
+            key=lambda market: market.market_key,
         )
-        for market in normalized_game.markets
     )
+    resolved_game = replace(normalized_game, markets=resolved_markets)
     config_mapping = config.to_mapping()
     forecast_run_id = build_forecast_run_id(
-        normalized_game,
+        resolved_game,
         config.version,
         config_mapping,
     )
 
     away_pitcher_chain = forecast_pitcher_chain(
-        normalized_game.away_pitching,
+        resolved_game.away_pitching,
         config,
     )
     home_pitcher_chain = forecast_pitcher_chain(
-        normalized_game.home_pitching,
+        resolved_game.home_pitching,
         config,
     )
     away_offense = forecast_offense(
-        normalized_game.away_lineup,
-        normalized_game.home_pitching.pitchers,
+        resolved_game.away_lineup,
+        resolved_game.home_pitching.pitchers,
         config,
     )
     home_offense = forecast_offense(
-        normalized_game.home_lineup,
-        normalized_game.away_pitching.pitchers,
+        resolved_game.home_lineup,
+        resolved_game.away_pitching.pitchers,
         config,
     )
-    away_bullpen = forecast_bullpen(normalized_game.away_bullpen, config)
-    home_bullpen = forecast_bullpen(normalized_game.home_bullpen, config)
+    away_bullpen = forecast_bullpen(resolved_game.away_bullpen, config)
+    home_bullpen = forecast_bullpen(resolved_game.home_bullpen, config)
 
     simulation_input = GameSimulationInput(
         away_offense=away_offense,
@@ -310,10 +316,7 @@ def run_forecast(
     )
     markets = {
         market.market_key: evaluate_market(simulation, market)
-        for market in sorted(
-            resolved_markets,
-            key=lambda item: item.market_key,
-        )
+        for market in resolved_game.markets
     }
     component_diagnostics = {
         "away_pitcher_chain": away_pitcher_chain,
