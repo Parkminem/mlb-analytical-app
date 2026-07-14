@@ -50,7 +50,21 @@ def capture_command(**overrides: object) -> CaptureCommand:
         "lineup_state": "confirmed",
         "out_of_sample_eligible": True,
         "normalized_input_hash": "input-hash-1",
-        "payload": {"away_team": "SEA", "home_team": "MIN"},
+        "payload": {
+            "away_team": "SEA",
+            "home_team": "MIN",
+            "markets": [
+                {
+                    "market_key": "game:900001:ml:SEA",
+                    "market_type": "ml",
+                    "settlement_format": "two_way",
+                    "selected_side": "away",
+                    "line": None,
+                    "selected_decimal_price": 1.91,
+                    "opposing_decimal_price": 1.95,
+                }
+            ],
+        },
     }
     values.update(overrides)
     return CaptureCommand(**values)
@@ -1287,6 +1301,78 @@ class LedgerStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(LedgerReferenceError, "market horizon"):
                 store.append_review(command)
 
+    def test_review_rejects_forecast_market_from_another_capture_game(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture = store.append_capture("capture:review", capture_command())
+            foreign_key = "game:900002:ml:SEA"
+            outputs = json.loads(canonical_json(forecast_command().outputs))
+            market_input = outputs["market_inputs"].pop(
+                "game:900001:ml:SEA"
+            )
+            market_input["market_key"] = foreign_key
+            outputs["market_inputs"][foreign_key] = market_input
+            outputs["markets"][0]["market_key"] = foreign_key
+            forecast = store.append_forecast(
+                forecast_command(outputs=outputs)
+            )
+            link = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            result = store.append_official_result(result_command())
+            command = review_command(
+                capture_forecast_link_record_id=link.envelope.record_id,
+                capture_id=capture.capture_id,
+                forecast_run_id=forecast.forecast_run_id,
+                official_result_record_id=result.envelope.record_id,
+                market_key=foreign_key,
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "capture markets"):
+                store.append_review(command)
+
+    def test_review_rejects_forecast_type_that_disagrees_with_capture_key(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            f5_key = "game:900001:f5_side:SEA"
+            payload = json.loads(canonical_json(capture_command().payload))
+            payload["markets"][0]["market_key"] = f5_key
+            payload["markets"][0]["market_type"] = "f5_side"
+            capture = store.append_capture(
+                "capture:review",
+                capture_command(payload=payload),
+            )
+            outputs = json.loads(canonical_json(forecast_command().outputs))
+            market_input = outputs["market_inputs"].pop(
+                "game:900001:ml:SEA"
+            )
+            market_input["market_key"] = f5_key
+            outputs["market_inputs"][f5_key] = market_input
+            outputs["markets"][0]["market_key"] = f5_key
+            forecast = store.append_forecast(
+                forecast_command(outputs=outputs)
+            )
+            link = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            result = store.append_official_result(result_command())
+            command = review_command(
+                capture_forecast_link_record_id=link.envelope.record_id,
+                capture_id=capture.capture_id,
+                forecast_run_id=forecast.forecast_run_id,
+                official_result_record_id=result.envelope.record_id,
+                market_key=f5_key,
+            )
+
+            with self.assertRaisesRegex(LedgerReferenceError, "capture markets"):
+                store.append_review(command)
+
     def test_stale_result_review_replays_but_cannot_append_under_a_new_key(
         self,
     ) -> None:
@@ -1873,7 +1959,9 @@ class LedgerStoreTests(unittest.TestCase):
             LedgerStore(path).append_capture("capture:deep", capture_command())
             valid_row = path.read_text(encoding="utf-8")
             depth = sys.getrecursionlimit() * 2
-            original_payload = '"payload":{"away_team":"SEA","home_team":"MIN"}'
+            original_payload = (
+                f'"payload":{canonical_json(capture_command().payload)}'
+            )
             deep_payload = (
                 '"payload":{"nested":'
                 f"{'[' * depth}0{']' * depth}"

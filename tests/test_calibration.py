@@ -130,6 +130,8 @@ def capture_payload(
     market_type: str = "ml",
     line: float | None = None,
     selected_side: str = "away",
+    selected_price: float | None = 2.0,
+    opposing_price: float | None = 1.9,
     away_roles: tuple[str, ...] = ("starter",),
     home_roles: tuple[str, ...] = ("starter",),
 ) -> dict[str, object]:
@@ -147,6 +149,8 @@ def capture_payload(
                 "settlement_format": "two_way",
                 "selected_side": selected_side,
                 "line": line,
+                "selected_decimal_price": selected_price,
+                "opposing_decimal_price": opposing_price,
             }
         ],
     }
@@ -191,6 +195,8 @@ def append_capture_link(
                 market_type=market_type,
                 line=line,
                 selected_side=selected_side,
+                selected_price=selected_price,
+                opposing_price=opposing_price,
                 away_roles=away_roles,
                 home_roles=home_roles,
             ),

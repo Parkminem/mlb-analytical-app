@@ -63,6 +63,17 @@ _CONVERSION_PATHS = frozenset(
 _FULL_GAME_ONLY_PATHS = frozenset(
     ("late_bullpen_exposure", "bullpen_protection")
 )
+_SEMANTIC_MARKET_KEYS = frozenset(
+    (
+        "market_key",
+        "market_type",
+        "settlement_format",
+        "selected_side",
+        "line",
+        "selected_decimal_price",
+        "opposing_decimal_price",
+    )
+)
 
 
 def _payload_hash(command: object) -> str:
@@ -162,6 +173,75 @@ def _forecast_market_type(
     if not isinstance(market_type, str) or not market_type.strip():
         return None
     return market_type
+
+
+def _capture_team_aliases(
+    capture: CaptureRecord,
+) -> tuple[str | None, str | None]:
+    identity = capture.payload.get("identity")
+    if isinstance(identity, Mapping):
+        away_team = identity.get("away_team")
+        home_team = identity.get("home_team")
+    else:
+        away_team = capture.payload.get("away_team")
+        home_team = capture.payload.get("home_team")
+    return (
+        away_team if isinstance(away_team, str) else None,
+        home_team if isinstance(home_team, str) else None,
+    )
+
+
+def _market_semantics(
+    value: object,
+    away_team: str | None,
+    home_team: str | None,
+) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    if not _SEMANTIC_MARKET_KEYS.issubset(value):
+        return None
+    semantics = {key: value[key] for key in _SEMANTIC_MARKET_KEYS}
+    selected_side = semantics["selected_side"]
+    if selected_side == away_team:
+        semantics["selected_side"] = "away"
+    elif selected_side == home_team:
+        semantics["selected_side"] = "home"
+    return semantics
+
+
+def _forecast_markets_match_capture(
+    capture: CaptureRecord,
+    forecast: ForecastRecord,
+) -> bool:
+    capture_markets = capture.payload.get("markets")
+    forecast_markets = forecast.outputs.get("market_inputs")
+    if not isinstance(capture_markets, tuple) or not isinstance(
+        forecast_markets,
+        Mapping,
+    ):
+        return False
+    away_team, home_team = _capture_team_aliases(capture)
+    expected: dict[str, dict[str, object]] = {}
+    for value in capture_markets:
+        semantics = _market_semantics(value, away_team, home_team)
+        if semantics is None:
+            return False
+        market_key = semantics["market_key"]
+        if not isinstance(market_key, str) or market_key in expected:
+            return False
+        expected[market_key] = semantics
+
+    actual: dict[str, dict[str, object]] = {}
+    for market_key, value in forecast_markets.items():
+        if not isinstance(market_key, str) or not isinstance(value, Mapping):
+            return False
+        if frozenset(value) != _SEMANTIC_MARKET_KEYS:
+            return False
+        semantics = _market_semantics(value, away_team, home_team)
+        if semantics is None or semantics["market_key"] != market_key:
+            return False
+        actual[market_key] = semantics
+    return canonical_json(actual) == canonical_json(expected)
 
 
 def _command_for_capture(record: CaptureRecord) -> CaptureCommand:
@@ -409,6 +489,10 @@ def _review_relationship_error(
     if market_type is None:
         return (
             "review market_key must reference the linked forecast semantic market"
+        )
+    if not _forecast_markets_match_capture(capture, forecast):
+        return (
+            "forecast market_inputs must exactly match canonical capture markets"
         )
     compatibility_error = _review_market_compatibility_error(
         command,
