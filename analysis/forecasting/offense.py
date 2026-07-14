@@ -1,6 +1,6 @@
 """All-lineup pitch and velocity matchup forecasting."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import math
 from types import MappingProxyType
@@ -125,12 +125,6 @@ class _OffenseInvariantContext:
     matchup_bounds: tuple[float, float]
     lineup_log_standard_error: float
     sample_shortage_log_se_penalty: float
-    _factory_capability: object | None = field(
-        init=False,
-        default=None,
-        repr=False,
-        compare=False,
-    )
 
     def __post_init__(self) -> None:
         _require_finite_positive(self.league_woba, "league_woba")
@@ -161,45 +155,6 @@ class _OffenseInvariantContext:
             self.sample_shortage_log_se_penalty,
             "sample_shortage_log_se_penalty",
         )
-
-
-def _build_offense_context_factory():
-    capability = object()
-    issued_contexts = weakref.WeakValueDictionary()
-
-    def create_context(
-        *,
-        league_woba: float,
-        normalized_pa_weights: tuple[float, ...],
-        matchup_bounds: tuple[float, float],
-        lineup_log_standard_error: float,
-        sample_shortage_log_se_penalty: float,
-    ) -> _OffenseInvariantContext:
-        context = _OffenseInvariantContext(
-            league_woba=league_woba,
-            normalized_pa_weights=normalized_pa_weights,
-            matchup_bounds=matchup_bounds,
-            lineup_log_standard_error=lineup_log_standard_error,
-            sample_shortage_log_se_penalty=sample_shortage_log_se_penalty,
-        )
-        object.__setattr__(context, "_factory_capability", capability)
-        issued_contexts[id(context)] = context
-        return context
-
-    def is_factory_context(value: object) -> bool:
-        return (
-            isinstance(value, _OffenseInvariantContext)
-            and issued_contexts.get(id(value)) is value
-            and value._factory_capability is capability
-        )
-
-    return create_context, is_factory_context
-
-
-(
-    _create_offense_invariant_context,
-    _is_factory_context,
-) = _build_offense_context_factory()
 
 
 @dataclass(frozen=True)
@@ -890,10 +845,11 @@ def _summarize_pitcher_slots(
     return matchup_multiplier, matchup_sigma, unknown_exposure
 
 
-def forecast_offense(
+def _forecast_offense_impl(
     lineup: LineupInput,
     opposing_profiles: tuple[PitcherInput, ...],
     config: SimulationConfig,
+    context_issuer: Callable[..., _OffenseInvariantContext],
 ) -> OffenseForecast:
     if not isinstance(lineup, LineupInput):
         raise TypeError("lineup must be LineupInput")
@@ -939,7 +895,7 @@ def forecast_offense(
         9.0,
         "pa_weights",
     )
-    context = _create_offense_invariant_context(
+    context = context_issuer(
         league_woba=config.league_woba,
         normalized_pa_weights=normalized_pa_weights,
         matchup_bounds=config.matchup_bounds,
@@ -989,3 +945,50 @@ def forecast_offense(
         ),
         _context=context,
     )
+
+
+def _build_forecast_offense():
+    issued_contexts = weakref.WeakValueDictionary()
+
+    def issue_context(
+        *,
+        league_woba: float,
+        normalized_pa_weights: tuple[float, ...],
+        matchup_bounds: tuple[float, float],
+        lineup_log_standard_error: float,
+        sample_shortage_log_se_penalty: float,
+    ) -> _OffenseInvariantContext:
+        context = _OffenseInvariantContext(
+            league_woba=league_woba,
+            normalized_pa_weights=normalized_pa_weights,
+            matchup_bounds=matchup_bounds,
+            lineup_log_standard_error=lineup_log_standard_error,
+            sample_shortage_log_se_penalty=sample_shortage_log_se_penalty,
+        )
+        issued_contexts[id(context)] = context
+        return context
+
+    def is_factory_context(value: object) -> bool:
+        return (
+            isinstance(value, _OffenseInvariantContext)
+            and issued_contexts.get(id(value)) is value
+        )
+
+    def forecast_offense(
+        lineup: LineupInput,
+        opposing_profiles: tuple[PitcherInput, ...],
+        config: SimulationConfig,
+    ) -> OffenseForecast:
+        return _forecast_offense_impl(
+            lineup,
+            opposing_profiles,
+            config,
+            issue_context,
+        )
+
+    return forecast_offense, is_factory_context
+
+
+# Keep context issuance inaccessible from module consumers.
+forecast_offense, _is_factory_context = _build_forecast_offense()
+del _build_forecast_offense

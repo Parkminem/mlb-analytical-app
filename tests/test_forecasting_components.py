@@ -12,6 +12,7 @@ import analysis.forecasting.offense as offense_module
 import analysis.forecasting.randomness as randomness_module
 import analysis.forecasting.starter as starter_module
 from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import (
     BooleanFeature,
     FeatureProvenance,
@@ -2607,6 +2608,39 @@ class OffenseForecastTests(unittest.TestCase):
             with self.subTest(result_type=type(value).__name__):
                 with self.assertRaisesRegex(ValueError, "forecast_offense"):
                     replace(value, _context=forged_context)
+
+    def test_module_exposes_no_arbitrary_context_issuer(self):
+        forbidden_names = {
+            "_build_offense_context_factory",
+            "_build_forecast_offense",
+            "_create_offense_invariant_context",
+        }
+
+        self.assertEqual(
+            forbidden_names.intersection(vars(offense_module)),
+            set(),
+        )
+
+    def test_offense_forecast_canonical_json_is_deterministic(self):
+        pitcher_id = "pitcher:starter"
+        lineup = _offense_uniform_response_lineup(pitcher_id)
+        profiles = (_offense_profile(pitcher_id),)
+        config = SimulationConfig()
+        first = forecast_offense(lineup, profiles, config)
+        second = forecast_offense(lineup, profiles, config)
+
+        def serialize(value):
+            try:
+                return canonical_json(value)
+            except (TypeError, ValueError) as error:
+                self.fail(f"canonical_json rejected OffenseForecast: {error}")
+
+        first_json = serialize(first)
+        self.assertEqual(first_json, serialize(second))
+        self.assertNotIn(
+            "_factory_capability",
+            json.loads(first_json)["_context"],
+        )
 
     def test_global_log_standard_error_must_equal_max_profile_sigma(self):
         first_id = "pitcher:opener"
