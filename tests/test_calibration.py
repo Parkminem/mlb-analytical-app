@@ -421,6 +421,7 @@ class CalibrationContractTests(unittest.TestCase):
             losses=0,
             pushes=0,
             hit_rate=1.0,
+            push_rate=0.0,
             binary_brier=0.25,
             multiclass_brier=0.5,
             log_loss=math.log(2.0),
@@ -444,6 +445,7 @@ class CalibrationContractTests(unittest.TestCase):
                 losses=0,
                 pushes=0,
                 hit_rate=1.0,
+                push_rate=0.0,
                 binary_brier=0.25,
                 multiclass_brier=0.5,
                 log_loss=math.log(2.0),
@@ -465,6 +467,7 @@ class CalibrationContractTests(unittest.TestCase):
             "losses": 0,
             "pushes": 0,
             "hit_rate": 1.0,
+            "push_rate": 0.0,
             "binary_brier": 0.25,
             "multiclass_brier": 0.5,
             "log_loss": math.log(2.0),
@@ -473,23 +476,68 @@ class CalibrationContractTests(unittest.TestCase):
             "mean_probability_clv": None,
             "mean_price_clv": None,
         }
-        for field_name in ("binary_brier", "multiclass_brier", "log_loss"):
+        for field_name in ("binary_brier", "log_loss"):
             with self.subTest(field_name=field_name):
                 invalid = dict(values)
                 invalid[field_name] = None
                 with self.assertRaisesRegex(ValueError, field_name):
                     CalibrationMetrics(**invalid)
 
+        no_multiclass = dict(values)
+        no_multiclass["multiclass_brier"] = None
+        self.assertIsNone(
+            CalibrationMetrics(**no_multiclass).multiclass_brier
+        )
+
         push_values = dict(values)
         push_values.update(
             wins=0,
             pushes=1,
             hit_rate=None,
+            push_rate=1.0,
             binary_brier=0.25,
             log_loss=None,
         )
         with self.assertRaisesRegex(ValueError, "binary_brier"):
             CalibrationMetrics(**push_values)
+
+    def test_push_rate_direct_invariants_match_outcome_counts(self):
+        values: dict[str, object] = {
+            "sample_size": 2,
+            "wins": 1,
+            "losses": 0,
+            "pushes": 1,
+            "hit_rate": 1.0,
+            "push_rate": 0.5,
+            "binary_brier": 0.25,
+            "multiclass_brier": 0.5,
+            "log_loss": math.log(2.0),
+            "profit_units": None,
+            "roi": None,
+            "mean_probability_clv": None,
+            "mean_price_clv": None,
+        }
+        self.assertEqual(CalibrationMetrics(**values).push_rate, 0.5)
+        for invalid_rate in (None, 0.25, -0.1, float("nan")):
+            with self.subTest(push_rate=invalid_rate):
+                invalid = dict(values)
+                invalid["push_rate"] = invalid_rate
+                with self.assertRaisesRegex(ValueError, "push_rate"):
+                    CalibrationMetrics(**invalid)
+
+        empty = dict(values)
+        empty.update(
+            sample_size=0,
+            wins=0,
+            pushes=0,
+            hit_rate=None,
+            push_rate=0.0,
+            binary_brier=None,
+            multiclass_brier=None,
+            log_loss=None,
+        )
+        with self.assertRaisesRegex(ValueError, "push_rate"):
+            CalibrationMetrics(**empty)
 
     def test_group_and_report_validate_fixed_partition_contract(self):
         metrics = build_calibration_report(
@@ -523,6 +571,7 @@ class CalibrationMetricTests(unittest.TestCase):
         metrics = report.groups[0].metrics
         self.assertEqual(metrics.pushes, 1)
         self.assertIsNone(metrics.hit_rate)
+        self.assertEqual(metrics.push_rate, 1.0)
         self.assertIsNone(metrics.binary_brier)
         self.assertIsNone(metrics.log_loss)
         self.assertAlmostEqual(metrics.multiclass_brier, 0.38)
@@ -576,6 +625,58 @@ class CalibrationMetricTests(unittest.TestCase):
         expected += (0.4**2 + 0.1**2 + (0.5 - 1) ** 2)
         self.assertAlmostEqual(report.overall.multiclass_brier, expected / 2)
         self.assertEqual(report.overall.hit_rate, 0.5)
+
+    def test_multiclass_brier_excludes_zero_push_probability_rows(self):
+        eligible = calibration_row(
+            forecast_run_id="push-capable",
+            p_win=0.4,
+            p_push=0.2,
+            p_loss=0.4,
+            market_result="win",
+        )
+        binary_only = calibration_row(
+            forecast_run_id="binary-only",
+            p_win=0.9,
+            p_push=0.0,
+            p_loss=0.1,
+            market_result="loss",
+        )
+
+        report = build_calibration_report(
+            (binary_only, eligible),
+            group_by=(),
+        )
+
+        expected = (0.4 - 1.0) ** 2 + 0.2**2 + 0.4**2
+        self.assertAlmostEqual(report.overall.multiclass_brier, expected)
+
+    def test_multiclass_brier_is_none_without_push_probability(self):
+        report = build_calibration_report(
+            (calibration_row(p_win=0.6, p_push=0.0, p_loss=0.4),),
+            group_by=(),
+        )
+
+        self.assertIsNone(report.overall.multiclass_brier)
+
+    def test_push_rate_uses_all_outcomes(self):
+        rows = (
+            calibration_row(forecast_run_id="push-rate-win"),
+            calibration_row(
+                forecast_run_id="push-rate-loss",
+                market_result="loss",
+            ),
+            calibration_row(
+                forecast_run_id="push-rate-push",
+                p_win=0.2,
+                p_push=0.5,
+                p_loss=0.3,
+                market_result="push",
+            ),
+        )
+
+        report = build_calibration_report(rows, group_by=())
+
+        self.assertAlmostEqual(report.overall.push_rate, 1.0 / 3.0)
 
     def test_profit_and_roi_use_only_rows_with_priced_stakes(self):
         rows = (
@@ -644,6 +745,7 @@ class CalibrationMetricTests(unittest.TestCase):
         self.assertEqual(report.overall.losses, 0)
         self.assertEqual(report.overall.pushes, 0)
         self.assertIsNone(report.overall.hit_rate)
+        self.assertIsNone(report.overall.push_rate)
         self.assertIsNone(report.overall.multiclass_brier)
         self.assertIsNone(report.overall.roi)
 
@@ -836,7 +938,7 @@ class CalibrationSelectionTests(unittest.TestCase):
         self.assertEqual(rows[0].lineup_state, "confirmed")
         self.assertEqual(rows[0].forecast_run_id, "confirmed-run")
 
-    def test_named_time_slice_can_evaluate_later_superseded_capture(self):
+    def test_named_time_slice_can_ignore_successor_after_boundary(self):
         projected = append_capture_link(
             self.store,
             game_pk=910003,
@@ -867,6 +969,103 @@ class CalibrationSelectionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].lineup_state, "projected")
         self.assertEqual(rows[0].forecast_run_id, "projected-slice-run")
+
+    def test_named_time_slice_rejects_successor_at_boundary_despite_lineup(self):
+        projected = append_capture_link(
+            self.store,
+            game_pk=910013,
+            captured_at=FIRST_PITCH - timedelta(hours=8),
+            lineup_state="projected",
+            forecast_run_id="stale-boundary-run",
+            id_suffix="projected",
+        )
+        confirmed = append_capture_link(
+            self.store,
+            game_pk=910013,
+            captured_at=FIRST_PITCH - timedelta(hours=6),
+            lineup_state="confirmed",
+            forecast_run_id="boundary-successor-run",
+            id_suffix="confirmed",
+            supersedes_capture_id=projected[0].capture_id,
+        )
+        self._complete_reviews(910013, (projected, confirmed))
+        policy = CaptureCutoffPolicy(
+            name="projected_lineup_6h_before",
+            minimum_seconds_before_first_pitch=21_600,
+            required_lineup_state="projected",
+            include_later_superseded_captures=True,
+        )
+
+        self.assertEqual(select_primary_rows(self.store, policy), ())
+
+    def test_named_time_slice_rejects_successor_before_boundary(self):
+        projected = append_capture_link(
+            self.store,
+            game_pk=910015,
+            captured_at=FIRST_PITCH - timedelta(hours=9),
+            lineup_state="projected",
+            forecast_run_id="stale-before-boundary-run",
+            id_suffix="projected",
+        )
+        confirmed = append_capture_link(
+            self.store,
+            game_pk=910015,
+            captured_at=FIRST_PITCH - timedelta(hours=7),
+            lineup_state="confirmed",
+            forecast_run_id="before-boundary-successor-run",
+            id_suffix="confirmed",
+            out_of_sample_eligible=False,
+            supersedes_capture_id=projected[0].capture_id,
+        )
+        self._complete_reviews(910015, (projected, confirmed))
+        policy = CaptureCutoffPolicy(
+            name="projected_lineup_6h_before",
+            minimum_seconds_before_first_pitch=21_600,
+            required_lineup_state="projected",
+            include_later_superseded_captures=True,
+        )
+
+        self.assertEqual(select_primary_rows(self.store, policy), ())
+
+    def test_named_time_slice_checks_every_successor_in_chain(self):
+        projected = append_capture_link(
+            self.store,
+            game_pk=910014,
+            captured_at=FIRST_PITCH - timedelta(hours=9),
+            lineup_state="projected",
+            forecast_run_id="stale-chain-run",
+            id_suffix="projected",
+        )
+        later_successor = append_capture_link(
+            self.store,
+            game_pk=910014,
+            captured_at=FIRST_PITCH - timedelta(hours=5),
+            lineup_state="confirmed",
+            forecast_run_id="later-chain-run",
+            id_suffix="later",
+            supersedes_capture_id=projected[0].capture_id,
+        )
+        boundary_successor = append_capture_link(
+            self.store,
+            game_pk=910014,
+            captured_at=FIRST_PITCH - timedelta(hours=6),
+            lineup_state="confirmed",
+            forecast_run_id="boundary-chain-run",
+            id_suffix="boundary",
+            supersedes_capture_id=later_successor[0].capture_id,
+        )
+        self._complete_reviews(
+            910014,
+            (projected, later_successor, boundary_successor),
+        )
+        policy = CaptureCutoffPolicy(
+            name="projected_lineup_6h_before",
+            minimum_seconds_before_first_pitch=21_600,
+            required_lineup_state="projected",
+            include_later_superseded_captures=True,
+        )
+
+        self.assertEqual(select_primary_rows(self.store, policy), ())
 
     def test_post_pitch_and_ineligible_successors_are_rejected(self):
         eligible = append_capture_link(

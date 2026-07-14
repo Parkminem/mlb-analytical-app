@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 import math
 
 from analysis.ledger.records import (
@@ -216,6 +216,7 @@ class CalibrationMetrics:
     losses: int
     pushes: int
     hit_rate: float | None
+    push_rate: float | None
     binary_brier: float | None
     multiclass_brier: float | None
     log_loss: float | None
@@ -229,6 +230,16 @@ class CalibrationMetrics:
             _require_nonnegative_integer(getattr(self, field_name), field_name)
         if self.wins + self.losses + self.pushes != self.sample_size:
             raise ValueError("outcome counts must sum to sample_size")
+        if self.sample_size == 0:
+            if self.push_rate is not None:
+                raise ValueError("push_rate must be None for an empty sample")
+        else:
+            expected_push_rate = self.pushes / self.sample_size
+            if (
+                not _is_finite_number(self.push_rate)
+                or self.push_rate != expected_push_rate
+            ):
+                raise ValueError("push_rate must match outcome counts")
 
         non_push_count = self.wins + self.losses
         if non_push_count == 0:
@@ -258,8 +269,6 @@ class CalibrationMetrics:
             not _is_finite_number(self.log_loss) or self.log_loss < 0.0
         ):
             raise ValueError("log_loss must be a finite nonnegative number")
-        if self.sample_size > 0 and self.multiclass_brier is None:
-            raise ValueError("multiclass_brier is required for a nonempty sample")
         if non_push_count == 0:
             if self.binary_brier is not None:
                 raise ValueError(
@@ -288,6 +297,7 @@ class CalibrationMetrics:
         if self.sample_size == 0:
             unavailable_fields = (
                 "hit_rate",
+                "push_rate",
                 "binary_brier",
                 "multiclass_brier",
                 "log_loss",
@@ -459,20 +469,21 @@ def _metrics_for_rows(rows: tuple[CalibrationRow, ...]) -> CalibrationMetrics:
     price_clv_values: list[float] = []
 
     for row in rows:
-        outcome = {
-            "win": (1.0, 0.0, 0.0),
-            "push": (0.0, 1.0, 0.0),
-            "loss": (0.0, 0.0, 1.0),
-        }[row.market_result]
-        multiclass_brier_values.append(
-            math.fsum(
-                (
-                    (row.p_win - outcome[0]) ** 2,
-                    (row.p_push - outcome[1]) ** 2,
-                    (row.p_loss - outcome[2]) ** 2,
+        if row.p_push > 0.0:
+            outcome = {
+                "win": (1.0, 0.0, 0.0),
+                "push": (0.0, 1.0, 0.0),
+                "loss": (0.0, 0.0, 1.0),
+            }[row.market_result]
+            multiclass_brier_values.append(
+                math.fsum(
+                    (
+                        (row.p_win - outcome[0]) ** 2,
+                        (row.p_push - outcome[1]) ** 2,
+                        (row.p_loss - outcome[2]) ** 2,
+                    )
                 )
             )
-        )
 
         if row.market_result != "push":
             conditional_probability = _conditional_probability(row)
@@ -526,6 +537,7 @@ def _metrics_for_rows(rows: tuple[CalibrationRow, ...]) -> CalibrationMetrics:
         losses=losses,
         pushes=pushes,
         hit_rate=None if non_push_count == 0 else wins / non_push_count,
+        push_rate=None if not rows else pushes / len(rows),
         binary_brier=_mean(binary_brier_values),
         multiclass_brier=_mean(multiclass_brier_values),
         log_loss=_mean(log_loss_values),
@@ -604,6 +616,33 @@ def _has_eligible_successor(
     return False
 
 
+def _has_successor_at_or_before_boundary(
+    record_id: str,
+    relationships: Mapping[str, object],
+    captures_by_record_id: Mapping[str, CaptureRecord],
+    boundary: datetime,
+) -> bool:
+    visited = {record_id}
+    successor_id = relationships.get(record_id)
+    while successor_id is not None:
+        if not isinstance(successor_id, str) or not successor_id:
+            raise ValueError(
+                "capture supersession relationships must contain record IDs"
+            )
+        if successor_id in visited:
+            raise ValueError("capture supersession relationships cannot contain cycles")
+        successor = captures_by_record_id.get(successor_id)
+        if successor is None:
+            raise ValueError(
+                "capture supersession relationship references missing record"
+            )
+        if successor.captured_at <= boundary:
+            return True
+        visited.add(successor_id)
+        successor_id = relationships.get(successor_id)
+    return False
+
+
 def _select_primary_captures(
     captures: tuple[CaptureRecord, ...],
     relationships: Mapping[str, object],
@@ -615,7 +654,22 @@ def _select_primary_captures(
     eligible_record_ids = frozenset(
         capture.envelope.record_id for capture in eligible
     )
-    if not policy.include_later_superseded_captures:
+    if policy.include_later_superseded_captures:
+        captures_by_record_id = {
+            capture.envelope.record_id: capture for capture in captures
+        }
+        eligible = tuple(
+            capture
+            for capture in eligible
+            if not _has_successor_at_or_before_boundary(
+                capture.envelope.record_id,
+                relationships,
+                captures_by_record_id,
+                capture.first_pitch
+                - timedelta(seconds=policy.minimum_seconds_before_first_pitch),
+            )
+        )
+    else:
         eligible = tuple(
             capture
             for capture in eligible
