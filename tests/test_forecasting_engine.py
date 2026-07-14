@@ -6,7 +6,11 @@ import unittest
 from unittest.mock import patch
 
 from analysis.forecasting.config import SimulationConfig
-from analysis.forecasting.identity import canonical_json
+from analysis.forecasting.identity import (
+    build_forecast_run_id,
+    canonical_json,
+    normalized_input_hash,
+)
 from analysis.forecasting.inputs import (
     BullpenInput,
     BullpenRole,
@@ -35,6 +39,7 @@ from tests.test_forecasting_inputs import (
     numeric,
     provenance,
     replace_all_provenance,
+    source_observation,
 )
 
 
@@ -379,6 +384,72 @@ class ForecastEngineTests(unittest.TestCase):
 
         self.assertEqual(first.forecast_run_id, second.forecast_run_id)
         self.assertEqual(first, second)
+
+    def test_unused_observation_does_not_change_identity_seed_or_output(self):
+        baseline = _complete_game()
+        unused = source_observation(
+            observation_id="obs:unused",
+            source_name="manual",
+            source_record="unused/audit-only",
+            content_hash="b" * 64,
+        )
+        with_unused = replace(
+            baseline,
+            observations=baseline.observations + (unused,),
+        )
+        config = _fast_config()
+        baseline_output = run_forecast(baseline, config)
+        unused_output = run_forecast(with_unused, config)
+
+        comparisons = (
+            (
+                "normalized_input_hash",
+                normalized_input_hash(baseline),
+                normalized_input_hash(with_unused),
+            ),
+            (
+                "forecast_run_id",
+                build_forecast_run_id(
+                    baseline,
+                    config.version,
+                    config.to_mapping(),
+                ),
+                build_forecast_run_id(
+                    with_unused,
+                    config.version,
+                    config.to_mapping(),
+                ),
+            ),
+            ("forecast_output", baseline_output, unused_output),
+        )
+        for label, expected, actual in comparisons:
+            with self.subTest(label=label):
+                self.assertEqual(expected, actual)
+
+    def test_referenced_observation_content_changes_identity_and_output(self):
+        baseline = _complete_game()
+        changed = replace(
+            baseline,
+            observations=(
+                replace(
+                    baseline.observations[0],
+                    content_hash="c" * 64,
+                ),
+            ),
+        )
+        config = _fast_config()
+        baseline_output = run_forecast(baseline, config)
+        changed_output = run_forecast(changed, config)
+
+        self.assertNotEqual(
+            normalized_input_hash(baseline),
+            normalized_input_hash(changed),
+        )
+        self.assertNotEqual(
+            baseline_output.forecast_run_id,
+            changed_output.forecast_run_id,
+        )
+        self.assertNotEqual(baseline_output, changed_output)
 
     def test_market_order_is_semantically_stable(self):
         markets = _markets()

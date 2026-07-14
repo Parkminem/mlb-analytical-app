@@ -106,6 +106,45 @@ def _semantic_observation(observation: SourceObservation) -> dict[str, object]:
     }
 
 
+def _referenced_semantic_observations(
+    game: NormalizedGameInput,
+) -> list[dict[str, object]]:
+    from .validation import iter_feature_provenance
+
+    observations_by_id: dict[str, SourceObservation] = {}
+    for observation in game.observations:
+        if observation.observation_id in observations_by_id:
+            raise ValueError(
+                f"duplicate observation_id: {observation.observation_id}"
+            )
+        observations_by_id[observation.observation_id] = observation
+
+    referenced_ids = {
+        observation_id
+        for provenance in iter_feature_provenance(game)
+        for observation_id in provenance.observation_ids
+    }
+    missing_ids = referenced_ids - observations_by_id.keys()
+    if missing_ids:
+        raise ValueError(
+            "missing observation_id referenced by feature: "
+            f"{min(missing_ids)}"
+        )
+
+    observations_by_payload = {}
+    for observation_id in referenced_ids:
+        semantic_observation = _semantic_observation(
+            observations_by_id[observation_id]
+        )
+        observations_by_payload[
+            canonical_json(semantic_observation)
+        ] = semantic_observation
+    return [
+        observations_by_payload[payload]
+        for payload in sorted(observations_by_payload)
+    ]
+
+
 def _semantic_value(value: object) -> object:
     if isinstance(value, FeatureProvenance):
         return _OMIT
@@ -128,16 +167,7 @@ def _semantic_value(value: object) -> object:
                 continue
             field_value = getattr(value, field.name)
             if isinstance(value, NormalizedGameInput) and field.name == "observations":
-                observations_by_payload = {}
-                for observation in field_value:
-                    semantic_observation = _semantic_observation(observation)
-                    observations_by_payload[
-                        canonical_json(semantic_observation)
-                    ] = semantic_observation
-                converted[field.name] = [
-                    observations_by_payload[payload]
-                    for payload in sorted(observations_by_payload)
-                ]
+                converted[field.name] = _referenced_semantic_observations(value)
                 continue
             if isinstance(value, NormalizedGameInput) and field.name == "markets":
                 converted[field.name] = [

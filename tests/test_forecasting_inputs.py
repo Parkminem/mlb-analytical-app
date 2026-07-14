@@ -1178,6 +1178,96 @@ class ForecastIdentityTests(unittest.TestCase):
             build_forecast_run_id(resolved_game, "shadow-1", config),
         )
 
+    def test_capture_projection_ignores_unused_observation_exactly(self):
+        semantic_from_capture = (
+            identity_module.semantic_forecast_payload_from_capture_payload
+        )
+        baseline = complete_forecast_game()
+        unused = source_observation(
+            observation_id="obs:unused",
+            source_name="manual",
+            source_record="unused/audit-only",
+            content_hash="b" * 64,
+        )
+        with_unused = replace(
+            baseline,
+            observations=baseline.observations + (unused,),
+        )
+
+        baseline_semantic = semantic_forecast_payload(baseline)
+        unused_semantic = semantic_forecast_payload(with_unused)
+        projected = semantic_from_capture(capture_payload(with_unused))
+
+        self.assertEqual(
+            canonical_json(baseline_semantic),
+            canonical_json(unused_semantic),
+        )
+        self.assertEqual(
+            canonical_json(projected),
+            canonical_json(unused_semantic),
+        )
+
+    def test_capture_payload_preserves_unused_observation_for_audit(self):
+        baseline = complete_forecast_game()
+        unused = source_observation(
+            observation_id="obs:unused",
+            source_name="manual",
+            source_record="unused/audit-only",
+            content_hash="b" * 64,
+        )
+
+        captured = capture_payload(
+            replace(
+                baseline,
+                observations=baseline.observations + (unused,),
+            )
+        )
+
+        self.assertEqual(
+            tuple(
+                observation["observation_id"]
+                for observation in captured["observations"]
+            ),
+            ("obs:1", "obs:unused"),
+        )
+
+    def test_semantic_identity_rejects_missing_or_duplicate_referenced_ids(self):
+        semantic_from_capture = (
+            identity_module.semantic_forecast_payload_from_capture_payload
+        )
+        baseline = complete_forecast_game()
+        duplicate = replace(
+            baseline.observations[0],
+            source_record="conflicting/source-record",
+            content_hash="d" * 64,
+        )
+        cases = (
+            (
+                "missing",
+                replace(baseline, observations=()),
+                "missing observation_id",
+            ),
+            (
+                "duplicate",
+                replace(
+                    baseline,
+                    observations=(baseline.observations[0], duplicate),
+                ),
+                "duplicate observation_id",
+            ),
+        )
+        for label, game, expected in cases:
+            for path, operation in (
+                ("object", lambda: semantic_forecast_payload(game)),
+                (
+                    "capture",
+                    lambda: semantic_from_capture(capture_payload(game)),
+                ),
+            ):
+                with self.subTest(label=label, path=path):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        operation()
+
     def test_capture_semantic_rebuild_rejects_malformed_payload_schema(self):
         semantic_from_capture = getattr(
             identity_module,
