@@ -252,7 +252,7 @@ class ReviewClassificationTests(unittest.TestCase):
         self.assertAlmostEqual(result.inside_80_ratio, 2 / 3)
         self.assertEqual(result.classification, "B")
 
-    def test_component_shared_by_distinct_paths_is_rejected(self):
+    def test_shared_component_across_two_paths_is_accepted_and_counted_once(self):
         paths = (
             standard_paths()[0],
             binding(
@@ -263,8 +263,8 @@ class ReviewClassificationTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "binding evidence_path"):
-            candidate(
+        try:
+            review_candidate = candidate(
                 values={
                     "away_pitcher_chain_runs_allowed": 3.0,
                     "away_pitcher_chain_workload_outs": 5.5,
@@ -272,6 +272,20 @@ class ReviewClassificationTests(unittest.TestCase):
                 principal_paths=paths,
                 market_result="loss",
             )
+        except ValueError as error:
+            self.fail(f"shared component should be accepted: {error}")
+
+        result = classify_review(review_candidate)
+
+        self.assertEqual(result.inside_80_ratio, 0.5)
+        self.assertEqual(
+            tuple(
+                (review.component_count, review.inside_80_count)
+                for review in result.path_reviews
+            ),
+            ((1, 1), (2, 1)),
+        )
+        self.assertEqual(result.classification, "C")
 
     def test_inside_80_ratio_ignores_components_outside_principal_paths(self):
         values = standard_values()
@@ -753,23 +767,29 @@ class ReviewValidationTests(unittest.TestCase):
                 principal_paths=(base.principal_paths[0], invalid_path),
             )
 
-    def test_bound_component_forecast_must_match_binding_evidence_path(self):
-        path = binding(
-            PriorityEvidencePath.STARTER_SUPPRESSION,
-            ContradictionRule.STARTER_SUPPRESSION,
-            "away_pitcher_chain_runs_allowed",
+    def test_shared_component_path_must_match_a_referencing_binding(self):
+        paths = (
+            standard_paths()[0],
+            binding(
+                PriorityEvidencePath.STARTER_COLLAPSE,
+                ContradictionRule.STARTER_COLLAPSE,
+                "away_pitcher_chain_runs_allowed",
+                "away_pitcher_chain_workload_outs",
+            ),
         )
 
         with self.assertRaisesRegex(ValueError, "binding evidence_path"):
             candidate(
-                values={"away_pitcher_chain_runs_allowed": 3.0},
-                principal_paths=(path,),
+                values={
+                    "away_pitcher_chain_runs_allowed": 3.0,
+                    "away_pitcher_chain_workload_outs": 3.0,
+                },
+                principal_paths=paths,
                 evidence_paths={
                     "away_pitcher_chain_runs_allowed": (
-                        PriorityEvidencePath.STARTER_COLLAPSE
+                        PriorityEvidencePath.TOP_ORDER_MATCHUP
                     ),
                 },
-                recommended=False,
             )
 
     def test_candidate_scalars_and_event_metadata_are_validated(self):

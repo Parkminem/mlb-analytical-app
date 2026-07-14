@@ -378,6 +378,7 @@ class ReviewCandidate:
             raise ValueError("candidate requires unique principal evidence paths")
 
         available_ids = set(forecast_ids).intersection(observation_ids)
+        bound_paths_by_component: dict[str, set[PriorityEvidencePath]] = {}
         for path in self.principal_paths:
             _validate_binding_shape(path, self.market_key)
             missing = set(path.component_ids).difference(available_ids)
@@ -385,14 +386,18 @@ class ReviewCandidate:
                 raise ValueError(
                     "every bound component must exist in forecasts and observations"
                 )
-            if any(
-                forecasts_by_id[component_id].evidence_path
-                != path.evidence_path
-                for component_id in path.component_ids
-            ):
-                raise ValueError(
-                    "bound component forecast must match binding evidence_path"
+            for component_id in path.component_ids:
+                bound_paths_by_component.setdefault(component_id, set()).add(
+                    path.evidence_path
                 )
+
+        if any(
+            forecasts_by_id[component_id].evidence_path not in evidence_paths
+            for component_id, evidence_paths in bound_paths_by_component.items()
+        ):
+            raise ValueError(
+                "bound component forecast must match binding evidence_path"
+            )
 
         if not isinstance(self.exogenous_events, tuple):
             raise ValueError("exogenous_events must be a tuple")
