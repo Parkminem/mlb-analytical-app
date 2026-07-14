@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from types import MappingProxyType
 
 from analysis.forecasting.engine import (
     ForecastOutput,
@@ -19,7 +20,11 @@ from analysis.forecasting.identity import (
     capture_payload,
     normalized_input_hash,
 )
-from analysis.forecasting.inputs import NormalizedGameInput
+from analysis.forecasting.inputs import (
+    MarketType,
+    NormalizedGameInput,
+    SettlementFormat,
+)
 from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
     CaptureCommand,
@@ -89,6 +94,23 @@ _MARKET_COMPARISON_FIELDS = frozenset(
         "review_eligible",
         "review_ineligibility_flags",
     )
+)
+_SEMANTIC_MARKET_INPUT_FIELDS = frozenset(
+    (
+        "market_key",
+        "market_type",
+        "settlement_format",
+        "selected_side",
+        "line",
+        "selected_decimal_price",
+        "opposing_decimal_price",
+    )
+)
+_COMPARISON_EVALUATION_FIELDS = (
+    ("model_win_probability", "model_conditional_win_probability"),
+    ("fair_decimal_price", "fair_decimal_price"),
+    ("market_no_vig_probability", "market_no_vig_probability"),
+    ("edge", "edge"),
 )
 
 
@@ -227,6 +249,18 @@ class LegacyDecisionSnapshot:
             )
         if any(index >= len(self.candidates) for index in indices):
             raise ValueError("review binding candidate index must be in range")
+        for binding in self.review_bindings:
+            candidate = self.candidates[binding.legacy_candidate_index]
+            binding_evidence_paths = frozenset(
+                path.evidence_path for path in binding.principal_paths
+            )
+            if not binding_evidence_paths.issubset(
+                candidate.evidence_paths
+            ):
+                raise ValueError(
+                    "review binding paths must be declared in candidate "
+                    "evidence_paths"
+                )
         _require_string_tuple(self.notes, "notes")
 
 
@@ -365,15 +399,41 @@ class ShadowComparison:
             for binding in self.legacy.review_bindings
         }
         for comparison in self.market_comparisons:
-            if not comparison.review_eligible:
-                continue
             binding = bindings_by_index.get(
                 comparison.legacy_candidate_index
             )
-            if binding is None or (
+            flags = comparison.review_ineligibility_flags
+            if "candidate_market_mismatch" in flags:
+                raise ValueError(
+                    "candidate_market_mismatch contradicts exact legacy market "
+                    "identity"
+                )
+            if binding is None:
+                if comparison.review_eligible:
+                    raise ValueError(
+                        "eligible market comparison requires an exact review binding"
+                    )
+                if "missing_pregame_binding" not in flags:
+                    raise ValueError(
+                        "comparison without a review binding requires "
+                        "missing_pregame_binding"
+                    )
+                continue
+            if "missing_pregame_binding" in flags:
+                raise ValueError(
+                    "comparison with a review binding cannot claim "
+                    "missing_pregame_binding"
+                )
+            if (
                 comparison.market_key != binding.market_key
                 or comparison.legacy_market != binding.legacy_market
-                or comparison.principal_paths != binding.principal_paths
+            ):
+                raise ValueError(
+                    "market comparison must match its exact review binding"
+                )
+            if (
+                comparison.review_eligible
+                and comparison.principal_paths != binding.principal_paths
             ):
                 raise ValueError(
                     "eligible market comparison must match its exact review binding"
@@ -611,6 +671,223 @@ def deserialize_shadow_comparison(value: object) -> ShadowComparison:
                 "shadow market_comparisons",
             )
         ),
+    )
+
+
+def _semantic_market_from_context(
+    market_key: str,
+    value: object,
+) -> SemanticMarketInput:
+    if isinstance(value, SemanticMarketInput):
+        if value.market_key != market_key:
+            raise ValueError(
+                "market_inputs key must match semantic market_key"
+            )
+        return value
+    payload = _payload_mapping(
+        value,
+        f"market_inputs[{market_key}]",
+        _SEMANTIC_MARKET_INPUT_FIELDS,
+    )
+    if payload["market_key"] != market_key:
+        raise ValueError(
+            "market_inputs key must match semantic market_key"
+        )
+    return SemanticMarketInput(
+        market_key=market_key,
+        market_type=_payload_enum(
+            MarketType,
+            payload["market_type"],
+            "market_type",
+        ),
+        settlement_format=_payload_enum(
+            SettlementFormat,
+            payload["settlement_format"],
+            "settlement_format",
+        ),
+        selected_side=payload["selected_side"],
+        line=payload["line"],
+        selected_decimal_price=payload["selected_decimal_price"],
+        opposing_decimal_price=payload["opposing_decimal_price"],
+    )
+
+
+def _evaluation_fingerprint(market_key: str, value: object) -> str:
+    fingerprint = (
+        value.get("semantic_fingerprint")
+        if isinstance(value, Mapping)
+        else getattr(value, "semantic_fingerprint", None)
+    )
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError(
+            f"markets[{market_key}] semantic_fingerprint is missing"
+        )
+    return fingerprint
+
+
+def _evaluation_field(
+    market_key: str,
+    evaluation: object,
+    field_name: str,
+) -> object:
+    if isinstance(evaluation, Mapping):
+        if field_name not in evaluation:
+            raise ValueError(
+                f"markets[{market_key}] is missing {field_name}"
+            )
+        return evaluation[field_name]
+    if not hasattr(evaluation, field_name):
+        raise ValueError(
+            f"markets[{market_key}] is missing {field_name}"
+        )
+    return getattr(evaluation, field_name)
+
+
+def _require_comparison_evaluation_match(
+    comparison: ShadowMarketComparison,
+    evaluation: object | None,
+) -> None:
+    for comparison_field, evaluation_field in _COMPARISON_EVALUATION_FIELDS:
+        expected = (
+            None
+            if evaluation is None
+            else _evaluation_field(
+                comparison.market_key,
+                evaluation,
+                evaluation_field,
+            )
+        )
+        if getattr(comparison, comparison_field) != expected:
+            raise ValueError(
+                f"shadow market evaluation {comparison_field} must match "
+                f"markets[{comparison.market_key}]"
+            )
+
+
+def _binding_context_flags(
+    binding: CandidateReviewBinding,
+    market_inputs: Mapping[str, object],
+    markets: Mapping[str, object],
+    component_distributions: Mapping[str, object],
+    parsed_market_inputs: dict[str, SemanticMarketInput],
+) -> tuple[str, ...]:
+    flags: set[str] = set()
+    market_key = binding.market_key
+    for path in binding.principal_paths:
+        for component_id in path.component_ids:
+            if not component_id.startswith(("away_", "home_")):
+                raise ValueError(
+                    "component IDs must use the captured away/home namespace; "
+                    "team-abbreviation component IDs are unsupported"
+                )
+    semantic_market = None
+    if market_key in market_inputs:
+        semantic_market = _semantic_market_from_context(
+            market_key,
+            market_inputs[market_key],
+        )
+        parsed_market_inputs[market_key] = semantic_market
+    if semantic_market is None or market_key not in markets:
+        flags.add("unknown_market_key")
+    elif (
+        _evaluation_fingerprint(market_key, markets[market_key])
+        != semantic_market.semantic_fingerprint
+    ):
+        raise ValueError(
+            f"markets[{market_key}] semantic_fingerprint must match "
+            "frozen market semantics"
+        )
+
+    invalid_paths = not _paths_have_valid_count_and_identity(
+        binding.principal_paths
+    )
+    if semantic_market is not None:
+        try:
+            validate_principal_path_bindings(
+                semantic_market.market_type,
+                binding.principal_paths,
+            )
+        except ValueError:
+            invalid_paths = True
+    if invalid_paths:
+        flags.add("invalid_path_count")
+    if any(
+        component_id not in component_distributions
+        for path in binding.principal_paths
+        for component_id in path.component_ids
+    ):
+        flags.add("missing_component_distribution")
+    return tuple(
+        flag for flag in _INELIGIBILITY_FLAG_ORDER if flag in flags
+    )
+
+
+def validate_shadow_forecast_context(
+    comparison: ShadowComparison,
+    market_inputs: object,
+    markets: object,
+    component_distributions: object,
+) -> Mapping[str, SemanticMarketInput]:
+    """Validate every shadow comparison against one frozen forecast output."""
+
+    if not isinstance(comparison, ShadowComparison):
+        raise TypeError("comparison must be ShadowComparison")
+    if not isinstance(market_inputs, Mapping):
+        raise ValueError("forecast market_inputs context must be a mapping")
+    if not isinstance(markets, Mapping):
+        raise ValueError("forecast markets context must be a mapping")
+    if not isinstance(component_distributions, Mapping):
+        raise ValueError(
+            "forecast component_distributions context must be a mapping"
+        )
+
+    bindings_by_index = {
+        binding.legacy_candidate_index: binding
+        for binding in comparison.legacy.review_bindings
+    }
+    parsed_market_inputs: dict[str, SemanticMarketInput] = {}
+    for market_comparison in comparison.market_comparisons:
+        binding = bindings_by_index.get(
+            market_comparison.legacy_candidate_index
+        )
+        expected_flags = (
+            ("missing_pregame_binding",)
+            if binding is None
+            else _binding_context_flags(
+                binding,
+                market_inputs,
+                markets,
+                component_distributions,
+                parsed_market_inputs,
+            )
+        )
+        if market_comparison.review_ineligibility_flags != expected_flags:
+            expected = ", ".join(expected_flags) or "none"
+            stored = (
+                ", ".join(
+                    market_comparison.review_ineligibility_flags
+                )
+                or "none"
+            )
+            raise ValueError(
+                "inconsistent shadow comparison flags for "
+                f"{market_comparison.market_key}: expected={expected}; "
+                f"stored={stored}"
+            )
+        evaluation = (
+            None
+            if binding is None
+            else markets.get(binding.market_key)
+        )
+        _require_comparison_evaluation_match(
+            market_comparison,
+            evaluation,
+        )
+    return MappingProxyType(
+        {
+            key: parsed_market_inputs[key]
+            for key in sorted(parsed_market_inputs)
+        }
     )
 
 
@@ -936,4 +1213,5 @@ __all__ = (
     "compare_shadow_forecast",
     "deserialize_shadow_comparison",
     "record_shadow_run",
+    "validate_shadow_forecast_context",
 )

@@ -470,6 +470,13 @@ class ReviewServiceTests(unittest.TestCase):
             shadow = outputs["shadow_comparison"]
             shadow["legacy"]["review_bindings"] = []
             comparison = shadow["market_comparisons"][0]
+            for field_name in (
+                "model_win_probability",
+                "fair_decimal_price",
+                "market_no_vig_probability",
+                "edge",
+            ):
+                comparison[field_name] = None
             comparison["principal_paths"] = []
             comparison["review_eligible"] = False
             comparison["review_ineligibility_flags"] = [
@@ -500,15 +507,17 @@ class ReviewServiceTests(unittest.TestCase):
             comparison["principal_paths"] = []
             comparison["review_eligible"] = False
             comparison["review_ineligibility_flags"] = [
-                "missing_pregame_binding",
                 "missing_component_distribution",
             ]
+            outputs["component_distributions"].pop(
+                "home_pitcher_chain_runs_allowed"
+            )
 
         fixture = self.fixture(mutate_outputs=make_ineligible)
 
         with self.assertRaisesRegex(
             ValueError,
-            "missing_pregame_binding.*missing_component_distribution",
+            "missing_component_distribution",
         ):
             build_review_candidate(
                 self.store,
@@ -523,7 +532,7 @@ class ReviewServiceTests(unittest.TestCase):
                 lambda outputs: outputs["component_distributions"].pop(
                     "home_pitcher_chain_runs_allowed"
                 ),
-                "component distribution",
+                "missing_component_distribution",
             ),
             (
                 lambda outputs: outputs["component_distributions"][
@@ -1005,6 +1014,124 @@ class ReviewServiceTests(unittest.TestCase):
                 fixture.result.envelope.record_id,
                 MARKET_KEY,
             )
+
+    @staticmethod
+    def _append_ghost_comparison(outputs, *, eligible):
+        shadow = outputs["shadow_comparison"]
+        candidate = json.loads(
+            canonical_json(shadow["legacy"]["candidates"][0])
+        )
+        binding = json.loads(
+            canonical_json(shadow["legacy"]["review_bindings"][0])
+        )
+        comparison = json.loads(
+            canonical_json(shadow["market_comparisons"][0])
+        )
+        binding["legacy_candidate_index"] = 1
+        binding["market_key"] = "ghost_ml"
+        comparison["legacy_candidate_index"] = 1
+        comparison["market_key"] = "ghost_ml"
+        if not eligible:
+            for field_name in (
+                "model_win_probability",
+                "fair_decimal_price",
+                "market_no_vig_probability",
+                "edge",
+            ):
+                comparison[field_name] = None
+            comparison["principal_paths"] = []
+            comparison["review_eligible"] = False
+            comparison["review_ineligibility_flags"] = [
+                "unknown_market_key"
+            ]
+        shadow["legacy"]["candidates"].append(candidate)
+        shadow["legacy"]["final_priority"].append(candidate["market"])
+        shadow["legacy"]["review_bindings"].append(binding)
+        shadow["market_comparisons"].append(comparison)
+
+    def test_unrelated_eligible_ghost_market_invalidates_normal_review(self):
+        fixture = self.fixture(
+            mutate_outputs=lambda outputs: self._append_ghost_comparison(
+                outputs,
+                eligible=True,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "unknown_market_key"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_unrelated_unknown_ineligible_ghost_market_remains_valid(self):
+        fixture = self.fixture(
+            mutate_outputs=lambda outputs: self._append_ghost_comparison(
+                outputs,
+                eligible=False,
+            )
+        )
+
+        candidate = build_review_candidate(
+            self.store,
+            fixture.link.envelope.record_id,
+            fixture.result.envelope.record_id,
+            MARKET_KEY,
+        )
+
+        self.assertEqual(candidate.market_key, MARKET_KEY)
+
+    def test_shadow_metrics_must_match_full_forecast_context(self):
+        def forge_shadow_metric(outputs):
+            outputs["shadow_comparison"]["market_comparisons"][0][
+                "edge"
+            ] = 0.123456
+
+        fixture = self.fixture(mutate_outputs=forge_shadow_metric)
+
+        with self.assertRaisesRegex(ValueError, "market evaluation.*edge"):
+            build_review_candidate(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+    def test_ineligible_flags_must_match_full_forecast_context(self):
+        def claim_flag(flag):
+            def mutate(outputs):
+                comparison = outputs["shadow_comparison"][
+                    "market_comparisons"
+                ][0]
+                comparison["principal_paths"] = []
+                comparison["review_eligible"] = False
+                comparison["review_ineligibility_flags"] = [flag]
+
+            return mutate
+
+        for flag in (
+            "unknown_market_key",
+            "missing_component_distribution",
+            "invalid_path_count",
+        ):
+            with self.subTest(flag=flag):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.store = LedgerStore(Path(directory) / "ledger.jsonl")
+                    fixture = self.fixture(
+                        mutate_outputs=claim_flag(flag)
+                    )
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"inconsistent.*{flag}",
+                    ):
+                        build_review_candidate(
+                            self.store,
+                            fixture.link.envelope.record_id,
+                            fixture.result.envelope.record_id,
+                            MARKET_KEY,
+                        )
 
     def test_nonstring_unsupported_event_type_is_ignored(self):
         fixture = self.fixture(

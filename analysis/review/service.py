@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from analysis.forecasting.engine import SemanticMarketInput
-from analysis.forecasting.inputs import MarketType, SettlementFormat
+from analysis.forecasting.inputs import MarketType
 from analysis.forecasting.market import settle_observed_market
 from analysis.forecasting.simulation import (
     ComponentDistribution,
@@ -201,88 +201,6 @@ def _capture_identity(capture: CaptureRecord) -> tuple[str, str]:
     return away_team, home_team
 
 
-def _parse_enum(enum_type: type, value: object, field_name: str):
-    if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a canonical string")
-    try:
-        return enum_type(value)
-    except ValueError as error:
-        raise ValueError(f"{field_name} is unsupported: {value}") from error
-
-
-def _semantic_market_input(
-    outputs: Mapping[str, object],
-    market_key: str,
-) -> SemanticMarketInput:
-    market_inputs = _require_mapping(
-        outputs.get("market_inputs"),
-        "forecast outputs market_inputs",
-    )
-    if market_key not in market_inputs:
-        raise ValueError(
-            f"forecast outputs market_inputs is missing market_key {market_key}"
-        )
-    value = _require_mapping(
-        market_inputs[market_key],
-        f"market_inputs[{market_key}]",
-    )
-    expected_fields = {
-        "market_key",
-        "market_type",
-        "settlement_format",
-        "selected_side",
-        "line",
-        "selected_decimal_price",
-        "opposing_decimal_price",
-    }
-    if set(value) != expected_fields:
-        raise ValueError(
-            f"market_inputs[{market_key}] must match SemanticMarketInput schema"
-        )
-    if value["market_key"] != market_key:
-        raise ValueError("market_inputs key and market_key must match")
-    return SemanticMarketInput(
-        market_key=market_key,
-        market_type=_parse_enum(
-            MarketType,
-            value["market_type"],
-            "market_type",
-        ),
-        settlement_format=_parse_enum(
-            SettlementFormat,
-            value["settlement_format"],
-            "settlement_format",
-        ),
-        selected_side=_require_nonempty_string(
-            value["selected_side"],
-            "selected_side",
-        ),
-        line=value["line"],
-        selected_decimal_price=value["selected_decimal_price"],
-        opposing_decimal_price=value["opposing_decimal_price"],
-    )
-
-
-def _require_semantic_fingerprint(
-    outputs: Mapping[str, object],
-    market: SemanticMarketInput,
-) -> None:
-    markets = _require_mapping(outputs.get("markets"), "forecast outputs markets")
-    if market.market_key not in markets:
-        raise ValueError(
-            f"forecast outputs markets is missing market_key {market.market_key}"
-        )
-    evaluation = _require_mapping(
-        markets[market.market_key],
-        f"markets[{market.market_key}]",
-    )
-    fingerprint = evaluation.get("semantic_fingerprint")
-    if fingerprint != market.semantic_fingerprint:
-        raise ValueError(
-            "market evaluation semantic_fingerprint must match frozen semantics"
-        )
-
-
 def _resolve_selected_side(
     market: SemanticMarketInput,
     away_team: str,
@@ -305,8 +223,11 @@ def _exact_shadow_comparison(
     outputs: Mapping[str, object],
     forecast_run_id: str,
     market_key: str,
-) -> object:
-    from analysis.shadow import deserialize_shadow_comparison
+) -> tuple[object, Mapping[str, SemanticMarketInput]]:
+    from analysis.shadow import (
+        deserialize_shadow_comparison,
+        validate_shadow_forecast_context,
+    )
 
     shadow = deserialize_shadow_comparison(
         outputs.get("shadow_comparison")
@@ -315,6 +236,12 @@ def _exact_shadow_comparison(
         raise ValueError(
             "shadow_comparison forecast_run_id must match ForecastRecord"
         )
+    semantic_market_inputs = validate_shadow_forecast_context(
+        shadow,
+        outputs.get("market_inputs"),
+        outputs.get("markets"),
+        outputs.get("component_distributions"),
+    )
     matches = tuple(
         comparison
         for comparison in shadow.market_comparisons
@@ -336,7 +263,7 @@ def _exact_shadow_comparison(
         )
     if flags:
         raise ValueError("review-eligible comparison cannot contain flags")
-    return comparison
+    return comparison, semantic_market_inputs
 
 
 def _require_component_namespace(component_id: str) -> None:
@@ -605,13 +532,16 @@ def build_review_candidate(
         raise ValueError(
             "forecast outputs forecast_run_id must match ForecastRecord"
         )
-    comparison = _exact_shadow_comparison(
+    comparison, semantic_market_inputs = _exact_shadow_comparison(
         outputs,
         forecast.forecast_run_id,
         market_key,
     )
-    market = _semantic_market_input(outputs, market_key)
-    _require_semantic_fingerprint(outputs, market)
+    if market_key not in semantic_market_inputs:
+        raise ValueError(
+            f"forecast outputs market_inputs is missing market_key {market_key}"
+        )
+    market = semantic_market_inputs[market_key]
     resolved_market = _resolve_selected_side(market, away_team, home_team)
     paths = _principal_paths(comparison, market.market_type)
     component_forecasts, component_observations = _component_pairs(

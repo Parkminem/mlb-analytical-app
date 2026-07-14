@@ -80,13 +80,16 @@ def candidate(
     market: str = "ml",
     score: int = 78,
     rating: str = "play",
+    evidence_paths: frozenset[PriorityEvidencePath] | None = None,
 ) -> PriorityMarketCandidate:
     return PriorityMarketCandidate(
         market=market,
         score=score,
         decision_rating=rating,
-        evidence_paths=frozenset(
-            path.evidence_path for path in principal_paths()
+        evidence_paths=(
+            frozenset(path.evidence_path for path in principal_paths())
+            if evidence_paths is None
+            else evidence_paths
         ),
     )
 
@@ -256,6 +259,20 @@ class ShadowComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate index.*range"):
             legacy_snapshot(review_bindings=(binding(index=1),))
 
+    def test_snapshot_rejects_binding_paths_absent_from_candidate_evidence(
+        self,
+    ) -> None:
+        incomplete_evidence = frozenset(
+            (PriorityEvidencePath.STARTER_SUPPRESSION,)
+        )
+
+        with self.assertRaisesRegex(ValueError, "candidate evidence_paths"):
+            legacy_snapshot(
+                candidates=(
+                    candidate(evidence_paths=incomplete_evidence),
+                ),
+            )
+
     def test_snapshot_rejects_mutable_or_noncanonical_candidate_evidence(self) -> None:
         mutable_evidence = candidate()
         object.__setattr__(
@@ -385,7 +402,7 @@ class ShadowComparisonTests(unittest.TestCase):
             ("missing_pregame_binding",),
         )
 
-    def test_invalid_binding_emits_all_flags_in_fixed_order(self) -> None:
+    def test_invalid_binding_emits_context_flags_in_fixed_order(self) -> None:
         invalid_path = PrincipalPathBinding(
             evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
             component_ids=("missing_component",),
@@ -394,7 +411,6 @@ class ShadowComparisonTests(unittest.TestCase):
         legacy = legacy_snapshot(
             review_bindings=(
                 binding(
-                    legacy_market="full_total",
                     market_key="unknown_market",
                     paths=(invalid_path,),
                 ),
@@ -412,7 +428,6 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertEqual(
             market.review_ineligibility_flags,
             (
-                "candidate_market_mismatch",
                 "unknown_market_key",
                 "invalid_path_count",
                 "missing_component_distribution",
@@ -447,6 +462,17 @@ class ShadowComparisonTests(unittest.TestCase):
             contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
         )
         legacy = legacy_snapshot(
+            candidates=(
+                candidate(
+                    evidence_paths=frozenset(
+                        path.evidence_path
+                        for path in (
+                            missing_component_path,
+                            principal_paths()[0],
+                        )
+                    )
+                ),
+            ),
             review_bindings=(
                 binding(
                     paths=(missing_component_path, principal_paths()[0]),
@@ -516,6 +542,102 @@ class ShadowComparisonTests(unittest.TestCase):
             ShadowComparison(
                 authority="shadow",
                 legacy=valid.legacy,
+                forecast_run_id=valid.forecast_run_id,
+                market_comparisons=valid.market_comparisons,
+            )
+
+    def test_comparison_cross_validates_binding_flags_and_identity(self) -> None:
+        valid = compare_shadow_forecast(
+            legacy_snapshot(),
+            self.forecast,
+        )
+        comparison = valid.market_comparisons[0]
+        forged_missing = replace(
+            comparison,
+            principal_paths=(),
+            review_eligible=False,
+            review_ineligibility_flags=("missing_pregame_binding",),
+        )
+
+        with self.assertRaisesRegex(ValueError, "binding.*missing_pregame"):
+            ShadowComparison(
+                authority="legacy",
+                legacy=valid.legacy,
+                forecast_run_id=valid.forecast_run_id,
+                market_comparisons=(forged_missing,),
+            )
+
+        forged_candidate_mismatch = replace(
+            comparison,
+            principal_paths=(),
+            review_eligible=False,
+            review_ineligibility_flags=("candidate_market_mismatch",),
+        )
+        with self.assertRaisesRegex(ValueError, "candidate_market_mismatch"):
+            ShadowComparison(
+                authority="legacy",
+                legacy=valid.legacy,
+                forecast_run_id=valid.forecast_run_id,
+                market_comparisons=(forged_candidate_mismatch,),
+            )
+
+        ineligible = replace(
+            comparison,
+            principal_paths=(),
+            review_eligible=False,
+            review_ineligibility_flags=("unknown_market_key",),
+        )
+        for mismatched_binding in (
+            replace(binding(), market_key="other_market"),
+            replace(binding(), legacy_market="full_total"),
+        ):
+            with self.subTest(binding=mismatched_binding):
+                with self.assertRaisesRegex(ValueError, "review binding"):
+                    ShadowComparison(
+                        authority="legacy",
+                        legacy=legacy_snapshot(
+                            review_bindings=(mismatched_binding,),
+                        ),
+                        forecast_run_id=valid.forecast_run_id,
+                        market_comparisons=(ineligible,),
+                    )
+
+        without_binding = legacy_snapshot(review_bindings=())
+        with self.assertRaisesRegex(ValueError, "missing_pregame_binding"):
+            ShadowComparison(
+                authority="legacy",
+                legacy=without_binding,
+                forecast_run_id=valid.forecast_run_id,
+                market_comparisons=(ineligible,),
+            )
+
+        forged_unbound_mismatch = replace(
+            comparison,
+            principal_paths=(),
+            review_eligible=False,
+            review_ineligibility_flags=(
+                "missing_pregame_binding",
+                "candidate_market_mismatch",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "candidate_market_mismatch"):
+            ShadowComparison(
+                authority="legacy",
+                legacy=without_binding,
+                forecast_run_id=valid.forecast_run_id,
+                market_comparisons=(forged_unbound_mismatch,),
+            )
+
+    def test_comparison_rejects_eligible_entry_without_binding(self) -> None:
+        valid = compare_shadow_forecast(
+            legacy_snapshot(),
+            self.forecast,
+        )
+
+        with self.assertRaisesRegex(ValueError, "review binding"):
+            ShadowComparison(
+                authority="legacy",
+                legacy=legacy_snapshot(review_bindings=()),
                 forecast_run_id=valid.forecast_run_id,
                 market_comparisons=valid.market_comparisons,
             )
@@ -989,6 +1111,13 @@ class ShadowRecordingTests(unittest.TestCase):
             ),
         )
         legacy = legacy_snapshot(
+            candidates=(
+                candidate(
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in same_side_paths
+                    )
+                ),
+            ),
             review_bindings=(binding(paths=same_side_paths),),
         )
 
