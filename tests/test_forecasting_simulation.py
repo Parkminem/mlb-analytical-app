@@ -360,10 +360,13 @@ class GameSimulationTests(unittest.TestCase):
             ].summary.p80
         )
 
-    def test_unverified_bulk_handoff_uses_unscheduled_f5_relief(self):
+    def test_unverified_opener_bulk_handoff_preserves_declared_bulk_in_f5(self):
         config = SimulationConfig(simulations=1)
+        home_chain = _unverified_opener_bulk_chain()
+        simulation_input = _game_sim_input(config, home_chain=home_chain)
+        bulk = home_chain.pitchers[1]
         means = []
-        scripted_runs = iter([0, 1] + [0] * 15)
+        scripted_runs = iter([0, 0, 1] + [0] * 15)
 
         def record_run_mean(_rng, *, mean, shape):
             del shape
@@ -387,19 +390,27 @@ class GameSimulationTests(unittest.TestCase):
                 return_value=(0, 0),
             ),
         ):
-            simulate_game_distribution(
-                _game_sim_input(
-                    config,
-                    home_chain=_unverified_opener_bulk_chain(),
-                ),
+            result = simulate_game_distribution(
+                simulation_input,
                 "a" * 64,
                 config,
             )
 
         self.assertAlmostEqual(
             means[2],
-            config.league_runs_per_team_game / 9,
+            mean_runs_for_half_inning(
+                league_inning_rate=config.league_runs_per_team_game / 9,
+                offense_multiplier=(
+                    simulation_input.away_offense.base_offense_multiplier
+                ),
+                matchup_multiplier=(
+                    simulation_input.away_offense.multiplier_for(bulk.pitcher_id)
+                ),
+                run_prevention_multiplier=bulk.run_prevention_multiplier,
+            ),
         )
+        self.assertEqual(result.games[0].home_pitcher_chain_runs_allowed, 1)
+        self.assertEqual(result.games[0].home_bullpen_runs_allowed, 0)
 
     def test_mixed_exit_inning_conserves_every_realized_run(self):
         runs = [0] * 18

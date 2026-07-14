@@ -6,6 +6,18 @@ from datetime import datetime
 
 
 _LOWERCASE_HEX = frozenset("0123456789abcdef")
+_MARKET_RESULTS = frozenset(("win", "loss", "push"))
+_REVIEW_CLASSIFICATIONS = frozenset(("A", "B", "C", "D"))
+_COMPONENT_REVIEW_KEYS = frozenset(
+    (
+        "evidence_path",
+        "component_ids",
+        "contradicted",
+        "inside_80_count",
+        "component_count",
+        "notes",
+    )
+)
 
 
 def _require_nonempty(value: object, field_name: str) -> None:
@@ -225,6 +237,77 @@ def _require_optional_positive_number(value: object, field_name: str) -> None:
 def _require_nonnegative_run(value: object, field_name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a nonnegative integer")
+
+
+def _validate_component_reviews(
+    component_reviews: tuple[FrozenMapping, ...],
+) -> tuple[str, ...]:
+    contradicted_paths: list[str] = []
+    evidence_paths: set[str] = set()
+    for index, review in enumerate(component_reviews):
+        if frozenset(review) != _COMPONENT_REVIEW_KEYS:
+            raise ValueError(
+                "component_reviews entries must contain exactly the canonical "
+                f"keys at index {index}"
+            )
+        evidence_path = review["evidence_path"]
+        _require_nonempty(
+            evidence_path,
+            f"component_reviews[{index}].evidence_path",
+        )
+        if evidence_path in evidence_paths:
+            raise ValueError("component_reviews evidence paths must be unique")
+        evidence_paths.add(evidence_path)
+
+        component_ids = review["component_ids"]
+        if not isinstance(component_ids, tuple) or not component_ids:
+            raise ValueError(
+                f"component_reviews[{index}].component_ids must be non-empty"
+            )
+        for component_id in component_ids:
+            _require_nonempty(
+                component_id,
+                f"component_reviews[{index}].component_ids",
+            )
+        if len(set(component_ids)) != len(component_ids):
+            raise ValueError(
+                f"component_reviews[{index}].component_ids must be unique"
+            )
+
+        contradicted = review["contradicted"]
+        if not isinstance(contradicted, bool):
+            raise ValueError(
+                f"component_reviews[{index}].contradicted must be boolean"
+            )
+        inside_80_count = review["inside_80_count"]
+        component_count = review["component_count"]
+        for field_name, value in (
+            ("inside_80_count", inside_80_count),
+            ("component_count", component_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"component_reviews[{index}].{field_name} must be an integer"
+                )
+        if component_count <= 0 or component_count != len(component_ids):
+            raise ValueError(
+                f"component_reviews[{index}].component_count must match component_ids"
+            )
+        if not 0 <= inside_80_count <= component_count:
+            raise ValueError(
+                f"component_reviews[{index}].inside_80_count is out of range"
+            )
+
+        notes = review["notes"]
+        if not isinstance(notes, tuple):
+            raise ValueError(
+                f"component_reviews[{index}].notes must be a sequence"
+            )
+        for note in notes:
+            _require_nonempty(note, f"component_reviews[{index}].notes")
+        if contradicted:
+            contradicted_paths.append(evidence_path)
+    return tuple(contradicted_paths)
 
 
 _OFFICIAL_COMPONENT_IDS = frozenset(
@@ -532,6 +615,8 @@ class OfficialResultCommand:
                 raise ValueError(
                     f"{side}_full_runs cannot be lower than {side}_f5_runs"
                 )
+        if self.away_full_runs == self.home_full_runs:
+            raise ValueError("official full-game result must identify a winner")
         component_values = freeze_mapping(
             self.component_values,
             "component_values",
@@ -635,22 +720,38 @@ class ReviewCommand:
             "official_result_record_id",
         )
         _require_nonempty(self.market_key, "market_key")
-        _require_nonempty(self.market_result, "market_result")
-        _require_optional_nonempty(self.classification, "classification")
+        if self.market_result not in _MARKET_RESULTS:
+            raise ValueError("market_result must be win, loss, or push")
+        if self.classification is not None and (
+            not isinstance(self.classification, str)
+            or self.classification not in _REVIEW_CLASSIFICATIONS
+        ):
+            raise ValueError("classification must be A, B, C, D, or None")
         if not _is_finite_number(self.inside_80_ratio):
             raise ValueError("inside_80_ratio must be a finite number")
         if not 0 <= self.inside_80_ratio <= 1:
             raise ValueError("inside_80_ratio must be within [0, 1]")
-        object.__setattr__(
-            self,
+        contradicted_paths = freeze_string_sequence(
+            self.contradicted_paths,
             "contradicted_paths",
-            freeze_string_sequence(self.contradicted_paths, "contradicted_paths"),
         )
-        object.__setattr__(
-            self,
+        if len(set(contradicted_paths)) != len(contradicted_paths):
+            raise ValueError("contradicted_paths must be unique")
+        component_reviews = freeze_mapping_sequence(
+            self.component_reviews,
             "component_reviews",
-            freeze_mapping_sequence(self.component_reviews, "component_reviews"),
         )
+        if self.classification is not None and not component_reviews:
+            raise ValueError(
+                "classified reviews require non-empty component_reviews"
+            )
+        component_contradictions = _validate_component_reviews(component_reviews)
+        if contradicted_paths != component_contradictions:
+            raise ValueError(
+                "contradicted_paths must match contradicted component_reviews"
+            )
+        object.__setattr__(self, "contradicted_paths", contradicted_paths)
+        object.__setattr__(self, "component_reviews", component_reviews)
         source_ids = freeze_string_sequence(
             self.qualifying_exogenous_source_observation_ids,
             "qualifying_exogenous_source_observation_ids",
@@ -667,6 +768,34 @@ class ReviewCommand:
         if self.classification != "D" and source_ids:
             raise ValueError(
                 "non-D classifications require empty qualifying source IDs"
+            )
+        has_contradictions = bool(contradicted_paths)
+        if self.classification == "A" and (
+            self.market_result != "win"
+            or self.inside_80_ratio < 0.75
+            or has_contradictions
+        ):
+            raise ValueError(
+                "A requires a win, inside_80_ratio >= 0.75, and no contradictions"
+            )
+        if self.classification == "B" and (
+            self.inside_80_ratio < 0.60
+            or has_contradictions
+            or (
+                self.market_result == "win"
+                and self.inside_80_ratio >= 0.75
+            )
+        ):
+            raise ValueError(
+                "B requires no contradictions and must not qualify for A or C"
+            )
+        if (
+            self.classification == "C"
+            and self.inside_80_ratio >= 0.60
+            and not has_contradictions
+        ):
+            raise ValueError(
+                "C requires a contradiction or inside_80_ratio < 0.60"
             )
         object.__setattr__(
             self,

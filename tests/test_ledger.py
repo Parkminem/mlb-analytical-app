@@ -130,13 +130,17 @@ def review_command(**overrides: object) -> ReviewCommand:
         "official_result_record_id": "result-record-id",
         "market_key": "game:900001:ml:SEA",
         "market_result": "win",
-        "classification": "inside_80",
+        "classification": "A",
         "inside_80_ratio": 0.75,
-        "contradicted_paths": ["away_lineup.power"],
+        "contradicted_paths": [],
         "component_reviews": [
             {
                 "evidence_path": "away_lineup.power",
-                "classification": "supported",
+                "component_ids": ["away_full_runs"],
+                "contradicted": False,
+                "inside_80_count": 1,
+                "component_count": 1,
+                "notes": [],
             }
         ],
     }
@@ -308,7 +312,7 @@ class LedgerStoreTests(unittest.TestCase):
             real_flock = fcntl.flock
             real_fsync = os.fsync
             real_read_records = LedgerStore._read_records
-            real_path_open = Path.open
+            real_fdopen = os.fdopen
 
             def flock_spy(file_descriptor: int, operation: int) -> None:
                 real_flock(file_descriptor, operation)
@@ -326,10 +330,10 @@ class LedgerStoreTests(unittest.TestCase):
                 real_fsync(file_descriptor)
                 events.append("fsync")
 
-            def open_spy(opened_path: Path, *args: object, **kwargs: object):
-                handle = real_path_open(opened_path, *args, **kwargs)
+            def fdopen_spy(file_descriptor: int, *args: object, **kwargs: object):
+                handle = real_fdopen(file_descriptor, *args, **kwargs)
                 mode = args[0] if args else kwargs.get("mode", "r")
-                if opened_path != store.path or mode != "a":
+                if mode != "a":
                     return handle
 
                 wrapped = mock.MagicMock(wraps=handle)
@@ -369,11 +373,9 @@ class LedgerStoreTests(unittest.TestCase):
                     "analysis.ledger.store.os.fsync",
                     side_effect=fsync_spy,
                 ),
-                mock.patch.object(
-                    Path,
-                    "open",
-                    autospec=True,
-                    side_effect=open_spy,
+                mock.patch(
+                    "analysis.ledger.store.os.fdopen",
+                    side_effect=fdopen_spy,
                 ),
             ):
                 store.append_capture("capture:ordered", capture_command())
@@ -973,6 +975,50 @@ class LedgerStoreTests(unittest.TestCase):
             self.assertEqual(store.latest_official_result(900001), correction)
             self.assertIsNone(store.latest_official_result(999999))
 
+    def test_official_result_rejects_tied_full_game_score(self) -> None:
+        with self.assertRaisesRegex(ValueError, "winner"):
+            result_command(away_full_runs=4, home_full_runs=4)
+
+    def test_result_source_revision_is_unique_across_custom_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            store.append_official_result(
+                result_command(),
+                idempotency_key="result:manual:first",
+            )
+
+            with self.assertRaisesRegex(
+                LedgerReferenceError,
+                "source revision",
+            ):
+                store.append_official_result(
+                    result_command(),
+                    idempotency_key="result:manual:duplicate",
+                )
+
+            self.assertEqual(len(tuple(store.iter_records("official_result"))), 1)
+
+    def test_duplicate_result_source_revision_is_corruption_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            original = store.append_official_result(result_command())
+            duplicate = result_command(
+                supersedes_record_id=original.envelope.record_id,
+            )
+            append_forged_record(
+                path,
+                "official_result",
+                "result:forged-duplicate-revision",
+                duplicate,
+            )
+
+            with self.assertRaisesRegex(
+                LedgerCorruptionError,
+                "source revision",
+            ):
+                tuple(LedgerStore(path).iter_records())
+
     def test_result_component_keys_accept_fixed_and_dynamic_team_ids(self) -> None:
         fixed_keys = (
             "away_f5_runs",
@@ -1326,14 +1372,64 @@ class LedgerStoreTests(unittest.TestCase):
                         forecast_run_id=command.forecast_run_id,
                         official_result_record_id=command.official_result_record_id,
                         market_key=command.market_key,
-                        classification="outside_80",
+                        market_result="loss",
+                        classification="B",
                     ),
                     idempotency_key="review:manual",
                 )
             with self.assertRaises(TypeError):
                 review.component_reviews[0]["new"] = {}
             with self.assertRaises(TypeError):
-                review.component_reviews[0]["classification"] = "mutated"
+                review.component_reviews[0]["contradicted"] = True
+
+    def test_review_command_rejects_invalid_results_and_classifications(self) -> None:
+        invalid_overrides = (
+            {"market_result": "bogus"},
+            {"classification": "Z"},
+            {
+                "classification": "A",
+                "market_result": "loss",
+            },
+            {
+                "classification": "A",
+                "inside_80_ratio": 0.74,
+            },
+            {
+                "classification": "B",
+                "inside_80_ratio": 0.59,
+            },
+            {
+                "classification": "C",
+                "inside_80_ratio": 0.60,
+                "contradicted_paths": (),
+            },
+        )
+
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    review_command(**overrides)
+
+    def test_review_component_payload_must_match_contradicted_paths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "contradicted_paths"):
+            review_command(
+                classification="C",
+                contradicted_paths=("away_lineup.power",),
+            )
+
+        with self.assertRaisesRegex(ValueError, "component_reviews"):
+            review_command(
+                component_reviews=(
+                    {
+                        "evidence_path": "away_lineup.power",
+                        "component_ids": ("away_full_runs",),
+                        "contradicted": False,
+                        "inside_80_count": 2,
+                        "component_count": 1,
+                        "notes": (),
+                    },
+                ),
+            )
 
     def test_review_source_ids_are_canonical_and_classification_bound(self) -> None:
         review_fields = {field.name for field in fields(ReviewCommand)}
@@ -1675,6 +1771,19 @@ class LedgerStoreTests(unittest.TestCase):
                 LedgerStore(hard_link_path)
             with self.assertRaisesRegex(LedgerCorruptionError, "hard link"):
                 tuple(store.iter_records())
+
+    def test_ledger_path_symlink_swap_cannot_modify_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            victim = Path(directory) / "victim.txt"
+            store = LedgerStore(path)
+            victim.write_text("untouched\n", encoding="utf-8")
+            path.symlink_to(victim)
+
+            with self.assertRaisesRegex(LedgerCorruptionError, "symlink"):
+                store.append_capture("capture:symlink-swap", capture_command())
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "untouched\n")
 
     def test_invalid_utf8_and_duplicate_json_keys_raise_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

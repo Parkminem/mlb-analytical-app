@@ -498,12 +498,18 @@ def settle_observed_market(
     ):
         raise ValueError("three-way F5 settlement is unsupported")
 
+    away_f5_runs = _official_run_value(official_result, "away_f5_runs")
+    home_f5_runs = _official_run_value(official_result, "home_f5_runs")
+    away_full_runs = _official_run_value(official_result, "away_full_runs")
+    home_full_runs = _official_run_value(official_result, "home_full_runs")
+    if away_full_runs == home_full_runs:
+        raise ValueError("official full-game result must identify a winner")
     value = _settlement_value_from_scores(
         market_input,
-        away_f5_runs=_official_run_value(official_result, "away_f5_runs"),
-        home_f5_runs=_official_run_value(official_result, "home_f5_runs"),
-        away_full_runs=_official_run_value(official_result, "away_full_runs"),
-        home_full_runs=_official_run_value(official_result, "home_full_runs"),
+        away_f5_runs=away_f5_runs,
+        home_f5_runs=home_f5_runs,
+        away_full_runs=away_full_runs,
+        home_full_runs=home_full_runs,
     )
     return _outcome(value, market_input.market_type)
 

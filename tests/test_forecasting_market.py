@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import math
 import sys
 from types import MappingProxyType
+from types import SimpleNamespace
 import unittest
 
 from analysis.forecasting.identity import canonical_json
@@ -722,11 +723,10 @@ class MarketSettlementTests(unittest.TestCase):
     "observed market settlement API is missing",
 )
 class ObservedMarketSettlementTests(unittest.TestCase):
-    def test_ml_uses_full_score_and_never_pushes_on_a_tie(self):
+    def test_ml_uses_full_score_and_never_pushes(self):
         cases = (
             ((1, 2, 4, 3), "win"),
             ((2, 1, 3, 4), "loss"),
-            ((2, 2, 4, 4), "loss"),
         )
 
         for score, expected in cases:
@@ -738,6 +738,20 @@ class ObservedMarketSettlementTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_observed_settlement_rejects_tied_official_final(self):
+        impossible_result = SimpleNamespace(
+            away_f5_runs=2,
+            home_f5_runs=2,
+            away_full_runs=4,
+            home_full_runs=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "winner"):
+            settle_observed_market(
+                _market(MarketType.ML, "away", line=None),
+                impossible_result,
+            )
 
     def test_plus_one_and_a_half_uses_full_game_margin_without_push(self):
         cases = (

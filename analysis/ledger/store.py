@@ -2,11 +2,13 @@
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 from typing import Callable, TypeVar
 import uuid
 
@@ -353,7 +355,11 @@ class LedgerStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._reject_existing_hard_links()
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
-        descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = self._open_no_follow(
+            self.lock_path,
+            os.O_CREAT | os.O_RDWR,
+            "ledger lock",
+        )
         os.close(descriptor)
 
     @staticmethod
@@ -370,10 +376,53 @@ class LedgerStore:
             return
         self._reject_hard_links(link_count)
 
+    def _open_no_follow(
+        self,
+        path: Path,
+        flags: int,
+        path_label: str,
+    ) -> int:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags | no_follow, 0o600)
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.EMLINK):
+                raise LedgerCorruptionError(
+                    f"{path_label} path must not be a symlink"
+                ) from error
+            raise
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = path.lstat()
+            if stat.S_ISLNK(path_stat.st_mode):
+                raise LedgerCorruptionError(
+                    f"{path_label} path must not be a symlink"
+                )
+            if not stat.S_ISREG(descriptor_stat.st_mode):
+                raise LedgerCorruptionError(
+                    f"{path_label} path must reference a regular file"
+                )
+            if (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ) != (path_stat.st_dev, path_stat.st_ino):
+                raise LedgerCorruptionError(
+                    f"{path_label} path changed while being opened"
+                )
+            self._reject_hard_links(descriptor_stat.st_nlink)
+        except Exception:
+            os.close(descriptor)
+            raise
+        return descriptor
+
     def _read_records(self) -> tuple[_RecordT, ...]:
         try:
-            with self.path.open("rb") as ledger:
-                self._reject_hard_links(os.fstat(ledger.fileno()).st_nlink)
+            descriptor = self._open_no_follow(
+                self.path,
+                os.O_RDONLY,
+                "ledger",
+            )
+            with os.fdopen(descriptor, "rb") as ledger:
                 raw_content = ledger.read()
         except FileNotFoundError:
             return ()
@@ -400,6 +449,7 @@ class LedgerStore:
         forecasts_by_id: dict[str, ForecastRecord] = {}
         markets_by_record_id: dict[str, MarketObservationRecord] = {}
         results_by_game: dict[int, list[OfficialResultRecord]] = {}
+        result_revision_keys: set[tuple[int, str, str]] = set()
         for line_number, line in enumerate(content.split("\n")[:-1], start=1):
             if not line:
                 raise LedgerCorruptionError(f"empty ledger row at line {line_number}")
@@ -485,6 +535,13 @@ class LedgerStore:
                                 "market supersession target already has a successor"
                             )
                 elif isinstance(record, OfficialResultRecord):
+                    revision_key = (
+                        record.game_pk,
+                        record.source_name,
+                        record.source_revision,
+                    )
+                    if revision_key in result_revision_keys:
+                        raise ValueError("duplicate official result source revision")
                     prior_results = results_by_game.get(record.game_pk, [])
                     if not prior_results:
                         if record.supersedes_record_id is not None:
@@ -536,6 +593,13 @@ class LedgerStore:
                     market_supersession_targets.add(record.supersedes_record_id)
             elif isinstance(record, OfficialResultRecord):
                 results_by_game.setdefault(record.game_pk, []).append(record)
+                result_revision_keys.add(
+                    (
+                        record.game_pk,
+                        record.source_name,
+                        record.source_revision,
+                    )
+                )
             elif isinstance(record, ReviewRecord):
                 review_ids.add(record.review_id)
         return tuple(records)
@@ -550,7 +614,12 @@ class LedgerStore:
     ) -> _RecordT:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("idempotency_key must be a non-empty string")
-        with self.lock_path.open("a+b") as lock_file:
+        lock_descriptor = self._open_no_follow(
+            self.lock_path,
+            os.O_RDWR,
+            "ledger lock",
+        )
+        with os.fdopen(lock_descriptor, "r+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 records = self._read_records()
@@ -577,8 +646,17 @@ class LedgerStore:
                     appended_at=datetime.now(timezone.utc),
                 )
                 record = build(envelope)
-                with self.path.open("a", encoding="utf-8", newline="") as ledger:
-                    self._reject_hard_links(os.fstat(ledger.fileno()).st_nlink)
+                descriptor = self._open_no_follow(
+                    self.path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    "ledger",
+                )
+                with os.fdopen(
+                    descriptor,
+                    "a",
+                    encoding="utf-8",
+                    newline="",
+                ) as ledger:
                     ledger.write(f"{canonical_json(record)}\n")
                     ledger.flush()
                     os.fsync(ledger.fileno())
@@ -827,6 +905,16 @@ class LedgerStore:
         )
 
         def validate(records: tuple[_RecordT, ...]) -> None:
+            if any(
+                isinstance(record, OfficialResultRecord)
+                and record.game_pk == command.game_pk
+                and record.source_name == command.source_name
+                and record.source_revision == command.source_revision
+                for record in records
+            ):
+                raise LedgerReferenceError(
+                    "official result source revision already exists"
+                )
             prior_results = [
                 record
                 for record in records

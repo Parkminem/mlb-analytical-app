@@ -246,6 +246,7 @@ class SlotMatchupForecast:
         appearances = frozen_mappings["plate_appearances"]
         adjusted_wobas = frozen_mappings["adjusted_wobas"]
         strengths = frozen_mappings["sample_strengths"]
+        labels_by_pitch = dict(zip(self.evaluated_pitch_types, self.labels))
 
         for pitch_type in self.evaluated_pitch_types:
             usage = usages[pitch_type]
@@ -293,9 +294,7 @@ class SlotMatchupForecast:
                 "adjusted_wobas",
             )
             sample_strength = strengths[pitch_type]
-            label = self.labels[
-                self.evaluated_pitch_types.index(pitch_type)
-            ]
+            label = labels_by_pitch[pitch_type]
             if band_width is None:
                 if plate_appearances != 0 or sample_strength is not None:
                     raise ValueError(
@@ -328,7 +327,12 @@ class SlotMatchupForecast:
         _require_unit_interval(self.unknown_exposure, "unknown_exposure")
         if self.evaluated_pitch_types:
             expected_woba = math.fsum(
-                usages[pitch_type] * adjusted_wobas[pitch_type]
+                usages[pitch_type]
+                * (
+                    self._context.league_woba
+                    if labels_by_pitch[pitch_type] == "표본 부족"
+                    else adjusted_wobas[pitch_type]
+                )
                 for pitch_type in self.evaluated_pitch_types
             )
             if not math.isclose(
@@ -343,7 +347,7 @@ class SlotMatchupForecast:
             expected_unknown = math.fsum(
                 usages[pitch_type]
                 for pitch_type in self.evaluated_pitch_types
-                if bands[pitch_type] is None
+                if labels_by_pitch[pitch_type] == "표본 부족"
             )
             if not math.isclose(
                 self.unknown_exposure,
@@ -352,7 +356,8 @@ class SlotMatchupForecast:
                 abs_tol=_FLOAT_TOLERANCE,
             ):
                 raise ValueError(
-                    "unknown_exposure is inconsistent with missing pitch usage"
+                    "unknown_exposure is inconsistent with sample-shortage "
+                    "pitch usage"
                 )
         else:
             if self.unknown_exposure != 1.0:
@@ -731,14 +736,20 @@ def _forecast_slot(
         labels.append(selected.slot_label)
         strengths[pitch_type] = selected.sample_strength
 
+    labels_by_pitch = dict(zip(pitch_types, labels))
     exposure_woba = math.fsum(
-        normalized_usages[pitch_type] * adjusted_wobas[pitch_type]
+        normalized_usages[pitch_type]
+        * (
+            config.league_woba
+            if labels_by_pitch[pitch_type] == "표본 부족"
+            else adjusted_wobas[pitch_type]
+        )
         for pitch_type in pitch_types
     )
     unknown_exposure = math.fsum(
         normalized_usages[pitch_type]
         for pitch_type in pitch_types
-        if bands[pitch_type] is None
+        if labels_by_pitch[pitch_type] == "표본 부족"
     )
     if math.isclose(unknown_exposure, 0.0, rel_tol=0.0, abs_tol=1e-15):
         unknown_exposure = 0.0

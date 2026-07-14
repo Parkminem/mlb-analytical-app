@@ -2311,8 +2311,74 @@ class OffenseForecastTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             missing.lineup_log_standard_error = 0.50
 
+    def test_selected_sample_shortage_is_neutral_and_counts_usage_as_unknown(self):
+        pitcher_id = "pitcher:starter"
+        config = SimulationConfig(pa_weights=(1.0,) * 9)
+        profile = _offense_profile(
+            pitcher_id,
+            (
+                _offense_usage(pitcher_id, "R", "FF", 0.25, 95.0),
+                _offense_usage(pitcher_id, "R", "CH", 0.75, 85.0),
+            ),
+        )
+        base = _offense_lineup(sides=("R",) * 9, log_standard_error=0.09)
+        responses_by_order = {}
+        for slot in base.slots:
+            sample_shortage = slot.order == 1
+            responses_by_order[slot.order] = (
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    adjusted_woba=config.league_woba,
+                ),
+                _offense_response(
+                    slot.order,
+                    pitcher_id,
+                    pitch_type="CH",
+                    velocity_center_mph=85.0,
+                    plate_appearances=4 if sample_shortage else 30,
+                    adjusted_woba=0.100 if sample_shortage else config.league_woba,
+                    sample_strength="short" if sample_shortage else "strong",
+                    slot_label="표본 부족" if sample_shortage else "중립",
+                ),
+            )
+
+        forecast = forecast_offense(
+            _offense_with_responses(base, responses_by_order),
+            (profile,),
+            config,
+        )
+        slot = forecast.slot_forecasts_for(pitcher_id)[0]
+        expected_unknown_exposure = 0.75 / 9.0
+
+        self.assertEqual(slot.selected_band_widths["CH"], 1.5)
+        self.assertEqual(slot.plate_appearances["CH"], 4)
+        self.assertEqual(slot.adjusted_wobas["CH"], 0.100)
+        self.assertEqual(slot.sample_strengths["CH"], "short")
+        self.assertEqual(slot.labels, ("중립", "표본 부족"))
+        self.assertEqual(slot.exposure_weighted_adjusted_woba, config.league_woba)
+        self.assertEqual(slot.unknown_exposure, 0.75)
+        self.assertEqual(forecast.matchup_multipliers[pitcher_id], 1.0)
+        self.assertEqual(
+            forecast.matchup_unknown_exposures[pitcher_id],
+            expected_unknown_exposure,
+        )
+        self.assertAlmostEqual(
+            forecast.matchup_log_standard_errors[pitcher_id],
+            math.hypot(
+                0.09,
+                expected_unknown_exposure
+                * config.sample_shortage_log_se_penalty,
+            ),
+        )
+        self.assertGreater(
+            forecast.matchup_log_standard_errors[pitcher_id],
+            base.log_standard_error.value,
+        )
+
     def test_selected_values_and_fixed_labels_are_carried_without_reshrinking(self):
         pitcher_id = "pitcher:starter"
+        config = SimulationConfig()
         pitches = ("FF", "CH", "SL", "SI")
         velocities = (95.0, 85.0, 84.0, 93.0)
         wobas = (0.111, 0.222, 0.333, 0.444)
@@ -2347,7 +2413,7 @@ class OffenseForecastTests(unittest.TestCase):
             },
         )
 
-        slot = forecast_offense(lineup, (profile,), SimulationConfig()).slot_forecasts[0]
+        slot = forecast_offense(lineup, (profile,), config).slot_forecasts[0]
 
         self.assertEqual(slot.adjusted_wobas, dict(zip(pitches, wobas)))
         self.assertEqual(slot.labels, labels)
@@ -2355,9 +2421,9 @@ class OffenseForecastTests(unittest.TestCase):
         self.assertEqual(slot.plate_appearances, dict(zip(pitches, range(11, 15))))
         self.assertAlmostEqual(
             slot.exposure_weighted_adjusted_woba,
-            math.fsum(wobas) / len(wobas),
+            math.fsum((*wobas[:-1], config.league_woba)) / len(wobas),
         )
-        self.assertEqual(slot.unknown_exposure, 0.0)
+        self.assertEqual(slot.unknown_exposure, 0.25)
 
     def test_base_and_matchup_multipliers_clip_high_and_low(self):
         pitcher_id = "pitcher:starter"

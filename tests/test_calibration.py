@@ -279,11 +279,33 @@ def append_review(
     market_result: str = "win",
     market_type: str = "ml",
     id_suffix: str = "1",
-    classification: str | None = "A",
+    classification: str | None = None,
     inside_80_ratio: float = 1.0,
     contradicted_paths: tuple[str, ...] = (),
-    component_reviews: tuple[dict[str, object], ...] = (),
+    component_reviews: tuple[dict[str, object], ...] | None = None,
 ):
+    resolved_classification = classification
+    if resolved_classification is None:
+        if contradicted_paths or inside_80_ratio < 0.60:
+            resolved_classification = "C"
+        elif market_result == "win" and inside_80_ratio >= 0.75:
+            resolved_classification = "A"
+        else:
+            resolved_classification = "B"
+    resolved_component_reviews = component_reviews
+    if resolved_component_reviews is None:
+        evidence_paths = contradicted_paths or ("away_lineup.power",)
+        resolved_component_reviews = tuple(
+            {
+                "evidence_path": evidence_path,
+                "component_ids": ("away_full_runs",),
+                "contradicted": evidence_path in contradicted_paths,
+                "inside_80_count": int(inside_80_ratio >= 0.50),
+                "component_count": 1,
+                "notes": (),
+            }
+            for evidence_path in evidence_paths
+        )
     return store.append_review(
         ReviewCommand(
             capture_forecast_link_record_id=link.envelope.record_id,
@@ -292,10 +314,10 @@ def append_review(
             official_result_record_id=result.envelope.record_id,
             market_key=market_key(capture.game_pk, market_type),
             market_result=market_result,
-            classification=classification,
+            classification=resolved_classification,
             inside_80_ratio=inside_80_ratio,
             contradicted_paths=contradicted_paths,
-            component_reviews=component_reviews,
+            component_reviews=resolved_component_reviews,
         ),
         idempotency_key=(
             f"review:{capture.capture_id}:{result.envelope.record_id}:"
@@ -1935,7 +1957,7 @@ class CalibrationSelectionTests(unittest.TestCase):
         )
         append_entry_market(self.store, game_pk=910032, id_suffix="entry")
         result = append_result(self.store, game_pk=910032)
-        for classification in ("A", "B"):
+        for classification, inside_80_ratio in (("A", 0.75), ("B", 0.70)):
             append_review(
                 self.store,
                 capture=context[0],
@@ -1944,6 +1966,7 @@ class CalibrationSelectionTests(unittest.TestCase):
                 result=result,
                 id_suffix=classification,
                 classification=classification,
+                inside_80_ratio=inside_80_ratio,
             )
 
         with self.assertRaisesRegex(ValueError, "conflicting review records"):
@@ -1970,8 +1993,12 @@ class CalibrationSelectionTests(unittest.TestCase):
                 id_suffix=classification,
                 component_reviews=(
                     {
-                        "component_id": "away_full_runs",
-                        "classification": classification,
+                        "evidence_path": "away_lineup.power",
+                        "component_ids": ("away_full_runs",),
+                        "contradicted": False,
+                        "inside_80_count": 1,
+                        "component_count": 1,
+                        "notes": (classification,),
                     },
                 ),
             )

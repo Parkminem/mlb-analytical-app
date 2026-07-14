@@ -777,11 +777,7 @@ def _pitching_effects_for_half_inning(
     effects: list[_PitchingEffect] = []
     covered_outs = 0
     handoff_verified = "handoff_unverified" not in chain.diagnostics
-    active_segments = (
-        plan.segments
-        if len(chain.pitchers) == 1 or handoff_verified
-        else plan.segments[:1]
-    )
+    active_segments = plan.segments
 
     for segment in active_segments:
         overlap = max(
