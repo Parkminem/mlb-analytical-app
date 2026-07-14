@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import math
 from types import MappingProxyType
+import weakref
 
 from .config import SimulationConfig
 from .inputs import LineupInput, LineupSlot, PitcherInput, PitchUsage
@@ -124,6 +125,12 @@ class _OffenseInvariantContext:
     matchup_bounds: tuple[float, float]
     lineup_log_standard_error: float
     sample_shortage_log_se_penalty: float
+    _factory_capability: object | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_finite_positive(self.league_woba, "league_woba")
@@ -156,6 +163,45 @@ class _OffenseInvariantContext:
         )
 
 
+def _build_offense_context_factory():
+    capability = object()
+    issued_contexts = weakref.WeakValueDictionary()
+
+    def create_context(
+        *,
+        league_woba: float,
+        normalized_pa_weights: tuple[float, ...],
+        matchup_bounds: tuple[float, float],
+        lineup_log_standard_error: float,
+        sample_shortage_log_se_penalty: float,
+    ) -> _OffenseInvariantContext:
+        context = _OffenseInvariantContext(
+            league_woba=league_woba,
+            normalized_pa_weights=normalized_pa_weights,
+            matchup_bounds=matchup_bounds,
+            lineup_log_standard_error=lineup_log_standard_error,
+            sample_shortage_log_se_penalty=sample_shortage_log_se_penalty,
+        )
+        object.__setattr__(context, "_factory_capability", capability)
+        issued_contexts[id(context)] = context
+        return context
+
+    def is_factory_context(value: object) -> bool:
+        return (
+            isinstance(value, _OffenseInvariantContext)
+            and issued_contexts.get(id(value)) is value
+            and value._factory_capability is capability
+        )
+
+    return create_context, is_factory_context
+
+
+(
+    _create_offense_invariant_context,
+    _is_factory_context,
+) = _build_offense_context_factory()
+
+
 @dataclass(frozen=True)
 class SlotMatchupForecast:
     order: int
@@ -181,7 +227,7 @@ class SlotMatchupForecast:
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self._context, _OffenseInvariantContext):
+        if not _is_factory_context(self._context):
             raise ValueError(
                 "SlotMatchupForecast must be constructed by forecast_offense"
             )
@@ -373,6 +419,12 @@ class SlotMatchupForecast:
             object.__setattr__(self, field_name, frozen)
 
 
+def _aggregate_matchup_log_standard_error(
+    matchup_sigmas: Mapping[str, float],
+) -> float:
+    return max(matchup_sigmas.values())
+
+
 @dataclass(frozen=True)
 class OffenseForecast:
     base_offense_multiplier: float
@@ -391,7 +443,7 @@ class OffenseForecast:
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self._context, _OffenseInvariantContext):
+        if not _is_factory_context(self._context):
             raise ValueError("OffenseForecast must be constructed by forecast_offense")
         _require_finite_positive(
             self.base_offense_multiplier,
@@ -452,9 +504,17 @@ class OffenseForecast:
                 unknowns[pitcher_id],
                 "matchup_unknown_exposures",
             )
-        if self.log_standard_error + _FLOAT_TOLERANCE < max(sigmas.values()):
+        expected_log_standard_error = _aggregate_matchup_log_standard_error(
+            sigmas
+        )
+        if not math.isclose(
+            self.log_standard_error,
+            expected_log_standard_error,
+            rel_tol=0.0,
+            abs_tol=_FLOAT_TOLERANCE,
+        ):
             raise ValueError(
-                "log_standard_error cannot be lower than an explicit matchup sigma"
+                "log_standard_error must equal the maximum matchup sigma"
             )
 
         if not isinstance(self.slot_forecasts, tuple):
@@ -879,7 +939,7 @@ def forecast_offense(
         9.0,
         "pa_weights",
     )
-    context = _OffenseInvariantContext(
+    context = _create_offense_invariant_context(
         league_woba=config.league_woba,
         normalized_pa_weights=normalized_pa_weights,
         matchup_bounds=config.matchup_bounds,
@@ -918,7 +978,9 @@ def forecast_offense(
         matchup_multipliers=matchup_multipliers,
         projected_traffic_per_9=projected_traffic,
         projected_extra_base_hits_per_9=projected_extra_base_hits,
-        log_standard_error=max(matchup_sigmas.values()),
+        log_standard_error=_aggregate_matchup_log_standard_error(
+            matchup_sigmas
+        ),
         slot_forecasts=slot_forecasts,
         matchup_log_standard_errors=matchup_sigmas,
         matchup_unknown_exposures=matchup_unknowns,

@@ -2582,6 +2582,63 @@ class OffenseForecastTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "forecast_offense"):
                     type(value)(**public_values)
 
+    def test_caller_cannot_forge_offense_invariant_context(self):
+        pitcher_id = "pitcher:starter"
+        result = forecast_offense(
+            _offense_uniform_response_lineup(pitcher_id),
+            (_offense_profile(pitcher_id),),
+            SimulationConfig(),
+        )
+        context = result._context
+
+        self.assertIs(replace(result)._context, context)
+        self.assertIs(replace(result.slot_forecasts[0])._context, context)
+        forged_context = offense_module._OffenseInvariantContext(
+            league_woba=context.league_woba,
+            normalized_pa_weights=context.normalized_pa_weights,
+            matchup_bounds=context.matchup_bounds,
+            lineup_log_standard_error=context.lineup_log_standard_error,
+            sample_shortage_log_se_penalty=(
+                context.sample_shortage_log_se_penalty
+            ),
+        )
+
+        for value in (result.slot_forecasts[0], result):
+            with self.subTest(result_type=type(value).__name__):
+                with self.assertRaisesRegex(ValueError, "forecast_offense"):
+                    replace(value, _context=forged_context)
+
+    def test_global_log_standard_error_must_equal_max_profile_sigma(self):
+        first_id = "pitcher:opener"
+        second_id = "pitcher:bulk"
+        result = forecast_offense(
+            _offense_uniform_response_lineup(
+                first_id,
+                log_standard_error=0.10,
+            ),
+            (
+                _offense_profile(first_id),
+                _offense_profile(second_id),
+            ),
+            SimulationConfig(),
+        )
+        expected = max(result.matchup_log_standard_errors.values())
+
+        self.assertEqual(result.log_standard_error, expected)
+        within_tolerance = expected + offense_module._FLOAT_TOLERANCE / 2.0
+        self.assertEqual(
+            replace(
+                result,
+                log_standard_error=within_tolerance,
+            ).log_standard_error,
+            within_tolerance,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "log_standard_error.*maximum matchup sigma",
+        ):
+            replace(result, log_standard_error=99.0)
+
     def test_direct_result_constructors_reject_invalid_invariants(self):
         pitcher_id = "pitcher:starter"
         result = forecast_offense(
