@@ -329,7 +329,7 @@ def price_market(
     )
 
 
-def _require_market_contract(market_input: MarketInput) -> None:
+def _require_market_contract(market_input: object) -> None:
     if market_input.market_type in _SIDE_MARKETS:
         if market_input.selected_side not in {"away", "home"}:
             raise ValueError(
@@ -374,33 +374,45 @@ def _require_market_contract(market_input: MarketInput) -> None:
     )
 
 
-def _side_margin(game: SimulatedGame, selected_side: str, period: str) -> int:
-    opposing_side = "home" if selected_side == "away" else "away"
-    selected_runs = getattr(game, f"{selected_side}_{period}_runs")
-    opposing_runs = getattr(game, f"{opposing_side}_{period}_runs")
-    return selected_runs - opposing_runs
-
-
-def _settlement_value(game: SimulatedGame, market_input: MarketInput) -> float:
+def _settlement_value_from_scores(
+    market_input: object,
+    *,
+    away_f5_runs: int,
+    home_f5_runs: int,
+    away_full_runs: int,
+    home_full_runs: int,
+) -> float:
     market_type = market_input.market_type
     if market_type is MarketType.F5_SIDE:
-        return _side_margin(game, market_input.selected_side, "f5") + market_input.line
+        selected_runs, opposing_runs = (
+            (away_f5_runs, home_f5_runs)
+            if market_input.selected_side == "away"
+            else (home_f5_runs, away_f5_runs)
+        )
+        return selected_runs - opposing_runs + market_input.line
     if market_type is MarketType.F5_TOTAL:
-        total = game.away_f5_runs + game.home_f5_runs
+        total = away_f5_runs + home_f5_runs
         return (
             total - market_input.line
             if market_input.selected_side == "over"
             else market_input.line - total
         )
     if market_type is MarketType.ML:
-        return float(_side_margin(game, market_input.selected_side, "full"))
-    if market_type is MarketType.PLUS_1_5:
-        return (
-            _side_margin(game, market_input.selected_side, "full")
-            + market_input.line
+        selected_runs, opposing_runs = (
+            (away_full_runs, home_full_runs)
+            if market_input.selected_side == "away"
+            else (home_full_runs, away_full_runs)
         )
+        return float(selected_runs - opposing_runs)
+    if market_type is MarketType.PLUS_1_5:
+        selected_runs, opposing_runs = (
+            (away_full_runs, home_full_runs)
+            if market_input.selected_side == "away"
+            else (home_full_runs, away_full_runs)
+        )
+        return selected_runs - opposing_runs + market_input.line
     if market_type is MarketType.FULL_TOTAL:
-        total = game.away_full_runs + game.home_full_runs
+        total = away_full_runs + home_full_runs
         return (
             total - market_input.line
             if market_input.selected_side == "over"
@@ -409,12 +421,67 @@ def _settlement_value(game: SimulatedGame, market_input: MarketInput) -> float:
     raise ValueError("market_type is unsupported")
 
 
+def _settlement_value(game: SimulatedGame, market_input: MarketInput) -> float:
+    return _settlement_value_from_scores(
+        market_input,
+        away_f5_runs=game.away_f5_runs,
+        home_f5_runs=game.home_f5_runs,
+        away_full_runs=game.away_full_runs,
+        home_full_runs=game.home_full_runs,
+    )
+
+
 def _outcome(value: float, market_type: MarketType) -> str:
     if value > 0.0:
         return "win"
     if value < 0.0 or market_type is MarketType.ML:
         return "loss"
     return "push"
+
+
+def _require_settlement_market_input(market_input: object) -> None:
+    if isinstance(market_input, MarketInput):
+        return
+    # Local import avoids the engine -> market module import cycle.
+    from .engine import SemanticMarketInput
+
+    if not isinstance(market_input, SemanticMarketInput):
+        raise TypeError(
+            "market_input must be MarketInput or SemanticMarketInput"
+        )
+
+
+def _official_run_value(official_result: object, field_name: str) -> int:
+    value = getattr(official_result, field_name, None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"official_result.{field_name} must be a nonnegative integer"
+        )
+    return value
+
+
+def settle_observed_market(
+    market_input: object,
+    official_result: object,
+) -> str:
+    """Settle frozen market semantics against one official score record."""
+
+    _require_settlement_market_input(market_input)
+    _require_market_contract(market_input)
+    if (
+        market_input.market_type is MarketType.F5_SIDE
+        and market_input.settlement_format is SettlementFormat.THREE_WAY
+    ):
+        raise ValueError("three-way F5 settlement is unsupported")
+
+    value = _settlement_value_from_scores(
+        market_input,
+        away_f5_runs=_official_run_value(official_result, "away_f5_runs"),
+        home_f5_runs=_official_run_value(official_result, "home_f5_runs"),
+        away_full_runs=_official_run_value(official_result, "away_full_runs"),
+        home_full_runs=_official_run_value(official_result, "home_full_runs"),
+    )
+    return _outcome(value, market_input.market_type)
 
 
 def evaluate_market(
@@ -488,4 +555,5 @@ __all__ = (
     "market_semantic_fingerprint",
     "price_market",
     "evaluate_market",
+    "settle_observed_market",
 )

@@ -6,13 +6,16 @@ from types import MappingProxyType
 import unittest
 
 from analysis.forecasting.identity import canonical_json
+from analysis.forecasting.engine import SemanticMarketInput
 from analysis.forecasting.inputs import (
     FeatureProvenance,
     MarketInput,
     MarketType,
     SettlementFormat,
 )
+import analysis.forecasting.market as market_module
 from analysis.forecasting.simulation import SimulatedGame, SimulationResult
+from analysis.ledger import OfficialResultCommand
 
 
 try:
@@ -38,6 +41,12 @@ MARKET_API_AVAILABLE = all(
         price_market,
     )
 )
+settle_observed_market = getattr(
+    market_module,
+    "settle_observed_market",
+    None,
+)
+OBSERVED_SETTLEMENT_AVAILABLE = callable(settle_observed_market)
 UTC = timezone.utc
 PROVENANCE = FeatureProvenance(
     observation_ids=("obs:market",),
@@ -106,6 +115,23 @@ def _game(path):
     return game
 
 
+def _official_result(path):
+    away_f5, home_f5, away_full, home_full = path
+    return OfficialResultCommand(
+        game_pk=900001,
+        source_name="MLB",
+        source_record="game/900001/boxscore",
+        source_revision="1",
+        finalized_at=datetime(2026, 7, 15, 3, 45, tzinfo=UTC),
+        away_f5_runs=away_f5,
+        home_f5_runs=home_f5,
+        away_full_runs=away_full,
+        home_full_runs=home_full,
+        component_values={},
+        documented_events=(),
+    )
+
+
 def _scores(paths):
     games = tuple(_game(path) for path in paths)
     simulation = object.__new__(SimulationResult)
@@ -119,6 +145,12 @@ def _scores(paths):
 class MarketApiAvailabilityTests(unittest.TestCase):
     def test_market_api_is_available(self):
         self.assertTrue(MARKET_API_AVAILABLE, "forecasting market API is missing")
+
+    def test_observed_market_settlement_api_is_available(self):
+        self.assertTrue(
+            OBSERVED_SETTLEMENT_AVAILABLE,
+            "observed market settlement API is missing",
+        )
 
 
 @unittest.skipUnless(MARKET_API_AVAILABLE, "forecasting market API is missing")
@@ -658,6 +690,114 @@ class MarketSettlementTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "settlement_format"):
             evaluate_market(_scores([(3, 2, 5, 4)]), market)
+
+
+@unittest.skipUnless(
+    OBSERVED_SETTLEMENT_AVAILABLE,
+    "observed market settlement API is missing",
+)
+class ObservedMarketSettlementTests(unittest.TestCase):
+    def test_ml_uses_full_score_and_never_pushes_on_a_tie(self):
+        cases = (
+            ((1, 5, 4, 3), "win"),
+            ((5, 1, 3, 4), "loss"),
+            ((2, 2, 4, 4), "loss"),
+        )
+
+        for score, expected in cases:
+            with self.subTest(score=score):
+                self.assertEqual(
+                    settle_observed_market(
+                        _market(MarketType.ML, "away", line=None),
+                        _official_result(score),
+                    ),
+                    expected,
+                )
+
+    def test_plus_one_and_a_half_uses_full_game_margin_without_push(self):
+        cases = (
+            ((0, 0, 3, 4), "win"),
+            ((0, 0, 3, 5), "loss"),
+            ((0, 0, 4, 3), "win"),
+        )
+
+        for score, expected in cases:
+            with self.subTest(score=score):
+                self.assertEqual(
+                    settle_observed_market(
+                        _market(
+                            MarketType.PLUS_1_5,
+                            "away",
+                            line=1.5,
+                        ),
+                        _official_result(score),
+                    ),
+                    expected,
+                )
+
+    def test_two_way_f5_side_uses_f5_score_and_allows_push(self):
+        cases = (
+            ((3, 2, 3, 9), "win"),
+            ((2, 3, 9, 3), "loss"),
+            ((2, 2, 3, 9), "push"),
+        )
+
+        for score, expected in cases:
+            with self.subTest(score=score):
+                self.assertEqual(
+                    settle_observed_market(
+                        _market(MarketType.F5_SIDE, "away", line=0.0),
+                        _official_result(score),
+                    ),
+                    expected,
+                )
+
+    def test_f5_and_full_totals_settle_over_under_and_integer_pushes(self):
+        cases = (
+            (MarketType.F5_TOTAL, "over", 4.5, (3, 2, 8, 1), "win"),
+            (MarketType.F5_TOTAL, "under", 4.5, (3, 2, 1, 8), "loss"),
+            (MarketType.F5_TOTAL, "under", 5.0, (3, 2, 1, 8), "push"),
+            (MarketType.FULL_TOTAL, "over", 8.5, (0, 0, 5, 4), "win"),
+            (MarketType.FULL_TOTAL, "under", 8.5, (9, 0, 5, 4), "loss"),
+            (MarketType.FULL_TOTAL, "over", 9.0, (9, 0, 5, 4), "push"),
+        )
+
+        for market_type, side, line, score, expected in cases:
+            with self.subTest(market_type=market_type, side=side, score=score):
+                self.assertEqual(
+                    settle_observed_market(
+                        _market(market_type, side, line=line),
+                        _official_result(score),
+                    ),
+                    expected,
+                )
+
+    def test_semantic_market_input_is_accepted_without_inventing_provenance(self):
+        semantic_market = SemanticMarketInput.from_market_input(
+            _market(MarketType.ML, "home", line=None)
+        )
+
+        self.assertEqual(
+            settle_observed_market(
+                semantic_market,
+                _official_result((0, 0, 3, 4)),
+            ),
+            "win",
+        )
+
+    def test_three_way_f5_semantics_remain_unsupported(self):
+        market = _market(
+            MarketType.F5_SIDE,
+            "away",
+            line=0.0,
+            settlement_format=SettlementFormat.THREE_WAY,
+        )
+
+        with self.assertRaisesRegex(ValueError, "three-way F5"):
+            settle_observed_market(
+                market,
+                _official_result((3, 2, 5, 4)),
+            )
 
 
 if __name__ == "__main__":

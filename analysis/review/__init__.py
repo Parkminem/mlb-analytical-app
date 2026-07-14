@@ -12,6 +12,11 @@ from .classification import (
     ReviewClassification,
     classify_review,
 )
+from .service import (
+    RecordedReview,
+    build_and_record_review,
+    build_review_candidate,
+)
 
 
 __all__ = (
@@ -24,5 +29,8 @@ __all__ = (
     "PrincipalPathBinding",
     "ReviewCandidate",
     "ReviewClassification",
+    "RecordedReview",
+    "build_and_record_review",
+    "build_review_candidate",
     "classify_review",
 )
