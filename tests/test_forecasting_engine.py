@@ -33,9 +33,15 @@ from tests.test_forecasting_inputs import (
 try:
     import analysis.forecasting.engine as forecast_engine_module
     from analysis.forecasting.engine import ForecastOutput, run_forecast
+    resolve_forecast_input = getattr(
+        forecast_engine_module,
+        "resolve_forecast_input",
+        None,
+    )
 except ModuleNotFoundError:
     forecast_engine_module = None
     ForecastOutput = None
+    resolve_forecast_input = None
     run_forecast = None
 
 
@@ -171,6 +177,30 @@ class ForecastEngineApiAvailabilityTests(unittest.TestCase):
 
 @unittest.skipUnless(ENGINE_API_AVAILABLE, "forecasting engine API is missing")
 class ForecastEngineTests(unittest.TestCase):
+    def test_public_input_resolver_canonicalizes_team_aliases_and_market_order(self):
+        self.assertIsNotNone(
+            resolve_forecast_input,
+            "public forecast input resolver is missing",
+        )
+        team_market = _market("z:side", MarketType.ML, "SEA", None)
+        total_market = _market(
+            "a:total",
+            MarketType.FULL_TOTAL,
+            "under",
+            8.5,
+        )
+        game = _complete_game(markets=(team_market, total_market))
+
+        resolved = resolve_forecast_input(game)
+
+        self.assertEqual(
+            tuple(market.market_key for market in resolved.markets),
+            ("a:total", "z:side"),
+        )
+        self.assertEqual(resolved.markets[1].selected_side, "away")
+        self.assertEqual(game.markets[0].selected_side, "SEA")
+        self.assertIn("resolve_forecast_input", forecast_engine_module.__all__)
+
     def test_engine_returns_every_verified_market_from_one_simulation(self):
         game = _complete_game()
         config = _fast_config()

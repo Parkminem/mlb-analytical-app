@@ -31,7 +31,11 @@ from analysis.shadow import (
     compare_shadow_forecast,
     record_shadow_run,
 )
-from tests.test_forecasting_engine import _complete_game, _fast_config
+from tests.test_forecasting_engine import (
+    _complete_game,
+    _fast_config,
+    forecast_engine_module,
+)
 
 
 def principal_paths() -> tuple[PrincipalPathBinding, ...]:
@@ -150,12 +154,13 @@ class FailOnceAfterAppendStore(TrackingStore):
 class ShadowComparisonTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.forecast = run_forecast(_complete_game(), _fast_config())
+        cls.game = _complete_game()
+        cls.forecast = run_forecast(cls.game, _fast_config())
 
     def test_shadow_types_are_frozen(self) -> None:
         review_binding = binding()
         legacy = legacy_snapshot()
-        comparison = compare_shadow_forecast(legacy, self.forecast)
+        comparison = compare_shadow_forecast(legacy, self.forecast, self.game)
 
         with self.assertRaises(FrozenInstanceError):
             review_binding.market_key = "other"
@@ -234,7 +239,7 @@ class ShadowComparisonTests(unittest.TestCase):
             ),
         )
 
-        comparison = compare_shadow_forecast(legacy, self.forecast)
+        comparison = compare_shadow_forecast(legacy, self.forecast, self.game)
 
         self.assertEqual(comparison.authority, "legacy")
         self.assertIs(comparison.legacy, legacy)
@@ -258,7 +263,11 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         low_probability_forecast = replace(self.forecast, markets=markets)
 
-        comparison = compare_shadow_forecast(legacy, low_probability_forecast)
+        comparison = compare_shadow_forecast(
+            legacy,
+            low_probability_forecast,
+            self.game,
+        )
 
         self.assertIs(comparison.legacy.candidates[0], legacy_candidate)
         self.assertEqual(
@@ -270,6 +279,7 @@ class ShadowComparisonTests(unittest.TestCase):
         comparison = compare_shadow_forecast(
             legacy_snapshot(),
             self.forecast,
+            self.game,
         )
         market = comparison.market_comparisons[0]
         expected = self.forecast.markets["sea_ml"]
@@ -292,6 +302,7 @@ class ShadowComparisonTests(unittest.TestCase):
         comparison = compare_shadow_forecast(
             legacy_snapshot(review_bindings=()),
             self.forecast,
+            self.game,
         )
 
         self.assertEqual(len(comparison.market_comparisons), 1)
@@ -319,7 +330,11 @@ class ShadowComparisonTests(unittest.TestCase):
             ),
         )
 
-        market = compare_shadow_forecast(legacy, self.forecast).market_comparisons[0]
+        market = compare_shadow_forecast(
+            legacy,
+            self.forecast,
+            self.game,
+        ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
         self.assertEqual(market.principal_paths, ())
@@ -340,7 +355,11 @@ class ShadowComparisonTests(unittest.TestCase):
             review_bindings=(binding(paths=(duplicated, duplicated)),),
         )
 
-        market = compare_shadow_forecast(legacy, self.forecast).market_comparisons[0]
+        market = compare_shadow_forecast(
+            legacy,
+            self.forecast,
+            self.game,
+        ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
         self.assertEqual(market.principal_paths, ())
@@ -351,19 +370,26 @@ class ShadowComparisonTests(unittest.TestCase):
 
     def test_missing_component_invalidates_the_whole_binding(self) -> None:
         missing_component_path = PrincipalPathBinding(
-            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
-            component_ids=("home_pitcher_chain_runs_allowed_missing",),
-            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+            evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+            component_ids=(
+                "home_bullpen_segment_missing_exposed",
+                "home_pitcher_chain_workload_outs",
+            ),
+            contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
         )
         legacy = legacy_snapshot(
             review_bindings=(
                 binding(
-                    paths=(missing_component_path, principal_paths()[1]),
+                    paths=(missing_component_path, principal_paths()[0]),
                 ),
             ),
         )
 
-        market = compare_shadow_forecast(legacy, self.forecast).market_comparisons[0]
+        market = compare_shadow_forecast(
+            legacy,
+            self.forecast,
+            self.game,
+        ).market_comparisons[0]
 
         self.assertFalse(market.review_eligible)
         self.assertEqual(market.principal_paths, ())
@@ -413,7 +439,11 @@ class ShadowComparisonTests(unittest.TestCase):
             )
 
     def test_shadow_comparison_rejects_nonlegacy_authority(self) -> None:
-        valid = compare_shadow_forecast(legacy_snapshot(), self.forecast)
+        valid = compare_shadow_forecast(
+            legacy_snapshot(),
+            self.forecast,
+            self.game,
+        )
 
         with self.assertRaisesRegex(ValueError, "authority.*legacy"):
             ShadowComparison(
@@ -422,6 +452,10 @@ class ShadowComparisonTests(unittest.TestCase):
                 forecast_run_id=valid.forecast_run_id,
                 market_comparisons=valid.market_comparisons,
             )
+
+    def test_comparison_requires_game_input_for_canonical_market_validation(self) -> None:
+        with self.assertRaisesRegex(TypeError, "game_input"):
+            compare_shadow_forecast(legacy_snapshot(), self.forecast)
 
 
 class ShadowRecordingTests(unittest.TestCase):
@@ -448,13 +482,14 @@ class ShadowRecordingTests(unittest.TestCase):
         store=None,
         game=None,
         legacy=None,
+        forecast=None,
         keys=None,
     ):
         return record_shadow_run(
             self.store if store is None else store,
             self.game if game is None else game,
             self.legacy if legacy is None else legacy,
-            self.forecast,
+            self.forecast if forecast is None else forecast,
             self.keys() if keys is None else keys,
         )
 
@@ -597,6 +632,162 @@ class ShadowRecordingTests(unittest.TestCase):
             self.record(game=invalid_game)
 
         self.assertEqual(tuple(self.store.iter_records()), ())
+
+    def test_forecast_for_another_game_is_rejected_before_any_append(self) -> None:
+        other_game = replace(
+            self.game,
+            identity=replace(
+                self.game.identity,
+                game_pk=self.game.identity.game_pk + 1,
+            ),
+        )
+        other_forecast = run_forecast(other_game, _fast_config())
+
+        with self.assertRaisesRegex(ValueError, "forecast_run_id.*game_input"):
+            self.record(forecast=other_forecast)
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
+    def test_team_alias_capture_uses_canonical_forecast_input_hash(self) -> None:
+        team_game = replace(
+            self.game,
+            markets=tuple(
+                replace(market, selected_side="SEA")
+                if market.market_key == "sea_ml"
+                else market
+                for market in self.game.markets
+            ),
+        )
+        team_forecast = run_forecast(team_game, _fast_config())
+        resolver = getattr(
+            forecast_engine_module,
+            "resolve_forecast_input",
+            None,
+        )
+        self.assertIsNotNone(
+            resolver,
+            "public forecast input resolver is missing",
+        )
+        resolved_game = resolver(team_game)
+
+        result = self.record(
+            game=team_game,
+            forecast=team_forecast,
+            keys=self.keys("team-alias"),
+        )
+
+        expected_hash = normalized_input_hash(resolved_game)
+        self.assertNotEqual(normalized_input_hash(team_game), expected_hash)
+        self.assertEqual(result.capture.payload, capture_payload(team_game))
+        self.assertEqual(result.capture.normalized_input_hash, expected_hash)
+        self.assertEqual(result.forecast.normalized_input_hash, expected_hash)
+
+    def test_existing_component_with_wrong_rule_shape_is_review_ineligible(self) -> None:
+        wrong_shape = PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("away_full_runs",),
+            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+        )
+        paths = (wrong_shape, principal_paths()[1])
+        legacy = legacy_snapshot(
+            review_bindings=(binding(paths=paths),),
+        )
+        self.assertTrue(
+            {
+                component_id
+                for path in paths
+                for component_id in path.component_ids
+            }.issubset(self.forecast.component_distributions)
+        )
+
+        result = self.record(legacy=legacy, keys=self.keys("wrong-shape"))
+        market = result.forecast.outputs["shadow_comparison"][
+            "market_comparisons"
+        ][0]
+
+        self.assertFalse(market["review_eligible"])
+        self.assertEqual(market["principal_paths"], ())
+        self.assertEqual(
+            market["review_ineligibility_flags"],
+            ("invalid_path_count",),
+        )
+
+    def test_market_input_type_rejects_wrong_horizon_despite_misleading_key(self) -> None:
+        misleading_key = "looks:like:f5_total"
+        game = replace(
+            self.game,
+            markets=tuple(
+                replace(market, market_key=misleading_key)
+                if market.market_key == "sea_ml"
+                else market
+                for market in self.game.markets
+            ),
+        )
+        forecast = run_forecast(game, _fast_config())
+        wrong_horizon = PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            component_ids=(
+                "away_f5_runs",
+                "away_f5_traffic",
+                "away_f5_extra_base_hits",
+            ),
+            contradiction_rule=(
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+        )
+        paths = (principal_paths()[0], wrong_horizon)
+        legacy = legacy_snapshot(
+            review_bindings=(
+                binding(market_key=misleading_key, paths=paths),
+            ),
+        )
+
+        result = self.record(
+            game=game,
+            legacy=legacy,
+            forecast=forecast,
+            keys=self.keys("wrong-horizon"),
+        )
+        market = result.forecast.outputs["shadow_comparison"][
+            "market_comparisons"
+        ][0]
+
+        self.assertFalse(market["review_eligible"])
+        self.assertEqual(
+            market["review_ineligibility_flags"],
+            ("invalid_path_count",),
+        )
+
+    def test_same_side_starter_paths_are_review_ineligible(self) -> None:
+        same_side_paths = (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+                component_ids=("home_pitcher_chain_runs_allowed",),
+                contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+            ),
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+                component_ids=(
+                    "home_pitcher_chain_runs_allowed",
+                    "home_pitcher_chain_workload_outs",
+                ),
+                contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+            ),
+        )
+        legacy = legacy_snapshot(
+            review_bindings=(binding(paths=same_side_paths),),
+        )
+
+        result = self.record(legacy=legacy, keys=self.keys("same-side"))
+        market = result.forecast.outputs["shadow_comparison"][
+            "market_comparisons"
+        ][0]
+
+        self.assertFalse(market["review_eligible"])
+        self.assertEqual(
+            market["review_ineligibility_flags"],
+            ("invalid_path_count",),
+        )
 
     def test_retry_after_forecast_append_failure_completes_missing_link(self) -> None:
         failing_store = FailOnceAfterAppendStore(self.store, "forecast")

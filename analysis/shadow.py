@@ -1,18 +1,20 @@
 """One-way comparison of legacy decisions with shadow forecast outputs."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
 import math
 import re
 
-from analysis.forecasting.engine import ForecastOutput
+from analysis.forecasting.engine import ForecastOutput, resolve_forecast_input
 from analysis.forecasting.identity import (
+    build_forecast_run_id,
     canonical_json,
     capture_payload,
     normalized_input_hash,
 )
-from analysis.forecasting.inputs import NormalizedGameInput
+from analysis.forecasting.inputs import MarketInput, NormalizedGameInput
 from analysis.forecasting.validation import validate_pregame_input
 from analysis.ledger.records import (
     CaptureCommand,
@@ -22,7 +24,10 @@ from analysis.ledger.records import (
     ForecastRecord,
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
-from analysis.review.classification import PrincipalPathBinding
+from analysis.review.classification import (
+    PrincipalPathBinding,
+    validate_principal_path_bindings,
+)
 
 
 _FORECAST_RUN_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -342,6 +347,7 @@ def _comparison_for_candidate(
     candidate: PriorityMarketCandidate,
     binding: CandidateReviewBinding | None,
     forecast: ForecastOutput,
+    market_inputs: Mapping[str, MarketInput] | None,
 ) -> ShadowMarketComparison:
     flags: set[str] = set()
     if binding is None:
@@ -355,10 +361,23 @@ def _comparison_for_candidate(
         if binding.legacy_market != candidate.market:
             flags.add("candidate_market_mismatch")
         market_evaluation = forecast.markets.get(market_key)
-        if market_evaluation is None:
+        market_input = (
+            None if market_inputs is None else market_inputs.get(market_key)
+        )
+        if market_evaluation is None or (
+            market_inputs is not None and market_input is None
+        ):
             flags.add("unknown_market_key")
         if not _paths_have_valid_count_and_identity(principal_paths):
             flags.add("invalid_path_count")
+        if market_input is not None:
+            try:
+                validate_principal_path_bindings(
+                    market_input.market_type,
+                    principal_paths,
+                )
+            except ValueError:
+                flags.add("invalid_path_count")
         if any(
             component_id not in forecast.component_distributions
             for path in principal_paths
@@ -408,6 +427,7 @@ def _comparison_for_candidate(
 def compare_shadow_forecast(
     legacy: LegacyDecisionSnapshot,
     forecast: ForecastOutput,
+    game_input: NormalizedGameInput,
 ) -> ShadowComparison:
     """Copy forecast metrics beside legacy decisions without changing authority."""
 
@@ -415,6 +435,22 @@ def compare_shadow_forecast(
         raise TypeError("legacy must be LegacyDecisionSnapshot")
     if not isinstance(forecast, ForecastOutput):
         raise TypeError("forecast must be ForecastOutput")
+    if not isinstance(game_input, NormalizedGameInput):
+        raise TypeError("game_input must be NormalizedGameInput")
+    resolved_game = resolve_forecast_input(game_input)
+    expected_forecast_run_id = build_forecast_run_id(
+        resolved_game,
+        forecast.model_version,
+        forecast.simulation_config,
+    )
+    if forecast.forecast_run_id != expected_forecast_run_id:
+        raise ValueError(
+            "forecast_run_id does not match canonical game_input, "
+            "model_version, and simulation_config"
+        )
+    market_inputs = {
+        market.market_key: market for market in resolved_game.markets
+    }
     bindings_by_index = {
         binding.legacy_candidate_index: binding
         for binding in legacy.review_bindings
@@ -425,6 +461,7 @@ def compare_shadow_forecast(
             candidate,
             bindings_by_index.get(index),
             forecast,
+            market_inputs,
         )
         for index, candidate in enumerate(legacy.candidates)
     )
@@ -573,8 +610,9 @@ def record_shadow_run(
             "idempotency_keys must be ShadowRunIdempotencyKeys"
         )
     validation = validate_pregame_input(game_input)
-    comparison = compare_shadow_forecast(legacy, forecast)
-    input_hash = normalized_input_hash(game_input)
+    comparison = compare_shadow_forecast(legacy, forecast, game_input)
+    resolved_game = resolve_forecast_input(game_input)
+    input_hash = normalized_input_hash(resolved_game)
     capture_command = CaptureCommand(
         game_pk=game_input.identity.game_pk,
         captured_at=game_input.captured_at,

@@ -4,6 +4,7 @@ import unittest
 
 from analysis.forecasting import MarketType
 from analysis.model import PriorityEvidencePath
+import analysis.review.classification as classification_module
 from analysis.review import (
     ComponentForecast,
     ComponentObservation,
@@ -143,6 +144,58 @@ def standard_values(*, chain_runs=3.0, runs=3.0, traffic=3.0, xbh=3.0):
         "home_full_traffic": traffic,
         "home_full_extra_base_hits": xbh,
     }
+
+
+class PrincipalPathBindingValidatorTests(unittest.TestCase):
+    def test_public_validator_enforces_shape_horizon_and_side_compatibility(self):
+        validator = getattr(
+            classification_module,
+            "validate_principal_path_bindings",
+            None,
+        )
+        self.assertIsNotNone(
+            validator,
+            "public principal-path binding validator is missing",
+        )
+        validator(MarketType.FULL_TOTAL, standard_paths())
+
+        wrong_shape = (
+            binding(
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                ContradictionRule.STARTER_SUPPRESSION,
+                "away_full_runs",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "binding shape"):
+            validator(MarketType.FULL_TOTAL, wrong_shape)
+
+        wrong_horizon = (
+            binding(
+                PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+                "away_f5_runs",
+                "away_f5_traffic",
+                "away_f5_extra_base_hits",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "binding shape"):
+            validator(MarketType.ML, wrong_horizon)
+
+        same_side = (
+            binding(
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                ContradictionRule.STARTER_SUPPRESSION,
+                "home_pitcher_chain_runs_allowed",
+            ),
+            binding(
+                PriorityEvidencePath.STARTER_COLLAPSE,
+                ContradictionRule.STARTER_COLLAPSE,
+                "home_pitcher_chain_runs_allowed",
+                "home_pitcher_chain_workload_outs",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "same pitching side"):
+            validator(MarketType.ML, same_side)
 
 
 class ReviewClassificationTests(unittest.TestCase):

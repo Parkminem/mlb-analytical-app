@@ -434,6 +434,26 @@ def _validate_candidate_path_compatibility(
         )
 
 
+def validate_principal_path_bindings(
+    market_type: MarketType,
+    principal_paths: tuple[PrincipalPathBinding, ...],
+) -> None:
+    """Validate canonical path shapes and cross-path market compatibility."""
+
+    if not isinstance(market_type, MarketType):
+        raise ValueError("market_type must be MarketType")
+    if not isinstance(principal_paths, tuple) or any(
+        not isinstance(path, PrincipalPathBinding)
+        for path in principal_paths
+    ):
+        raise ValueError(
+            "principal_paths must be a tuple of PrincipalPathBinding values"
+        )
+    for path in principal_paths:
+        _validate_binding_shape(path, market_type)
+    _validate_candidate_path_compatibility(market_type, principal_paths)
+
+
 @dataclass(frozen=True)
 class ReviewCandidate:
     capture_forecast_link_record_id: str
@@ -540,10 +560,13 @@ class ReviewCandidate:
         if len(set(evidence_paths)) != len(evidence_paths):
             raise ValueError("candidate requires unique principal evidence paths")
 
+        validate_principal_path_bindings(
+            self.market_type,
+            self.principal_paths,
+        )
         available_ids = set(forecast_ids).intersection(observation_ids)
         bound_paths_by_component: dict[str, set[PriorityEvidencePath]] = {}
         for path in self.principal_paths:
-            _validate_binding_shape(path, self.market_type)
             missing = set(path.component_ids).difference(available_ids)
             if missing:
                 raise ValueError(
@@ -553,10 +576,6 @@ class ReviewCandidate:
                 bound_paths_by_component.setdefault(component_id, set()).add(
                     path.evidence_path
                 )
-        _validate_candidate_path_compatibility(
-            self.market_type,
-            self.principal_paths,
-        )
 
         if any(
             forecasts_by_id[component_id].evidence_path not in evidence_paths
@@ -890,4 +909,5 @@ __all__ = (
     "ReviewCandidate",
     "ReviewClassification",
     "classify_review",
+    "validate_principal_path_bindings",
 )

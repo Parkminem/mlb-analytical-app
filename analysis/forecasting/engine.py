@@ -190,6 +190,29 @@ def _resolve_market_side(
     return replace(market, selected_side=canonical_side)
 
 
+def resolve_forecast_input(
+    normalized_game: NormalizedGameInput,
+) -> NormalizedGameInput:
+    """Return the canonical market input used for forecast identity and pricing."""
+
+    if not isinstance(normalized_game, NormalizedGameInput):
+        raise TypeError("normalized_game must be NormalizedGameInput")
+    resolved_markets = tuple(
+        sorted(
+            (
+                _resolve_market_side(
+                    market,
+                    normalized_game.identity.away_team,
+                    normalized_game.identity.home_team,
+                )
+                for market in normalized_game.markets
+            ),
+            key=lambda market: market.market_key,
+        )
+    )
+    return replace(normalized_game, markets=resolved_markets)
+
+
 @dataclass(frozen=True)
 class ForecastOutput:
     forecast_run_id: str
@@ -259,20 +282,7 @@ def run_forecast(
     if validated_config != config:
         raise ValueError("config is invalid or noncanonical")
 
-    resolved_markets = tuple(
-        sorted(
-            (
-                _resolve_market_side(
-                    market,
-                    normalized_game.identity.away_team,
-                    normalized_game.identity.home_team,
-                )
-                for market in normalized_game.markets
-            ),
-            key=lambda market: market.market_key,
-        )
-    )
-    resolved_game = replace(normalized_game, markets=resolved_markets)
+    resolved_game = resolve_forecast_input(normalized_game)
     config_mapping = config.to_mapping()
     forecast_run_id = build_forecast_run_id(
         resolved_game,
@@ -343,4 +353,4 @@ def run_forecast(
     )
 
 
-__all__ = ("ForecastOutput", "run_forecast")
+__all__ = ("ForecastOutput", "resolve_forecast_input", "run_forecast")
