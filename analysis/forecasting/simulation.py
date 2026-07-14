@@ -282,6 +282,14 @@ class SimulatedGame:
                 "game state with a skipped bottom ninth requires a regulation "
                 "home win"
             )
+        if (
+            self.bottom_ninth_played
+            and self.home_full_runs > self.away_full_runs
+            and self.home_full_runs - self.away_full_runs != 1
+        ):
+            raise ValueError(
+                "walkoff home wins must have an exact one-run margin"
+            )
         if self.max_inning_tiebreak_used and (
             self.final_inning < 10
             or not self.bottom_ninth_played
@@ -319,7 +327,14 @@ class SimulationResult:
 
     def __post_init__(self) -> None:
         max_innings, available_entries = _require_simulation_result_context()
-        available_by_side = dict(available_entries)
+        available_by_side = {
+            side: dict(segment_entries)
+            for side, segment_entries in available_entries
+        }
+        protected_roles = {
+            BullpenRole.HIGH_LEVERAGE.value,
+            BullpenRole.CLOSER.value,
+        }
         _validate_forecast_run_id(self.forecast_run_id)
         if (
             isinstance(self.simulation_count, bool)
@@ -352,6 +367,17 @@ class SimulationResult:
                     raise ValueError(
                         "game exposure IDs must reference available bullpen "
                         "segments"
+                    )
+                if getattr(
+                    game,
+                    f"{side}_protected_bullpen_close_entry",
+                ) and not any(
+                    available_by_side[side][segment_id] in protected_roles
+                    for segment_id in exposed
+                ):
+                    raise ValueError(
+                        "protected bullpen entry requires an exposed available "
+                        "high-leverage or closer segment"
                     )
         if not isinstance(self.component_distributions, Mapping):
             raise TypeError("component_distributions must be a mapping")
@@ -391,63 +417,6 @@ class SimulationResult:
             "component_distributions",
             MappingProxyType(copied),
         )
-
-
-def _make_simulation_result_factory():
-    active_context = ContextVar("simulation_result_context", default=None)
-
-    def build_result(
-        *,
-        forecast_run_id: str,
-        simulation_count: int,
-        games: tuple[SimulatedGame, ...],
-        component_distributions: Mapping[str, ComponentDistribution],
-        max_innings: int,
-        available_entries: tuple[tuple[str, tuple[str, ...]], ...],
-    ) -> SimulationResult:
-        if (
-            isinstance(max_innings, bool)
-            or not isinstance(max_innings, int)
-            or max_innings < 10
-        ):
-            raise ValueError("result context max_innings must be at least ten")
-        canonical_entries = tuple(
-            (side, tuple(sorted(segment_ids)))
-            for side, segment_ids in available_entries
-        )
-        if tuple(side for side, _ids in canonical_entries) != _SIDES:
-            raise ValueError("result context must contain away and home metadata")
-        for _side, segment_ids in canonical_entries:
-            if len(segment_ids) != len(set(segment_ids)):
-                raise ValueError("result context bullpen IDs must be unique")
-            for segment_id in segment_ids:
-                _require_nonempty_string(segment_id, "result context bullpen ID")
-        context = (max_innings, canonical_entries)
-        token = active_context.set(context)
-        try:
-            return SimulationResult(
-                forecast_run_id=forecast_run_id,
-                simulation_count=simulation_count,
-                games=games,
-                component_distributions=component_distributions,
-            )
-        finally:
-            active_context.reset(token)
-
-    def require_context():
-        context = active_context.get()
-        if context is None:
-            raise ValueError(
-                "SimulationResult must be constructed by the simulation factory"
-            )
-        return context
-
-    return build_result, require_context
-
-
-_build_simulation_result, _require_simulation_result_context = (
-    _make_simulation_result_factory()
-)
 
 
 @dataclass(frozen=True)
@@ -1205,12 +1174,12 @@ def _component_distribution_matches_exactly(
 
 def _available_bullpen_entries(
     simulation_input: GameSimulationInput,
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
     return tuple(
         (
             side,
             tuple(
-                segment.segment_id
+                (segment.segment_id, segment.role.value)
                 for segment in getattr(
                     simulation_input,
                     f"{side}_bullpen",
@@ -1223,7 +1192,7 @@ def _available_bullpen_entries(
 
 def _expected_component_distributions(
     games: tuple[SimulatedGame, ...],
-    available_entries: tuple[tuple[str, tuple[str, ...]], ...],
+    available_entries: tuple[tuple[str, tuple[tuple[str, str], ...]], ...],
 ) -> Mapping[str, ComponentDistribution]:
     available_by_side = dict(available_entries)
     values_by_id: dict[str, tuple[int | float, ...]] = {}
@@ -1237,7 +1206,7 @@ def _expected_component_distributions(
                 for game in games
             )
         exposed_field = f"{side}_bullpen_segment_ids_exposed"
-        for segment_id in available_by_side[side]:
+        for segment_id, _role in available_by_side[side]:
             component_id = f"{side}_bullpen_segment_{segment_id}_exposed"
             values_by_id[component_id] = tuple(
                 int(segment_id in getattr(game, exposed_field))
@@ -1265,10 +1234,11 @@ def _component_distributions(
     )
 
 
-def simulate_game_distribution(
+def _simulate_game_distribution_impl(
     input: GameSimulationInput,
     forecast_run_id: str,
     config: SimulationConfig,
+    issue_result,
 ) -> SimulationResult:
     """Simulate one distribution whose seeded game prefix is batch-size stable."""
 
@@ -1297,7 +1267,7 @@ def simulate_game_distribution(
         for _ in range(config.simulations)
     )
     available_entries = _available_bullpen_entries(input)
-    return _build_simulation_result(
+    return issue_result(
         forecast_run_id=forecast_run_id,
         simulation_count=config.simulations,
         games=games,
@@ -1305,3 +1275,84 @@ def simulate_game_distribution(
         max_innings=config.max_innings,
         available_entries=available_entries,
     )
+
+
+def _build_simulate_game_distribution():
+    active_context = ContextVar("simulation_result_context", default=None)
+
+    def issue_result(
+        *,
+        forecast_run_id: str,
+        simulation_count: int,
+        games: tuple[SimulatedGame, ...],
+        component_distributions: Mapping[str, ComponentDistribution],
+        max_innings: int,
+        available_entries: tuple[
+            tuple[str, tuple[tuple[str, str], ...]],
+            ...,
+        ],
+    ) -> SimulationResult:
+        if (
+            isinstance(max_innings, bool)
+            or not isinstance(max_innings, int)
+            or max_innings < 10
+        ):
+            raise ValueError("result context max_innings must be at least ten")
+        canonical_entries = tuple(
+            (side, tuple(sorted(segment_entries)))
+            for side, segment_entries in available_entries
+        )
+        if tuple(side for side, _ids in canonical_entries) != _SIDES:
+            raise ValueError("result context must contain away and home metadata")
+        valid_roles = {role.value for role in BullpenRole}
+        for _side, segment_entries in canonical_entries:
+            segment_ids = tuple(
+                segment_id for segment_id, _role in segment_entries
+            )
+            if len(segment_ids) != len(set(segment_ids)):
+                raise ValueError("result context bullpen IDs must be unique")
+            for segment_id, role in segment_entries:
+                _require_nonempty_string(segment_id, "result context bullpen ID")
+                if role not in valid_roles:
+                    raise ValueError("result context bullpen role must be canonical")
+        context = (max_innings, canonical_entries)
+        token = active_context.set(context)
+        try:
+            return SimulationResult(
+                forecast_run_id=forecast_run_id,
+                simulation_count=simulation_count,
+                games=games,
+                component_distributions=component_distributions,
+            )
+        finally:
+            active_context.reset(token)
+
+    def require_context():
+        context = active_context.get()
+        if context is None:
+            raise ValueError(
+                "SimulationResult must be constructed by the simulation factory"
+            )
+        return context
+
+    def simulate_game_distribution(
+        input: GameSimulationInput,
+        forecast_run_id: str,
+        config: SimulationConfig,
+    ) -> SimulationResult:
+        """Simulate a seeded distribution with a batch-size-stable prefix."""
+
+        return _simulate_game_distribution_impl(
+            input,
+            forecast_run_id,
+            config,
+            issue_result,
+        )
+
+    return simulate_game_distribution, require_context
+
+
+simulate_game_distribution, _require_simulation_result_context = (
+    _build_simulate_game_distribution()
+)
+del _build_simulate_game_distribution

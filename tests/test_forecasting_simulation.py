@@ -250,6 +250,24 @@ class GameSimulationTests(unittest.TestCase):
         self.assertEqual(game.home_full_runs - game.away_full_runs, 1)
         self.assertEqual(run_draws, 20)
 
+    def test_played_bottom_ninth_home_win_must_have_one_run_margin(self):
+        game, _ = _simulate_scripted_game([0] * 18 + [1, 5])
+
+        with self.assertRaisesRegex(ValueError, "walkoff"):
+            replace(
+                game,
+                home_full_runs=game.home_full_runs + 2,
+                away_bullpen_runs_allowed=(
+                    game.away_bullpen_runs_allowed + 2
+                ),
+            )
+
+    def test_skipped_bottom_ninth_home_win_may_have_larger_margin(self):
+        game, _ = _simulate_scripted_game([0, 3] + [0] * 15)
+
+        self.assertFalse(game.bottom_ninth_played)
+        self.assertEqual(game.home_full_runs - game.away_full_runs, 3)
+
     def test_starter_and_bullpen_are_not_added_as_separate_run_totals(self):
         source = inspect.getsource(mean_runs_for_half_inning)
         run_draw_source = inspect.getsource(simulation_module._draw_run_count)
@@ -732,6 +750,22 @@ class GameSimulationTests(unittest.TestCase):
                 component_distributions=valid.component_distributions,
             )
 
+    def test_module_exposes_no_result_context_issuer(self):
+        forbidden_names = {
+            "_build_simulation_result",
+            "_make_simulation_result_factory",
+            "_build_simulate_game_distribution",
+            "_create_simulation_result_context",
+        }
+
+        self.assertEqual(
+            forbidden_names.intersection(vars(simulation_module)),
+            set(),
+        )
+        self.assertTrue(
+            callable(simulation_module._require_simulation_result_context)
+        )
+
     def test_result_rejects_noncanonical_or_nonderived_components(self):
         config = SimulationConfig(simulations=1)
         simulation_input = _game_sim_input(config)
@@ -872,6 +906,73 @@ class GameSimulationTests(unittest.TestCase):
                     "9" * 64,
                     config,
                 )
+
+    def test_protected_entry_requires_exposed_high_leverage_or_closer(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        valid = simulate_game_distribution(
+            simulation_input,
+            "b" * 64,
+            config,
+        )
+        bridge_id = next(
+            segment.segment_id
+            for segment in simulation_input.away_bullpen.available_segments
+            if segment.role == BullpenRole.BRIDGE
+        )
+        invalid_game = replace(
+            valid.games[0],
+            away_bullpen_segment_ids_exposed=(bridge_id,),
+            away_protected_bullpen_close_entry=True,
+        )
+
+        with patch.object(
+            simulation_module,
+            "_simulate_one_game",
+            return_value=invalid_game,
+        ):
+            with self.assertRaisesRegex(ValueError, "protected bullpen"):
+                simulate_game_distribution(
+                    simulation_input,
+                    "b" * 64,
+                    config,
+                )
+
+    def test_unprotected_entry_may_expose_a_closer(self):
+        config = SimulationConfig(simulations=1)
+        simulation_input = _game_sim_input(config)
+        valid = simulate_game_distribution(
+            simulation_input,
+            "c" * 64,
+            config,
+        )
+        closer_id = next(
+            segment.segment_id
+            for segment in simulation_input.away_bullpen.available_segments
+            if segment.role == BullpenRole.CLOSER
+        )
+        allowed_game = replace(
+            valid.games[0],
+            away_bullpen_segment_ids_exposed=(closer_id,),
+            away_protected_bullpen_close_entry=False,
+        )
+
+        with patch.object(
+            simulation_module,
+            "_simulate_one_game",
+            return_value=allowed_game,
+        ):
+            result = simulate_game_distribution(
+                simulation_input,
+                "c" * 64,
+                config,
+            )
+
+        self.assertFalse(result.games[0].away_protected_bullpen_close_entry)
+        self.assertEqual(
+            result.games[0].away_bullpen_segment_ids_exposed,
+            (closer_id,),
+        )
 
     def test_synthetic_f5_relief_is_not_an_exposed_team_segment(self):
         config = SimulationConfig(simulations=1)
