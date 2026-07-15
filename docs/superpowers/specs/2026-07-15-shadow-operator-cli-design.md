@@ -46,9 +46,9 @@ reports/private/shadow/calibration-latest.json
 reports/private/shadow/calibration-latest.md
 ```
 
-All runtime paths are already covered by Git ignore rules. The ledger remains
-the authoritative append-only state. Bundle copies and reports are derived
-operator artifacts.
+The ledger remains the authoritative append-only state. Bundle copies and
+reports are derived operator artifacts. Implementation must add `data/shadow/`
+to `.gitignore`; `data/ledger/` and `reports/private/` are already ignored.
 
 ## Architecture
 
@@ -57,6 +57,9 @@ Create a small `analysis.operator` package with explicit boundaries:
 - `schemas.py`: versioned external JSON schemas and strict decoding into the
   existing forecasting, legacy-decision, result, and market-observation value
   objects.
+- `config.py`: immutable forecast-config registry loading. Each semantic shadow
+  version has one complete JSON config file under `config/forecasting/`; files
+  are additive and must never be edited after captures reference them.
 - `bundles.py`: canonical JSON loading, content hashing, immutable managed
   bundle copies, and schema-version checks.
 - `service.py`: stage orchestration over `run_forecast`, `record_shadow_run`,
@@ -97,9 +100,15 @@ The pregame payload contains:
 - `legacy_decision`: the complete frozen `LegacyDecisionSnapshot`, including
   exact candidates, decisions, evidence paths, final priority, and review
   bindings.
+- `forecast_config_version`: the exact immutable config-registry version used
+  to construct `SimulationConfig`.
 
-The CLI runs `run_forecast(game_input)` itself. A caller cannot provide a
-precomputed shadow forecast.
+The CLI resolves the complete config from
+`config/forecasting/<forecast_config_version>.json` and runs
+`run_forecast(game_input, simulation_config)` itself. A caller cannot provide a
+precomputed shadow forecast or config overrides. The registry file content is
+included in the forecast identity, so retries remain deterministic after newer
+config versions are added.
 
 Projected-stage requirements:
 
@@ -120,11 +129,22 @@ Confirmed-stage requirements:
 
 The review payload contains:
 
+- The exact frozen `capture_id`, `forecast_run_id`, and
+  `capture_forecast_link_record_id` returned by the confirmed command.
 - Official MLB result source identity and revision.
 - F5 and full-game scores.
 - Available component observations and documented external events.
 - Optional closing market observations with decimal prices and observation
   timestamps.
+
+An initial official result sets `supersedes_result_record_id` to null. A
+correction must provide the exact current latest result record ID; the operator
+never infers a correction target. Each closing observation contains
+`source_name`, `source_record`, `source_revision`, `market_key`, `market_type`,
+`settlement_format`, `selected_side`, `line`, both decimal prices,
+`observed_at`, `available_at`, and an explicit nullable
+`supersedes_record_id`. `observation_kind` is fixed to `close`. A corrected
+quote must explicitly reference the prior quote record.
 
 The result contract reuses `OfficialResultCommand`, including score and
 pitching-run conservation validation. Corrections append a new immutable
@@ -136,8 +156,11 @@ revision that supersedes the previous official result.
 
 1. Load and strictly validate the bundle.
 2. Require projected lineup state and a pre-first-pitch capture time.
-3. Run the deterministic shadow forecast.
-4. Append or replay the capture, forecast, and link.
+3. Apply the same keyed-capture preflight and active-capture ordering defined
+   for `confirmed`. A changed projected state supersedes the latest active
+   pregame capture for the game; an exact retry reuses its original target.
+4. Run the deterministic shadow forecast and append or replay the capture,
+   forecast, and link.
 5. Store an immutable canonical bundle copy under the game directory.
 6. Print record IDs, forecast ID, lineup state, and replay status.
 
@@ -146,8 +169,14 @@ revision that supersedes the previous official result.
 1. Load and strictly validate the bundle.
 2. Require both lineups to be confirmed and captured before first pitch.
 3. Locate the latest active pregame capture for the game.
-4. Append the confirmed capture with an explicit supersession relationship
-   when it replaces an earlier semantic state.
+4. Compute the capture idempotency key and first search the ledger for an
+   existing capture with that key. On retry, reuse that record's exact
+   `supersedes_capture_id`. Only when no keyed capture exists may the operator
+   select the latest active capture as the supersession target. Active means a
+   capture not referenced by another capture's `supersedes_capture_id`.
+   Candidate ordering is `(captured_at, envelope.appended_at,
+   envelope.record_id)` and the greatest tuple wins. Append the confirmed
+   capture with that fixed target when it replaces an earlier semantic state.
 5. Run, append or replay, and link the deterministic forecast.
 6. Store the immutable canonical bundle copy and print frozen IDs.
 
@@ -158,10 +187,19 @@ private forecast serialization logic.
 ### `review`
 
 1. Load and strictly validate the official-result bundle.
-2. Require a latest active confirmed capture linked to a forecast and captured
-   before first pitch. Refuse to silently use a projected capture.
+2. Resolve the exact capture, forecast, and link IDs supplied by the bundle.
+   Require one matching relationship, confirmed lineup state, matching game
+   ID, pre-first-pitch capture time, and an active capture. Refuse to select a
+   different, newer, or projected capture. Multiple links are harmless because
+   the bundle names one exact link and its forecast; mismatched IDs fail.
 3. Append or replay optional closing market observations.
-4. Append or replay the official result revision.
+   Require both `observed_at` and `available_at` to be between the frozen
+   capture time and first pitch, inclusive, and both decimal prices to exceed
+   `1.0`. Quote correction targets are explicit and stable across retries.
+4. Append or replay the official result revision using the bundle's explicit
+   nullable `supersedes_result_record_id`. If a prior result exists, a null
+   target is rejected; if a correction target is supplied, it must equal the
+   current latest result unless the same result idempotency key already exists.
 5. Build and append one review for every exact review-eligible market in the
    frozen confirmed forecast. Legacy passes may retain component-flow review
    data but cannot enter production priority.
@@ -174,11 +212,19 @@ private forecast serialization logic.
 ## Idempotency and Recovery
 
 - Managed bundle identity is the SHA-256 hash of canonical bundle JSON.
+- Managed filenames are
+  `<stage>-v<schema_version>-<bundle_hash_prefix_16>.json` inside the game
+  directory. An existing path must contain identical canonical bytes.
 - Capture idempotency keys derive from schema version, game ID, stage, and the
   canonical normalized-input hash.
 - Forecast identity remains the existing deterministic forecast run ID.
 - Result idempotency derives from game ID, official source identity, and source
-  revision.
+  revision. The operator searches for that exact key before validating whether
+  the bundle's explicit correction target is still latest, so a partially
+  completed correction replays instead of attempting to supersede itself.
+- Before deriving any supersession target, the operator checks for an existing
+  record with the stage's idempotency key. A found record locks the original
+  target and turns all later work into replay/completion behavior.
 - Review idempotency remains the existing capture/forecast/result/market key.
 - Report writes use a temporary sibling file followed by atomic replacement.
 
@@ -203,12 +249,26 @@ the remaining idempotent operations without editing prior records.
 
 The JSON report is the deterministic machine-readable artifact. It includes:
 
-- Generation timestamp and ledger path.
+- `ledger_as_of`, defined as the maximum `envelope.appended_at` in the ledger,
+  or null for an empty ledger, plus the ledger path. No wall-clock generation
+  timestamp is serialized, so an unchanged ledger produces byte-identical
+  reports.
 - Overall calibration metrics.
 - Fixed grouping dimensions and group metrics.
 - Confirmed-lineup game and decision counts.
 - Migration-gate progress for 100 confirmed games and 300 decisions per market
   family.
+
+Migration denominators are fixed as follows:
+
+- Confirmed games are unique `game_pk` values among leakage-safe primary
+  calibration rows with `lineup_state == "confirmed"` and at least one exact
+  recorded review.
+- A market-family decision is one unique `(forecast_run_id, market_key)` primary
+  confirmed row, grouped by canonical `market_type`.
+- Exact review-eligible legacy passes are included because they are still
+  frozen decisions with probabilities and settlements. Review-ineligible
+  markets are excluded.
 
 The Korean Markdown report presents the same values without adding new model
 interpretation. It keeps sample size, hit/push rates, Brier score, log loss,
@@ -217,7 +277,17 @@ unavailable rather than zero.
 
 ## Error Handling
 
-The CLI uses stable nonzero exits for:
+The CLI uses stable exits:
+
+- `0`: success or exact replay.
+- `1`: unexpected internal failure.
+- `2`: Typer usage or option error.
+- `3`: invalid JSON, unsupported schema, or field validation failure.
+- `4`: stage, timestamp, source, or frozen-record precondition failure.
+- `5`: ledger reference, idempotency, or corruption failure.
+- `6`: managed-bundle or report I/O failure.
+
+The nonzero categories cover:
 
 - Invalid JSON or unsupported schema version.
 - Stage and lineup-state mismatch.
@@ -250,7 +320,10 @@ Use test-driven development. Required coverage:
 11. Interrupted-stage retry behavior.
 12. Typer CLI success output, stable failures, default paths, and path
     overrides.
-13. Full existing regression suite and fixed-model manifest verification.
+13. Config-registry version resolution and historical-version replay.
+14. Byte-identical reports for an unchanged ledger and fixed migration-gate
+    denominators.
+15. Full existing regression suite and fixed-model manifest verification.
 
 ## Acceptance Criteria
 
