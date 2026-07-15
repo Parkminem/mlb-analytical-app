@@ -78,7 +78,9 @@ def load_forecast_config(
     actual_fields = set(mapping)
     missing_fields = expected_fields - actual_fields
     if missing_fields:
-        raise BundleValidationError("missing config fields")
+        raise BundleValidationError(
+            "missing config fields: " + ", ".join(sorted(missing_fields))
+        )
     unknown_fields = actual_fields - expected_fields
     if unknown_fields:
         raise BundleValidationError("unknown config fields")

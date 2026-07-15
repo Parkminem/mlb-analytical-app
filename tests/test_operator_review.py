@@ -821,6 +821,37 @@ def test_existing_key_still_uses_store_hash_validation_for_close_and_result(
         _run(review_context, changed_result)
 
 
+def test_changed_payload_same_result_key_is_not_claimed_rerun_safe(
+    review_context: ReviewContext,
+) -> None:
+    committed = _run(review_context)
+    changed_command = replace(
+        review_context.bundle.payload.official_result,
+        documented_events=({"result_label": "changed-same-key"},),
+    )
+    changed_bundle = _replace_review_commands(
+        review_context.bundle,
+        official_result=changed_command,
+    )
+
+    messages: list[str] = []
+    for _ in range(2):
+        with pytest.raises(
+            OperatorLedgerError,
+            match="idempotency|payload",
+        ) as raised:
+            _run(review_context, changed_bundle)
+        messages.append(str(raised.value))
+        progress = raised.value.partial_progress
+        assert progress.official_result_record_id == (
+            committed.official_result.envelope.record_id
+        )
+        assert progress.rerun_safe is False
+
+    assert messages[1] == messages[0]
+    assert len(_records(review_context, "official_result")) == 1
+
+
 def test_concurrent_closing_head_change_is_retried_without_forking(
     review_context: ReviewContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -1133,6 +1164,58 @@ def test_post_persistence_symlink_replacement_is_omitted_from_progress(
     progress = raised.value.partial_progress
     assert progress.managed_bundle_path is None
     assert progress.rerun_safe is True
+
+
+@pytest.mark.parametrize("replacement_level", ("game", "root"))
+def test_parent_replacement_during_recovery_read_omits_bundle_path(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    replacement_level: str,
+) -> None:
+    original_read = service_module.os.read
+    replaced = False
+
+    def replace_parent_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        if not chunk or replaced:
+            return chunk
+        replaced = True
+        root = review_context.bundle_root
+        game_dir = root / str(review_context.bundle.game_pk)
+        (managed_path,) = tuple(game_dir.glob("review-*.json"))
+        canonical_bytes = managed_path.read_bytes()
+        filename = managed_path.name
+        if replacement_level == "game":
+            game_dir.rename(tmp_path / "replaced-game-directory")
+            game_dir.mkdir()
+            (game_dir / filename).write_bytes(canonical_bytes)
+        else:
+            root.rename(tmp_path / "replaced-bundle-root")
+            replacement_game_dir = root / str(review_context.bundle.game_pk)
+            replacement_game_dir.mkdir(parents=True)
+            (replacement_game_dir / filename).write_bytes(canonical_bytes)
+        return chunk
+
+    monkeypatch.setattr(service_module.os, "read", replace_parent_after_read)
+
+    def interrupt_publication(*args, **kwargs):
+        del args, kwargs
+        raise OperatorIOError("calibration publication interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        interrupt_publication,
+    )
+
+    with pytest.raises(OperatorIOError, match="publication") as raised:
+        _run(review_context)
+
+    assert replaced is True
+    assert raised.value.partial_progress.managed_bundle_path is None
+    assert raised.value.partial_progress.rerun_safe is True
 
 
 def test_recovery_hash_fault_preserves_original_operator_error(

@@ -428,12 +428,20 @@ def test_unexpected_exception_exits_one_without_traceback(
     assert "Traceback" not in result.output
 
 
-def test_malicious_unknown_bundle_value_is_never_printed(
+@pytest.mark.parametrize(
+    "attacker_key",
+    (
+        "https://attacker.example/private?api_token=url-secret",
+        "api_token=field-name-secret",
+    ),
+)
+def test_malicious_unknown_bundle_key_and_value_are_never_printed(
     tmp_path: Path,
+    attacker_key: str,
 ) -> None:
     secret = "api-token-secret-value"
     mapping = projected_bundle_mapping()
-    mapping["payload"]["api_token"] = secret
+    mapping["payload"][attacker_key] = secret
     bundle_path = tmp_path / "projected-secret.json"
     bundle_path.write_text(_raw(mapping), encoding="utf-8")
 
@@ -443,8 +451,11 @@ def test_malicious_unknown_bundle_value_is_never_printed(
     )
 
     assert result.exit_code == 3
-    assert "payload.api_token" in result.output
+    assert "payload.<field>" in result.output
     assert "extra_forbidden" in result.output
+    assert attacker_key not in result.output
+    assert "attacker.example" not in result.output
+    assert "field-name-secret" not in result.output
     assert secret not in result.output
     assert "input_value" not in result.output
     assert "errors.pydantic.dev" not in result.output
@@ -492,8 +503,69 @@ def test_validation_diagnostic_never_prints_secret_value(
 
     assert result.exit_code == 3
     assert "payload.official_result.component_values" in result.output
-    assert "invalid_type" in result.output
+    assert "invalid_number" in result.output
     assert secret_value not in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "dynamic_key",
+    (
+        "https://attacker.example/?api_token=map-key-secret",
+        "game_pk",
+    ),
+)
+def test_dynamic_mapping_key_is_rendered_as_safe_placeholder(
+    tmp_path: Path,
+    dynamic_key: str,
+) -> None:
+    secret_value = "map-value-secret"
+    mapping = review_bundle_mapping()
+    mapping["payload"]["official_result"]["component_values"] = {
+        dynamic_key: secret_value,
+    }
+    bundle_path = tmp_path / "review-secret-map-key.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        ["review", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert (
+        "payload.official_result.component_values.<field>: invalid_number"
+        in result.output
+    )
+    assert f"component_values.{dynamic_key}" not in result.output
+    assert "attacker.example" not in result.output
+    assert "map-key-secret" not in result.output
+    assert secret_value not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_malformed_nested_datetime_has_safe_actionable_diagnostic(
+    tmp_path: Path,
+) -> None:
+    secret_datetime = "malformed-datetime-api-token-secret"
+    mapping = review_bundle_mapping()
+    mapping["payload"]["closing_observations"][0]["observed_at"] = (
+        secret_datetime
+    )
+    bundle_path = tmp_path / "review-malformed-datetime.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        ["review", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert (
+        "payload.closing_observations[0].observed_at: invalid_datetime"
+        in result.output
+    )
+    assert secret_datetime not in result.output
     assert "Traceback" not in result.output
 
 

@@ -31,6 +31,7 @@ from analysis.ledger import (
 )
 from analysis.operator.errors import (
     BundleValidationError,
+    OperatorError,
     OperatorIOError,
     OperatorLedgerError,
     OperatorPreconditionError,
@@ -483,6 +484,47 @@ def test_recovery_reread_fault_preserves_original_operator_error(
     assert progress.stage == "projected"
     assert progress.game_pk == bundle.game_pk
     assert progress.capture_id is None
+    assert progress.rerun_safe is False
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    (
+        OperatorLedgerError,
+        OperatorPreconditionError,
+        BundleValidationError,
+    ),
+)
+def test_non_io_error_after_pregame_commit_is_not_claimed_rerun_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OperatorError],
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+    original_record = service_module.record_shadow_run
+
+    def commit_then_fail(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise error_type("post-commit controlled failure")
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        commit_then_fail,
+    )
+
+    with pytest.raises(error_type) as raised:
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    progress = raised.value.partial_progress
+    assert progress.capture_id is not None
+    assert progress.forecast_run_id is not None
+    assert progress.capture_forecast_link_record_id is not None
     assert progress.rerun_safe is False
 
 

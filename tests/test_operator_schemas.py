@@ -204,15 +204,26 @@ def test_registry_requires_exact_complete_config_fields(
     mutation: str,
 ) -> None:
     mapping = SimulationConfig().to_mapping()
+    secret_unknown_field = "https://attacker.example/?api_token=config-secret"
     if mutation == "missing":
         mapping.pop("league_woba")
     else:
-        mapping["unexpected"] = 1
+        mapping[secret_unknown_field] = 1
     path = tmp_path / f"{mapping['version']}.json"
     path.write_text(json.dumps(mapping), encoding="utf-8")
 
-    with pytest.raises(BundleValidationError, match=f"{mutation} config field"):
+    with pytest.raises(
+        BundleValidationError,
+        match=f"{mutation} config field",
+    ) as raised:
         load_forecast_config(str(mapping["version"]), registry_root=tmp_path)
+
+    message = str(raised.value)
+    if mutation == "missing":
+        assert "league_woba" in message
+    else:
+        assert secret_unknown_field not in message
+        assert "attacker.example" not in message
 
 
 def test_registry_rejects_filename_content_version_mismatch(
@@ -396,7 +407,11 @@ def test_bundle_rejects_unknown_fields(location: str) -> None:
     target = mapping if location == "envelope" else mapping["payload"]
     target["unexpected"] = True
 
-    with pytest.raises(BundleValidationError, match="unexpected"):
+    expected_path = "<field>" if location == "envelope" else "payload.<field>"
+    with pytest.raises(
+        BundleValidationError,
+        match=rf"{expected_path}: extra_forbidden",
+    ):
         parse_projected_bundle_json(_raw(mapping))
 
 
@@ -486,6 +501,29 @@ def test_bundle_rejects_naive_timestamps(mutate, diagnostic: str) -> None:
     mutate(mapping)
 
     with pytest.raises(BundleValidationError, match=diagnostic):
+        parse_projected_bundle_json(_raw(mapping))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "category"),
+    (
+        ("game_pk", "900001", "invalid_integer"),
+        ("created_at", 123, "invalid_datetime"),
+        ("created_at", "not-a-datetime", "invalid_datetime"),
+    ),
+)
+def test_bundle_common_scalar_failures_use_fixed_safe_categories(
+    field_name: str,
+    value: object,
+    category: str,
+) -> None:
+    mapping = projected_bundle_mapping()
+    mapping[field_name] = value
+
+    with pytest.raises(
+        BundleValidationError,
+        match=rf"{field_name}: {category}",
+    ):
         parse_projected_bundle_json(_raw(mapping))
 
 

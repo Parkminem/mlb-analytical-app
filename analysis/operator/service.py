@@ -169,6 +169,19 @@ def _single_record(
     return matches[0] if len(matches) == 1 else None
 
 
+def _path_matches_opened_descriptor(
+    path: Path,
+    opened_stat: os.stat_result,
+    mode_check: Callable[[int], bool],
+) -> bool:
+    current_stat = os.stat(path, follow_symlinks=False)
+    return (
+        mode_check(current_stat.st_mode)
+        and current_stat.st_dev == opened_stat.st_dev
+        and current_stat.st_ino == opened_stat.st_ino
+    )
+
+
 def _committed_managed_bundle_path(
     bundle: _AnyBundle,
     bundle_root: str | Path,
@@ -210,14 +223,16 @@ def _committed_managed_bundle_path(
         directory_flags |= getattr(os, "O_DIRECTORY", 0)
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         root_descriptor = os.open(resolved_root, directory_flags)
-        if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+        opened_root_stat = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(opened_root_stat.st_mode):
             return None
         game_descriptor = os.open(
             str(bundle.game_pk),
             directory_flags,
             dir_fd=root_descriptor,
         )
-        if not stat.S_ISDIR(os.fstat(game_descriptor).st_mode):
+        opened_game_stat = os.fstat(game_descriptor)
+        if not stat.S_ISDIR(opened_game_stat.st_mode):
             return None
         file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         file_descriptor = os.open(
@@ -233,15 +248,36 @@ def _committed_managed_bundle_path(
             chunks.append(chunk)
         if b"".join(chunks) != expected_bytes:
             return None
-        current_stat = os.stat(
+        opened_candidate_stat = os.stat(
             candidate.name,
             dir_fd=game_descriptor,
             follow_symlinks=False,
         )
         if (
-            not stat.S_ISREG(current_stat.st_mode)
-            or current_stat.st_dev != opened_stat.st_dev
-            or current_stat.st_ino != opened_stat.st_ino
+            not stat.S_ISREG(opened_candidate_stat.st_mode)
+            or opened_candidate_stat.st_dev != opened_stat.st_dev
+            or opened_candidate_stat.st_ino != opened_stat.st_ino
+        ):
+            return None
+
+        public_game_dir = supplied_root / str(bundle.game_pk)
+        public_candidate = public_game_dir / candidate.name
+        if not _path_matches_opened_descriptor(
+            supplied_root,
+            opened_root_stat,
+            stat.S_ISDIR,
+        ):
+            return None
+        if not _path_matches_opened_descriptor(
+            public_game_dir,
+            opened_game_stat,
+            stat.S_ISDIR,
+        ):
+            return None
+        if not _path_matches_opened_descriptor(
+            public_candidate,
+            opened_stat,
+            stat.S_ISREG,
         ):
             return None
         return candidate
@@ -443,6 +479,7 @@ def _pregame_partial_progress(
     store: LedgerStore,
     bundle: _Bundle,
     *,
+    error: OperatorError,
     capture_key: str,
     forecast_run_id: str,
     bundle_root: str | Path,
@@ -501,7 +538,11 @@ def _pregame_partial_progress(
         managed_bundle_replayed=(
             None if managed_bundle is None else managed_bundle.replayed
         ),
-        rerun_safe=reread_succeeded and capture is not None,
+        rerun_safe=(
+            isinstance(error, OperatorIOError)
+            and reread_succeeded
+            and capture is not None
+        ),
     )
 
 
@@ -602,6 +643,7 @@ def _run_pregame(
             progress = _pregame_partial_progress(
                 store,
                 bundle,
+                error=error,
                 capture_key=capture_key,
                 forecast_run_id=forecast.forecast_run_id,
                 bundle_root=bundle_root,
@@ -1111,6 +1153,7 @@ def _review_partial_progress(
     store: LedgerStore,
     bundle: ReviewBundle,
     *,
+    error: OperatorError,
     capture: CaptureRecord,
     forecast: ForecastRecord,
     link: CaptureForecastLink,
@@ -1212,7 +1255,8 @@ def _review_partial_progress(
             None if managed_bundle is None else managed_bundle.replayed
         ),
         rerun_safe=(
-            latest_capture is not None
+            isinstance(error, OperatorIOError)
+            and latest_capture is not None
             and latest_capture.capture_id == capture.capture_id
         ),
     )
@@ -1478,6 +1522,7 @@ def run_review(
             progress = _review_partial_progress(
                 store,
                 bundle,
+                error=error,
                 capture=capture,
                 forecast=forecast,
                 link=link,

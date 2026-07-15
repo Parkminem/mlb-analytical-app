@@ -170,6 +170,110 @@ _LEGACY_BINDING_FIELDS = tuple(
 _PRINCIPAL_PATH_FIELDS = tuple(
     field.name for field in fields(PrincipalPathBinding)
 )
+_SAFE_VALIDATION_CATEGORIES = {
+    "assertion_error": "invalid_value",
+    "bool_parsing": "invalid_boolean",
+    "bool_type": "invalid_boolean",
+    "bytes_type": "invalid_bytes",
+    "date_from_datetime_inexact": "invalid_date",
+    "date_from_datetime_parsing": "invalid_date",
+    "date_parsing": "invalid_date",
+    "date_type": "invalid_date",
+    "datetime_from_date_parsing": "invalid_datetime",
+    "datetime_parsing": "invalid_datetime",
+    "datetime_type": "invalid_datetime",
+    "decimal_parsing": "invalid_number",
+    "decimal_type": "invalid_number",
+    "dict_type": "invalid_object",
+    "enum": "invalid_choice",
+    "extra_forbidden": "extra_forbidden",
+    "finite_number": "invalid_number",
+    "float_parsing": "invalid_number",
+    "float_type": "invalid_number",
+    "frozenset_type": "invalid_list",
+    "greater_than": "invalid_value",
+    "greater_than_equal": "invalid_value",
+    "int_from_float": "invalid_integer",
+    "int_parsing": "invalid_integer",
+    "int_parsing_size": "invalid_integer",
+    "int_type": "invalid_integer",
+    "is_instance_of": "invalid_type",
+    "less_than": "invalid_value",
+    "less_than_equal": "invalid_value",
+    "list_type": "invalid_list",
+    "literal_error": "invalid_choice",
+    "mapping_type": "invalid_object",
+    "missing": "missing",
+    "model_attributes_type": "invalid_object",
+    "set_type": "invalid_list",
+    "string_type": "invalid_string",
+    "time_parsing": "invalid_time",
+    "time_type": "invalid_time",
+    "timezone_aware": "invalid_timezone",
+    "timezone_naive": "invalid_timezone",
+    "tuple_type": "invalid_list",
+    "union_tag_invalid": "invalid_choice",
+    "union_tag_not_found": "invalid_choice",
+    "url_parsing": "invalid_url",
+    "url_scheme": "invalid_url",
+    "url_type": "invalid_url",
+    "value_error": "invalid_value",
+}
+
+
+def _contains_dynamic_mapping_value(schema: object) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    if "additionalProperties" in schema:
+        return True
+    items = schema.get("items")
+    if isinstance(items, dict) and "additionalProperties" in items:
+        return True
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        options = schema.get(keyword)
+        if isinstance(options, list) and any(
+            _contains_dynamic_mapping_value(option) for option in options
+        ):
+            return True
+    return False
+
+
+def _schema_location_policy(
+    adapter: TypeAdapter[object],
+) -> tuple[frozenset[str], frozenset[str]]:
+    trusted_fields: set[str] = set()
+    dynamic_mapping_fields: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                for field_name, field_schema in properties.items():
+                    trusted_fields.add(field_name)
+                    if _contains_dynamic_mapping_value(field_schema):
+                        dynamic_mapping_fields.add(field_name)
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(adapter.json_schema())
+    return frozenset(trusted_fields), frozenset(dynamic_mapping_fields)
+
+
+(
+    _PROJECTED_TRUSTED_FIELDS,
+    _PROJECTED_DYNAMIC_MAPPING_FIELDS,
+) = _schema_location_policy(_PROJECTED_ADAPTER)
+(
+    _CONFIRMED_TRUSTED_FIELDS,
+    _CONFIRMED_DYNAMIC_MAPPING_FIELDS,
+) = _schema_location_policy(_CONFIRMED_ADAPTER)
+(
+    _REVIEW_TRUSTED_FIELDS,
+    _REVIEW_DYNAMIC_MAPPING_FIELDS,
+) = _schema_location_policy(_REVIEW_ADAPTER)
 
 
 def _reject_duplicate_keys(
@@ -325,41 +429,56 @@ def bundle_stage_from_json(raw: str | bytes | bytearray) -> str:
     return stage
 
 
-def _validation_location(location: tuple[object, ...]) -> str:
-    return ".".join(str(part) for part in location) or "bundle"
+def _validation_location(
+    location: tuple[object, ...],
+    *,
+    trusted_fields: frozenset[str],
+    dynamic_mapping_fields: frozenset[str],
+    force_final_placeholder: bool,
+) -> str:
+    rendered = ""
+    dynamic_segment_follows = False
+    for index, part in enumerate(location):
+        if type(part) is int:
+            rendered += f"[{part}]"
+            continue
+        is_forced_placeholder = (
+            force_final_placeholder and index == len(location) - 1
+        )
+        is_trusted = (
+            isinstance(part, str)
+            and part in trusted_fields
+            and not dynamic_segment_follows
+            and not is_forced_placeholder
+        )
+        safe_part = part if is_trusted else "<field>"
+        rendered += ("." if rendered else "") + safe_part
+        dynamic_segment_follows = (
+            is_trusted and part in dynamic_mapping_fields
+        )
+    return rendered or "bundle"
 
 
-def _safe_validation_diagnostics(error: ValidationError) -> str:
-    safe_categories = {
-        "bool_type": "invalid_type",
-        "date_type": "invalid_type",
-        "datetime_type": "invalid_type",
-        "dict_type": "invalid_type",
-        "extra_forbidden": "extra_forbidden",
-        "finite_number": "invalid_value",
-        "float_type": "invalid_type",
-        "greater_than": "invalid_value",
-        "greater_than_equal": "invalid_value",
-        "int_type": "invalid_type",
-        "is_instance_of": "invalid_type",
-        "less_than": "invalid_value",
-        "less_than_equal": "invalid_value",
-        "list_type": "invalid_type",
-        "literal_error": "invalid_literal",
-        "missing": "missing",
-        "set_type": "invalid_type",
-        "string_type": "invalid_type",
-        "tuple_type": "invalid_type",
-        "value_error": "invalid_value",
-    }
+def _safe_validation_diagnostics(
+    error: ValidationError,
+    *,
+    trusted_fields: frozenset[str],
+    dynamic_mapping_fields: frozenset[str],
+) -> str:
     diagnostics: list[str] = []
     for detail in error.errors(include_input=False, include_url=False):
         raw_location = detail.get("loc", ())
-        location = _validation_location(
-            tuple(raw_location) if isinstance(raw_location, tuple) else ()
-        )
         raw_type = detail.get("type")
-        category = safe_categories.get(raw_type, "validation_error")
+        location = _validation_location(
+            tuple(raw_location) if isinstance(raw_location, tuple) else (),
+            trusted_fields=trusted_fields,
+            dynamic_mapping_fields=dynamic_mapping_fields,
+            force_final_placeholder=raw_type == "extra_forbidden",
+        )
+        category = _SAFE_VALIDATION_CATEGORIES.get(
+            raw_type,
+            "validation_error",
+        )
         if raw_type == "value_error" and location.endswith("schema_version"):
             category = "invalid_integer"
         elif raw_type == "value_error" and location.endswith("created_at"):
@@ -372,6 +491,8 @@ def _parse_bundle_json(
     raw: str | bytes | bytearray,
     adapter: TypeAdapter[_BundleType],
     audit_presence_check: _AuditPresenceCheck,
+    trusted_fields: frozenset[str],
+    dynamic_mapping_fields: frozenset[str],
 ) -> _BundleType:
     raw_bytes, decoded_value = _decode_bundle_json(raw)
     audit_presence_check(decoded_value)
@@ -380,7 +501,12 @@ def _parse_bundle_json(
         return adapter.validate_json(raw_bytes, strict=True)
     except ValidationError as error:
         raise BundleValidationError(
-            f"invalid bundle: {_safe_validation_diagnostics(error)}"
+            "invalid bundle: "
+            + _safe_validation_diagnostics(
+                error,
+                trusted_fields=trusted_fields,
+                dynamic_mapping_fields=dynamic_mapping_fields,
+            )
         ) from error
     except (TypeError, ValueError) as error:
         raise BundleValidationError(
@@ -395,6 +521,8 @@ def parse_projected_bundle_json(
         raw,
         _PROJECTED_ADAPTER,
         _require_pregame_audit_fields,
+        _PROJECTED_TRUSTED_FIELDS,
+        _PROJECTED_DYNAMIC_MAPPING_FIELDS,
     )
 
 
@@ -405,6 +533,8 @@ def parse_confirmed_bundle_json(
         raw,
         _CONFIRMED_ADAPTER,
         _require_pregame_audit_fields,
+        _CONFIRMED_TRUSTED_FIELDS,
+        _CONFIRMED_DYNAMIC_MAPPING_FIELDS,
     )
 
 
@@ -415,4 +545,6 @@ def parse_review_bundle_json(
         raw,
         _REVIEW_ADAPTER,
         _require_review_audit_fields,
+        _REVIEW_TRUSTED_FIELDS,
+        _REVIEW_DYNAMIC_MAPPING_FIELDS,
     )
