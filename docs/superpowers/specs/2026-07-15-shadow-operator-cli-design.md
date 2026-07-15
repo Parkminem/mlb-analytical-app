@@ -158,7 +158,10 @@ revision that supersedes the previous official result.
 2. Require projected lineup state and a pre-first-pitch capture time.
 3. Apply the same keyed-capture preflight and active-capture ordering defined
    for `confirmed`. A changed projected state supersedes the latest active
-   pregame capture for the game; an exact retry reuses its original target.
+   projected pregame capture for the game; an exact retry reuses its original
+   target. If no keyed projected capture already exists and the game has an
+   active confirmed capture, reject the new projected command. A projected
+   command can never supersede or deactivate a confirmed capture.
 4. Run the deterministic shadow forecast and append or replay the capture,
    forecast, and link.
 5. Store an immutable canonical bundle copy under the game directory.
@@ -215,8 +218,12 @@ private forecast serialization logic.
 - Managed filenames are
   `<stage>-v<schema_version>-<bundle_hash_prefix_16>.json` inside the game
   directory. An existing path must contain identical canonical bytes.
-- Capture idempotency keys derive from schema version, game ID, stage, and the
-  canonical normalized-input hash.
+- Capture idempotency keys derive from schema version, stage, and a SHA-256 hash
+  of the exact intrinsic `CaptureCommand` content: game ID, `captured_at`, first
+  pitch, lineup state, eligibility, normalized-input hash, and canonical
+  capture payload. `supersedes_capture_id` is excluded because it is resolved
+  after key lookup. This preserves distinct source-state/audit captures when
+  forecast semantics are unchanged while making an exact command replayable.
 - Forecast identity remains the existing deterministic forecast run ID.
 - Result idempotency derives from game ID, official source identity, and source
   revision. The operator searches for that exact key before validating whether
@@ -311,19 +318,23 @@ Use test-driven development. Required coverage:
 3. Projected capture/forecast/link happy path.
 4. Confirmed supersession and frozen forecast selection.
 5. Semantic forecast reuse and exact-command idempotency.
-6. Rejection of post-first-pitch captures and result leakage.
-7. Review refusal when no confirmed forecast exists.
-8. Official result ingestion, correction lineage, and closing observations.
-9. Review creation for all exact eligible markets, including legacy pass flow
+6. Distinct capture records for unchanged forecast semantics with different
+   capture times or audit provenance.
+7. Rejection of a new projected capture after confirmation while allowing an
+   exact historical projected replay.
+8. Rejection of post-first-pitch captures and result leakage.
+9. Review refusal when no confirmed forecast exists.
+10. Official result ingestion, correction lineage, and closing observations.
+11. Review creation for all exact eligible markets, including legacy pass flow
    handling.
-10. Calibration row selection and deterministic JSON/Markdown reports.
-11. Interrupted-stage retry behavior.
-12. Typer CLI success output, stable failures, default paths, and path
+12. Calibration row selection and deterministic JSON/Markdown reports.
+13. Interrupted-stage retry behavior.
+14. Typer CLI success output, stable failures, default paths, and path
     overrides.
-13. Config-registry version resolution and historical-version replay.
-14. Byte-identical reports for an unchanged ledger and fixed migration-gate
+15. Config-registry version resolution and historical-version replay.
+16. Byte-identical reports for an unchanged ledger and fixed migration-gate
     denominators.
-15. Full existing regression suite and fixed-model manifest verification.
+17. Full existing regression suite and fixed-model manifest verification.
 
 ## Acceptance Criteria
 
