@@ -10,12 +10,14 @@ import tempfile
 
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
+from analysis.ledger import ForecastRecord
 from analysis.review.calibration import (
     CalibrationMetrics,
     CalibrationReport,
     CalibrationRow,
     GROUPING_DIMENSIONS,
 )
+from analysis.shadow import deserialize_shadow_comparison
 
 from .errors import OperatorIOError
 
@@ -85,8 +87,87 @@ def _progress_mapping(count: int, threshold: int) -> dict[str, object]:
     }
 
 
-def _migration_mapping(rows: tuple[CalibrationRow, ...]) -> dict[str, object]:
+def _migration_eligible_rows(
+    rows: tuple[CalibrationRow, ...],
+    ledger_records: tuple[object, ...],
+) -> tuple[CalibrationRow, ...]:
     confirmed_rows = tuple(row for row in rows if row.lineup_state == "confirmed")
+    required_forecast_ids = {
+        row.forecast_run_id for row in confirmed_rows
+    }
+    forecasts_by_run_id: dict[str, ForecastRecord] = {}
+    for record in ledger_records:
+        if (
+            not isinstance(record, ForecastRecord)
+            or record.forecast_run_id not in required_forecast_ids
+        ):
+            continue
+        if record.forecast_run_id in forecasts_by_run_id:
+            raise ValueError(
+                "duplicate frozen forecast required by migration row: "
+                f"{record.forecast_run_id}"
+            )
+        forecasts_by_run_id[record.forecast_run_id] = record
+
+    missing_forecasts = required_forecast_ids - forecasts_by_run_id.keys()
+    if missing_forecasts:
+        missing = ", ".join(sorted(missing_forecasts))
+        raise ValueError(
+            f"migration rows reference missing frozen forecasts: {missing}"
+        )
+
+    eligible_pairs: set[tuple[str, str]] = set()
+    comparison_pairs: set[tuple[str, str]] = set()
+    for forecast_run_id in sorted(required_forecast_ids):
+        forecast = forecasts_by_run_id[forecast_run_id]
+        try:
+            comparison = deserialize_shadow_comparison(
+                forecast.outputs.get("shadow_comparison")
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "invalid frozen shadow comparison required by migration row "
+                f"for forecast {forecast_run_id}: {error}"
+            ) from error
+        if comparison.forecast_run_id != forecast_run_id:
+            raise ValueError(
+                "frozen shadow comparison forecast_run_id does not match "
+                f"migration forecast {forecast_run_id}"
+            )
+        for market in comparison.market_comparisons:
+            pair = (forecast_run_id, market.market_key)
+            if pair in comparison_pairs:
+                raise ValueError(
+                    "duplicate exact market in frozen shadow comparison: "
+                    f"{forecast_run_id}, {market.market_key}"
+                )
+            comparison_pairs.add(pair)
+            if market.review_eligible:
+                eligible_pairs.add(pair)
+
+    required_pairs = {
+        (row.forecast_run_id, row.market_key) for row in confirmed_rows
+    }
+    missing_pairs = required_pairs - comparison_pairs
+    if missing_pairs:
+        missing = ", ".join(
+            f"({forecast_run_id}, {market_key})"
+            for forecast_run_id, market_key in sorted(missing_pairs)
+        )
+        raise ValueError(
+            "migration rows reference missing exact frozen market comparisons: "
+            f"{missing}"
+        )
+    return tuple(
+        row
+        for row in confirmed_rows
+        if (row.forecast_run_id, row.market_key) in eligible_pairs
+    )
+
+
+def _migration_mapping(
+    confirmed_rows: tuple[CalibrationRow, ...],
+) -> dict[str, object]:
     confirmed_games = len({row.game_pk for row in confirmed_rows})
     market_types: dict[str, object] = {}
     for market_type in MarketType:
@@ -160,7 +241,9 @@ def build_report_mapping(
             }
             for group in report.groups
         ],
-        "migration": _migration_mapping(rows),
+        "migration": _migration_mapping(
+            _migration_eligible_rows(rows, ledger_records)
+        ),
     }
 
 

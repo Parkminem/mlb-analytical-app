@@ -1,5 +1,6 @@
 from dataclasses import fields, replace
 from datetime import timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,8 +11,8 @@ import pytest
 import analysis.operator.service as service_module
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
-from analysis.ledger import LedgerStore
-from analysis.operator.errors import OperatorIOError
+from analysis.ledger import ForecastCommand, LedgerStore, ReviewCommand
+from analysis.operator.errors import OperatorIOError, OperatorLedgerError
 from analysis.operator.reporting import (
     CALIBRATION_JSON_FILENAME,
     CALIBRATION_MARKDOWN_FILENAME,
@@ -28,7 +29,9 @@ from analysis.review.calibration import (
     CalibrationMetrics,
     GROUPING_DIMENSIONS,
     build_calibration_report,
+    select_primary_rows,
 )
+from analysis.shadow import deserialize_shadow_comparison
 from tests.test_calibration import calibration_row
 from tests.test_forecasting_engine import _complete_game
 from tests.test_operator_review import (
@@ -95,12 +98,391 @@ def _run_review_for_game(
     )
 
 
+def _frozen_forecast(tmp_path: Path):
+    confirmed = _record_pregame(
+        _complete_game(),
+        _legacy_snapshot(),
+        tmp_path / "frozen-comparison-ledger.jsonl",
+    )
+    return confirmed.forecast
+
+
+def _forecast_with_ineligible_market(tmp_path: Path):
+    forecast = _frozen_forecast(tmp_path)
+    outputs = json.loads(canonical_json(forecast.outputs))
+    shadow = outputs["shadow_comparison"]
+    ineligible = next(
+        comparison
+        for comparison in shadow["market_comparisons"]
+        if comparison["market_key"] == "sea_ml"
+    )
+    ineligible["principal_paths"] = []
+    ineligible["review_eligible"] = False
+    ineligible["review_ineligibility_flags"] = [
+        "missing_component_distribution"
+    ]
+    frozen = replace(forecast, outputs=outputs)
+    comparison = deserialize_shadow_comparison(
+        frozen.outputs["shadow_comparison"]
+    )
+    assert comparison.forecast_run_id == frozen.forecast_run_id
+    stored_ineligible = next(
+        market
+        for market in comparison.market_comparisons
+        if market.market_key == "sea_ml"
+    )
+    assert stored_ineligible.review_eligible is False
+    return frozen
+
+
+def _clone_eligible_forecast_for_row(forecast, row, index: int):
+    run_id = hashlib.sha256(f"migration-forecast-{index}".encode()).hexdigest()
+    market_key = row.market_key
+    shadow = json.loads(canonical_json(forecast.outputs["shadow_comparison"]))
+    shadow["forecast_run_id"] = run_id
+    comparison = next(
+        market
+        for market in shadow["market_comparisons"]
+        if market["legacy_candidate_index"] == 0
+    )
+    comparison["market_key"] = market_key
+    binding = next(
+        item
+        for item in shadow["legacy"]["review_bindings"]
+        if item["legacy_candidate_index"] == 0
+    )
+    binding["market_key"] = market_key
+    cloned = replace(
+        forecast,
+        envelope=replace(
+            forecast.envelope,
+            record_id=hashlib.sha256(f"migration-envelope-{index}".encode())
+            .hexdigest()[:32],
+            idempotency_key=f"migration-forecast-{index}",
+            payload_hash=f"migration-payload-{index}",
+        ),
+        forecast_run_id=run_id,
+        normalized_input_hash=f"migration-input-{index}",
+        outputs={"shadow_comparison": shadow},
+    )
+    deserialize_shadow_comparison(cloned.outputs["shadow_comparison"])
+    return replace(row, forecast_run_id=run_id), cloned
+
+
+def _exact_migration_row(
+    forecast,
+    *,
+    game_pk: int,
+    market_key: str,
+    market_type: str,
+    legacy_priority_score: int,
+):
+    return calibration_row(
+        game_pk=game_pk,
+        capture_id=f"capture-{game_pk}-{market_key}",
+        forecast_run_id=forecast.forecast_run_id,
+        market_key=market_key,
+        market_type=market_type,
+        legacy_priority_score=legacy_priority_score,
+    )
+
+
+def _mapping_from_frozen_forecast(
+    tmp_path: Path,
+    forecast,
+    rows,
+):
+    rows = tuple(rows)
+    return build_report_mapping(
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_records=(forecast,),
+        rows=rows,
+        report=build_calibration_report(rows),
+    )
+
+
+def test_eligible_legacy_pass_counts_for_migration(tmp_path: Path) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    comparison = deserialize_shadow_comparison(
+        forecast.outputs["shadow_comparison"]
+    )
+    frozen_pass = next(
+        market
+        for market in comparison.market_comparisons
+        if market.market_key == "full_under"
+    )
+    assert frozen_pass.legacy_rating == "pass"
+    assert frozen_pass.review_eligible is True
+    eligible_pass = _exact_migration_row(
+        forecast,
+        game_pk=940001,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+
+    mapping = _mapping_from_frozen_forecast(
+        tmp_path,
+        forecast,
+        (eligible_pass,),
+    )
+
+    assert mapping["overall"]["sample_size"] == 1
+    assert mapping["migration"]["confirmed_games"]["count"] == 1
+    assert mapping["migration"]["market_types"]["full_total"]["count"] == 1
+
+
+def test_ineligible_exact_reviewed_market_does_not_count_for_migration(
+    tmp_path: Path,
+) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    eligible_pass = _exact_migration_row(
+        forecast,
+        game_pk=940001,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+    ineligible = _exact_migration_row(
+        forecast,
+        game_pk=940002,
+        market_key="sea_ml",
+        market_type="ml",
+        legacy_priority_score=78,
+    )
+
+    mapping = _mapping_from_frozen_forecast(
+        tmp_path,
+        forecast,
+        (eligible_pass, ineligible),
+    )
+
+    assert mapping["overall"]["sample_size"] == 2
+    assert mapping["migration"]["market_types"]["full_total"]["count"] == 1
+    assert mapping["migration"]["market_types"]["ml"]["count"] == 0
+
+
+def test_game_with_only_ineligible_row_does_not_count_as_confirmed_game(
+    tmp_path: Path,
+) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    ineligible = _exact_migration_row(
+        forecast,
+        game_pk=940003,
+        market_key="sea_ml",
+        market_type="ml",
+        legacy_priority_score=78,
+    )
+
+    mapping = _mapping_from_frozen_forecast(
+        tmp_path,
+        forecast,
+        (ineligible,),
+    )
+
+    assert mapping["overall"]["sample_size"] == 1
+    assert mapping["migration"]["confirmed_games"]["count"] == 0
+
+
+def test_duplicate_eligible_rows_remain_one_migration_decision(
+    tmp_path: Path,
+) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    eligible_pass = _exact_migration_row(
+        forecast,
+        game_pk=940004,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+    duplicate = replace(eligible_pass, capture_id="duplicate-capture")
+
+    mapping = _mapping_from_frozen_forecast(
+        tmp_path,
+        forecast,
+        (eligible_pass, duplicate),
+    )
+
+    assert mapping["overall"]["sample_size"] == 2
+    assert mapping["migration"]["confirmed_games"]["count"] == 1
+    assert mapping["migration"]["market_types"]["full_total"]["count"] == 1
+
+
+def test_historical_ineligible_review_stays_in_metrics_but_not_migration(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "historical-ledger.jsonl"
+    confirmed = _record_pregame(
+        _complete_game(),
+        _legacy_snapshot(),
+        ledger_path,
+    )
+    store = LedgerStore(ledger_path)
+    forecast_run_id = hashlib.sha256(b"historical-ineligible").hexdigest()
+    outputs = json.loads(canonical_json(confirmed.forecast.outputs))
+    outputs["forecast_run_id"] = forecast_run_id
+    shadow = outputs["shadow_comparison"]
+    shadow["forecast_run_id"] = forecast_run_id
+    ineligible = next(
+        comparison
+        for comparison in shadow["market_comparisons"]
+        if comparison["market_key"] == "sea_ml"
+    )
+    ineligible["principal_paths"] = []
+    ineligible["review_eligible"] = False
+    ineligible["review_ineligibility_flags"] = [
+        "missing_component_distribution"
+    ]
+    deserialize_shadow_comparison(shadow)
+    historical_forecast = store.append_forecast(
+        ForecastCommand(
+            forecast_run_id=forecast_run_id,
+            model_version=confirmed.forecast.model_version,
+            simulation_config_hash=(
+                confirmed.forecast.simulation_config_hash
+            ),
+            normalized_input_hash=confirmed.capture.normalized_input_hash,
+            outputs=outputs,
+        )
+    )
+    historical_link = store.link_capture_forecast(
+        confirmed.capture.capture_id,
+        historical_forecast.forecast_run_id,
+    )
+    bundle = parse_review_bundle_json(_raw(_review_mapping(confirmed)))
+    result = store.append_official_result(bundle.payload.official_result)
+    store.append_review(
+        ReviewCommand(
+            capture_forecast_link_record_id=(
+                historical_link.envelope.record_id
+            ),
+            capture_id=confirmed.capture.capture_id,
+            forecast_run_id=historical_forecast.forecast_run_id,
+            official_result_record_id=result.envelope.record_id,
+            market_key="sea_ml",
+            market_result="win",
+            classification="A",
+            inside_80_ratio=1.0,
+            contradicted_paths=(),
+            component_reviews=(
+                {
+                    "evidence_path": "starter_suppression",
+                    "component_ids": (
+                        "home_pitcher_chain_runs_allowed",
+                    ),
+                    "contradicted": False,
+                    "inside_80_count": 1,
+                    "component_count": 1,
+                    "notes": (),
+                },
+                {
+                    "evidence_path": "top_order_matchup",
+                    "component_ids": (
+                        "away_full_runs",
+                        "away_full_traffic",
+                        "away_full_extra_base_hits",
+                    ),
+                    "contradicted": False,
+                    "inside_80_count": 3,
+                    "component_count": 3,
+                    "notes": (),
+                },
+            ),
+        )
+    )
+
+    rows = select_primary_rows(store)
+    mapping = build_report_mapping(
+        ledger_path=ledger_path,
+        ledger_records=tuple(store.iter_records()),
+        rows=rows,
+        report=build_calibration_report(rows),
+    )
+
+    assert tuple(row.market_key for row in rows) == ("sea_ml",)
+    assert mapping["overall"]["sample_size"] == 1
+    assert mapping["migration"]["confirmed_games"]["count"] == 0
+    assert mapping["migration"]["market_types"]["ml"]["count"] == 0
+
+
+@pytest.mark.parametrize(
+    "comparison_state",
+    ("missing_forecast", "missing_market", "invalid"),
+)
+def test_migration_rows_require_valid_exact_frozen_comparison(
+    tmp_path: Path,
+    comparison_state: str,
+) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    row = _exact_migration_row(
+        forecast,
+        game_pk=940005,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+    if comparison_state == "missing_forecast":
+        records = (_ledger_record(forecast.envelope.appended_at),)
+    elif comparison_state == "missing_market":
+        records = (forecast,)
+        row = replace(row, market_key="missing_exact_market")
+    else:
+        outputs = json.loads(canonical_json(forecast.outputs))
+        outputs.pop("shadow_comparison")
+        records = (replace(forecast, outputs=outputs),)
+
+    with pytest.raises(ValueError, match="frozen.*comparison|forecast"):
+        build_report_mapping(
+            ledger_path=tmp_path / "ledger.jsonl",
+            ledger_records=records,
+            rows=(row,),
+            report=build_calibration_report((row,)),
+        )
+
+
+def test_service_maps_invalid_migration_comparison_to_ledger_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forecast = _forecast_with_ineligible_market(tmp_path)
+    outputs = json.loads(canonical_json(forecast.outputs))
+    outputs.pop("shadow_comparison")
+    invalid_forecast = replace(forecast, outputs=outputs)
+    row = _exact_migration_row(
+        forecast,
+        game_pk=940006,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+
+    class SnapshotStore:
+        def iter_records(self):
+            return iter((invalid_forecast,))
+
+    monkeypatch.setattr(
+        service_module,
+        "select_primary_rows",
+        lambda snapshot: (row,),
+    )
+
+    with pytest.raises(
+        OperatorLedgerError,
+        match="invalid frozen shadow comparison",
+    ):
+        service_module._calibration_report_state(
+            SnapshotStore(),
+            tmp_path / "ledger.jsonl",
+        )
+
+
 def test_report_mapping_is_versioned_complete_and_uses_latest_ledger_append(
     tmp_path: Path,
 ) -> None:
-    first = _unique_row(1)
+    first = _unique_row(1, lineup_state="projected")
     second = _unique_row(
         2,
+        lineup_state="projected",
         market_result="loss",
         selected_decimal_price=None,
         closing_selected_decimal_price=None,
@@ -154,13 +536,20 @@ def test_empty_ledger_has_null_as_of_and_unavailable_metrics(tmp_path: Path) -> 
 def test_migration_counts_are_unique_confirmed_only_and_cover_all_market_types(
     tmp_path: Path,
 ) -> None:
-    confirmed = _unique_row(1)
+    forecast = _frozen_forecast(tmp_path)
+    confirmed = _exact_migration_row(
+        forecast,
+        game_pk=910001,
+        market_key="sea_ml",
+        market_type="ml",
+        legacy_priority_score=78,
+    )
     duplicate_decision = replace(confirmed, capture_id="capture-duplicate")
-    eligible_pass = _unique_row(
-        2,
+    eligible_pass = _exact_migration_row(
+        forecast,
+        game_pk=910002,
+        market_key="full_under",
         market_type="full_total",
-        market_key="game:910002:full_total:under",
-        line=8.5,
         legacy_priority_score=60,
     )
     projected = _unique_row(3, lineup_state="projected")
@@ -168,6 +557,7 @@ def test_migration_counts_are_unique_confirmed_only_and_cover_all_market_types(
     mapping = _mapping(
         tmp_path,
         (confirmed, duplicate_decision, eligible_pass, projected),
+        ledger_records=(forecast,),
     )
     migration = mapping["migration"]
 
@@ -187,16 +577,27 @@ def test_migration_counts_are_unique_confirmed_only_and_cover_all_market_types(
 
 
 def test_migration_progress_is_deterministic_and_capped(tmp_path: Path) -> None:
-    rows = tuple(
-        _unique_row(
+    forecast = _frozen_forecast(tmp_path)
+    cloned = tuple(
+        _clone_eligible_forecast_for_row(
+            forecast,
+            _unique_row(
+                index,
+                game_pk=920000 + (index % 105),
+                market_key=f"decision:{index}:ml",
+            ),
             index,
-            game_pk=920000 + (index % 105),
-            market_key=f"decision:{index}:ml",
         )
         for index in range(305)
     )
+    rows = tuple(row for row, _ in cloned)
+    forecasts = tuple(record for _, record in cloned)
 
-    migration = _mapping(tmp_path, rows)["migration"]
+    migration = _mapping(
+        tmp_path,
+        rows,
+        ledger_records=forecasts,
+    )["migration"]
     games = migration["confirmed_games"]
     ml = migration["market_types"]["ml"]
 
@@ -215,7 +616,10 @@ def test_migration_progress_is_deterministic_and_capped(tmp_path: Path) -> None:
 def test_json_and_markdown_are_byte_identical_for_unchanged_mapping(
     tmp_path: Path,
 ) -> None:
-    mapping = _mapping(tmp_path, (_unique_row(1),))
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
     report_dir = tmp_path / "reports"
 
     first = write_calibration_reports(mapping, report_dir=report_dir)
@@ -240,7 +644,10 @@ def test_atomic_writer_fsyncs_files_and_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mapping = _mapping(tmp_path, (_unique_row(1),))
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
     calls: list[int] = []
     real_fsync = os.fsync
 
@@ -261,7 +668,10 @@ def test_atomic_write_failures_map_to_operator_io_error_and_clean_temps(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    mapping = _mapping(tmp_path, (_unique_row(1),))
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
     report_dir = tmp_path / "reports"
 
     def fail(*args, **kwargs):
@@ -278,7 +688,10 @@ def test_atomic_write_failures_map_to_operator_io_error_and_clean_temps(
 def test_report_writer_rejects_symlinked_directory_and_destination(
     tmp_path: Path,
 ) -> None:
-    mapping = _mapping(tmp_path, (_unique_row(1),))
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
     real_dir = tmp_path / "real"
     real_dir.mkdir()
     linked_dir = tmp_path / "linked"
