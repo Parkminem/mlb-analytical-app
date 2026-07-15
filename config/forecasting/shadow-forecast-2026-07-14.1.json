@@ -1,0 +1,45 @@
+{
+  "version": "shadow-forecast-2026-07-14.1",
+  "league_runs_per_team_game": 4.5,
+  "league_woba": 0.32,
+  "gamma_poisson_shape": 1.6,
+  "simulations": 20000,
+  "extra_inning_multiplier": 1.8,
+  "max_innings": 30,
+  "offense_bounds": [
+    0.65,
+    1.45
+  ],
+  "matchup_bounds": [
+    0.8,
+    1.2
+  ],
+  "starter_ra9_bounds": [
+    0.55,
+    1.75
+  ],
+  "bullpen_ra9_bounds": [
+    0.6,
+    1.9
+  ],
+  "pa_weights": [
+    1.11,
+    1.08,
+    1.06,
+    1.04,
+    1.01,
+    0.98,
+    0.94,
+    0.91,
+    0.87
+  ],
+  "pitch_limit_high_bucket_transfer": 1.0,
+  "pitch_limit_transfer_to_under_five": 0.4,
+  "sample_shortage_log_se_penalty": 0.12,
+  "unknown_bullpen_matchup_log_se_penalty": 0.08,
+  "handoff_uncertainty_log_se_penalty": 0.1,
+  "injury_return_log_se_penalty": 0.12,
+  "recent_short_exit_log_se_penalty": 0.1,
+  "limited_reliever_log_se_penalty": 0.1,
+  "unscheduled_f5_relief_log_standard_error": 0.15
+}

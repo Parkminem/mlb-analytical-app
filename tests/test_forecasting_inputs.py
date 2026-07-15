@@ -42,6 +42,8 @@ from analysis.forecasting.identity import (
     semantic_forecast_payload,
 )
 from analysis.forecasting.validation import (
+    PregameRelationshipError,
+    PregameTimingError,
     iter_feature_provenance,
     validate_pregame_input,
 )
@@ -1443,6 +1445,77 @@ class ForecastIdentityTests(unittest.TestCase):
 
         self.assertTrue(result.out_of_sample_eligible)
         self.assertEqual(result.flags, ())
+
+    def test_pregame_validation_uses_typed_failure_categories(self) -> None:
+        game = complete_forecast_game()
+        away_slot = game.away_lineup.slots[0]
+        wrong_response = replace(
+            away_slot.responses[0],
+            pitcher_id="pitcher:missing",
+        )
+        relationship_cases = (
+            replace(
+                game,
+                away_lineup=replace(game.away_lineup, team="OAK"),
+            ),
+            replace(game, markets=(game.markets[0], game.markets[0])),
+            replace(
+                game,
+                away_lineup=replace_lineup_slot(
+                    game.away_lineup,
+                    0,
+                    replace(away_slot, responses=(wrong_response,)),
+                ),
+            ),
+            replace(game, observations=()),
+            replace(
+                game,
+                observations=(game.observations[0], game.observations[0]),
+            ),
+        )
+        late_available = replace(
+            game.away_lineup.state_provenance,
+            latest_available_at=game.captured_at + timedelta(seconds=1),
+        )
+        late_lookback = replace(
+            game.away_lineup.state_provenance,
+            lookback_end=game.captured_at + timedelta(seconds=1),
+        )
+        timing_cases = (
+            replace(game, captured_at=game.identity.first_pitch),
+            replace(
+                game,
+                away_lineup=replace(
+                    game.away_lineup,
+                    state_provenance=late_available,
+                ),
+            ),
+            replace(
+                game,
+                away_lineup=replace(
+                    game.away_lineup,
+                    state_provenance=late_lookback,
+                ),
+            ),
+            replace(
+                game,
+                observations=(
+                    replace(
+                        game.observations[0],
+                        available_at=game.captured_at + timedelta(seconds=1),
+                    ),
+                ),
+            ),
+        )
+
+        for changed in relationship_cases:
+            with self.subTest(category="relationship", changed=changed):
+                with self.assertRaises(PregameRelationshipError):
+                    validate_pregame_input(changed)
+        for changed in timing_cases:
+            with self.subTest(category="timing", changed=changed):
+                with self.assertRaises(PregameTimingError):
+                    validate_pregame_input(changed)
 
     def test_iter_feature_provenance_yields_every_reference(self) -> None:
         provenances = tuple(iter_feature_provenance(complete_forecast_game()))

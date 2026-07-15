@@ -13,6 +13,14 @@ from .inputs import (
 )
 
 
+class PregameRelationshipError(ValueError):
+    """Pregame domain objects do not reference each other consistently."""
+
+
+class PregameTimingError(ValueError):
+    """Pregame capture or source availability violates the time boundary."""
+
+
 @dataclass(frozen=True)
 class ValidationResult:
     out_of_sample_eligible: bool
@@ -106,20 +114,22 @@ def _require_unique_market_keys(game: NormalizedGameInput) -> None:
     seen: set[str] = set()
     for market in game.markets:
         if market.market_key in seen:
-            raise ValueError(f"duplicate market_key: {market.market_key}")
+            raise PregameRelationshipError(
+                f"duplicate market_key: {market.market_key}"
+            )
         seen.add(market.market_key)
 
 
 def _validate_team_relationships(game: NormalizedGameInput) -> None:
     identity = game.identity
     if identity.away_team == identity.home_team:
-        raise ValueError("away_team and home_team must differ")
+        raise PregameRelationshipError("away_team and home_team must differ")
     if not (
         identity.away_team
         == game.away_lineup.team
         == game.away_bullpen.team
     ):
-        raise ValueError(
+        raise PregameRelationshipError(
             "away team relationship mismatch: identity, lineup, and bullpen "
             "teams must match"
         )
@@ -128,7 +138,7 @@ def _validate_team_relationships(game: NormalizedGameInput) -> None:
         == game.home_lineup.team
         == game.home_bullpen.team
     ):
-        raise ValueError(
+        raise PregameRelationshipError(
             "home team relationship mismatch: identity, lineup, and bullpen "
             "teams must match"
         )
@@ -148,13 +158,13 @@ def _validate_response_relationships(
             "L" if matchup_pitcher.throws == "R" else "R"
         ) if slot.bats == "S" else slot.bats
         if slot.expected_side != matchup_side:
-            raise ValueError(
+            raise PregameRelationshipError(
                 f"{team_label} lineup expected_side must match the batter side "
                 "against the matchup pitcher"
             )
         for response in slot.responses:
             if response.pitcher_id not in opposing_pitchers:
-                raise ValueError(
+                raise PregameRelationshipError(
                     f"{team_label} lineup response pitcher_id must reference "
                     "the opposing pitcher chain"
                 )
@@ -163,7 +173,7 @@ def _validate_response_relationships(
                 "L" if pitcher.throws == "R" else "R"
             ) if slot.bats == "S" else slot.bats
             if response.expected_side != expected_side:
-                raise ValueError(
+                raise PregameRelationshipError(
                     f"{team_label} lineup response expected_side must match the "
                     "batter side resolved for its opposing pitcher"
                 )
@@ -175,7 +185,7 @@ def _observations_by_id(
     observations: dict[str, SourceObservation] = {}
     for observation in game.observations:
         if observation.observation_id in observations:
-            raise ValueError(
+            raise PregameRelationshipError(
                 f"duplicate observation_id: {observation.observation_id}"
             )
         observations[observation.observation_id] = observation
@@ -188,7 +198,9 @@ def validate_pregame_input(game: NormalizedGameInput) -> ValidationResult:
     if not isinstance(game, NormalizedGameInput):
         raise TypeError("game must be NormalizedGameInput")
     if game.captured_at >= game.identity.first_pitch:
-        raise ValueError("captured_at must be before identity.first_pitch")
+        raise PregameTimingError(
+            "captured_at must be before identity.first_pitch"
+        )
 
     _validate_team_relationships(game)
     _require_unique_market_keys(game)
@@ -210,17 +222,19 @@ def validate_pregame_input(game: NormalizedGameInput) -> ValidationResult:
         if latest_available_at is None:
             unknown_available_at = True
         elif latest_available_at > game.captured_at:
-            raise ValueError(
+            raise PregameTimingError(
                 "feature latest_available_at is after captured_at"
             )
 
         lookback_end = feature_provenance.lookback_end
         if lookback_end is not None and lookback_end > game.captured_at:
-            raise ValueError("feature lookback_end is after captured_at")
+            raise PregameTimingError(
+                "feature lookback_end is after captured_at"
+            )
 
         for observation_id in feature_provenance.observation_ids:
             if observation_id not in observations:
-                raise ValueError(
+                raise PregameRelationshipError(
                     "missing observation_id referenced by feature: "
                     f"{observation_id}"
                 )
@@ -229,7 +243,7 @@ def validate_pregame_input(game: NormalizedGameInput) -> ValidationResult:
             if available_at is None:
                 unknown_available_at = True
             elif available_at > game.captured_at:
-                raise ValueError(
+                raise PregameTimingError(
                     f"observation {observation_id} available_at is after "
                     "captured_at"
                 )
