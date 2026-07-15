@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 import analysis.operator.cli as cli_module
-from analysis.operator.bundles import DEFAULT_BUNDLE_ROOT, ManagedBundleCopy
+from analysis.operator.bundles import ManagedBundleCopy
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorIOError,
@@ -23,7 +23,6 @@ from analysis.operator.schemas import (
     parse_projected_bundle_json,
     parse_review_bundle_json,
 )
-from analysis.operator.service import DEFAULT_LEDGER_PATH, DEFAULT_REPORT_DIR
 from tests.test_operator_schemas import (
     _raw,
     confirmed_bundle_mapping,
@@ -93,6 +92,7 @@ class _ReviewResult:
 
 
 runner = CliRunner()
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:
@@ -182,11 +182,17 @@ def test_commands_use_default_paths(
 
     assert result.exit_code == 0, result.output
     expected = {
-        "ledger_path": DEFAULT_LEDGER_PATH,
-        "bundle_root": DEFAULT_BUNDLE_ROOT,
+        "ledger_path": (
+            REPOSITORY_ROOT / "data" / "ledger" / "shadow.jsonl"
+        ),
+        "bundle_root": (
+            REPOSITORY_ROOT / "data" / "shadow" / "bundles"
+        ),
     }
     if command == "review":
-        expected["report_dir"] = DEFAULT_REPORT_DIR
+        expected["report_dir"] = (
+            REPOSITORY_ROOT / "reports" / "private" / "shadow"
+        )
     assert calls == [(loaded_bundle, expected)]
 
 
@@ -411,16 +417,26 @@ def test_unexpected_exception_exits_one_without_traceback(
     assert "Traceback" not in result.output
 
 
-@pytest.mark.parametrize(
-    "arguments",
-    (
-        ["projected"],
+@pytest.mark.parametrize("command", ("projected", "confirmed", "review"))
+def test_missing_required_bundle_exits_two(command: str) -> None:
+    result = runner.invoke(cli_module.app, [command])
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+
+
+def test_unknown_option_exits_two() -> None:
+    result = runner.invoke(
+        cli_module.app,
         ["projected", "--bundle", "input.json", "--unknown-option"],
-        [],
-    ),
-)
-def test_native_usage_errors_exit_two(arguments: list[str]) -> None:
-    result = runner.invoke(cli_module.app, arguments)
+    )
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+
+
+def test_no_args_exits_two() -> None:
+    result = runner.invoke(cli_module.app, [])
 
     assert result.exit_code == 2
     assert "Traceback" not in result.output
@@ -429,7 +445,7 @@ def test_native_usage_errors_exit_two(arguments: list[str]) -> None:
 def test_module_entry_point_help_smoke() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "analysis.operator", "--help"],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=REPOSITORY_ROOT,
         check=False,
         capture_output=True,
         text=True,
@@ -440,3 +456,17 @@ def test_module_entry_point_help_smoke() -> None:
     assert "projected" in output
     assert "confirmed" in output
     assert "review" in output
+
+
+def test_module_entry_point_no_args_exits_two_without_traceback() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "analysis.operator"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 2, output
+    assert "Traceback" not in output
