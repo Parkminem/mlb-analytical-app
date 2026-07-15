@@ -2,6 +2,7 @@
 
 from .service import (
     DEFAULT_LEDGER_PATH,
+    DEFAULT_REPORT_DIR,
     PregameRunResult,
     ReviewRunResult,
     run_confirmed,
@@ -11,6 +12,7 @@ from .service import (
 
 __all__ = (
     "DEFAULT_LEDGER_PATH",
+    "DEFAULT_REPORT_DIR",
     "PregameRunResult",
     "ReviewRunResult",
     "run_confirmed",

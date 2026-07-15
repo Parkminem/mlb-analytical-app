@@ -31,6 +31,10 @@ from analysis.ledger import (
     ReviewRecord,
 )
 from analysis.review import build_and_record_review
+from analysis.review.calibration import (
+    build_calibration_report,
+    select_primary_rows,
+)
 from analysis.shadow import (
     ShadowRunIdempotencyKeys,
     build_shadow_capture_command,
@@ -50,6 +54,11 @@ from .errors import (
     OperatorIOError,
     OperatorLedgerError,
     OperatorPreconditionError,
+)
+from .reporting import (
+    DEFAULT_REPORT_DIR,
+    build_report_mapping,
+    write_calibration_reports,
 )
 from .schemas import ConfirmedBundle, ProjectedBundle, ReviewBundle
 
@@ -101,12 +110,26 @@ class ReviewRunResult:
     official_result_replayed: bool
     review_replay_count: int
     classification_counts: Mapping[str, int]
+    calibration_json_path: Path
+    calibration_markdown_path: Path
+    calibration_sample_size: int
+    confirmed_game_count: int
+    confirmed_decision_count: int
+    confirmed_decision_counts: Mapping[str, int]
 
 
 @dataclass(frozen=True)
 class _ClosingPreflight:
     existing: MarketObservationRecord | None
     expected_latest_record_id: str | None
+
+
+@dataclass(frozen=True)
+class _LedgerSnapshot:
+    records: tuple[object, ...]
+
+    def iter_records(self):
+        return iter(self.records)
 
 
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
@@ -906,11 +929,62 @@ def _classification_count_mapping(
     return MappingProxyType(counts)
 
 
+def _calibration_report_state(
+    store: LedgerStore,
+    ledger_path: str | Path,
+) -> tuple[dict[str, object], int, int, Mapping[str, int]]:
+    try:
+        ledger_records = tuple(store.iter_records())
+        rows = select_primary_rows(_LedgerSnapshot(ledger_records))
+        report = build_calibration_report(rows)
+        mapping = build_report_mapping(
+            ledger_path=ledger_path,
+            ledger_records=ledger_records,
+            rows=rows,
+            report=report,
+        )
+    except _LEDGER_ERRORS as error:
+        raise OperatorLedgerError(
+            f"unable to build calibration report: {error}"
+        ) from error
+    except OSError as error:
+        raise OperatorIOError(
+            f"unable to build calibration report: {error}"
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise OperatorLedgerError(
+            f"unable to build calibration report: {error}"
+        ) from error
+
+    overall = mapping["overall"]
+    migration = mapping["migration"]
+    if not isinstance(overall, Mapping) or not isinstance(migration, Mapping):
+        raise AssertionError("calibration report mapping has invalid sections")
+    confirmed_games = migration["confirmed_games"]
+    market_types = migration["market_types"]
+    if not isinstance(confirmed_games, Mapping) or not isinstance(
+        market_types, Mapping
+    ):
+        raise AssertionError("calibration migration mapping has invalid sections")
+    decision_counts = {
+        market_type: int(progress["count"])
+        for market_type, progress in market_types.items()
+        if isinstance(progress, Mapping)
+    }
+    return (
+        mapping,
+        int(overall["sample_size"]),
+        int(confirmed_games["count"]),
+        MappingProxyType(decision_counts),
+    )
+
+
 def run_review(
     bundle: ReviewBundle,
     *,
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
     bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
+    report_dir: str | Path = DEFAULT_REPORT_DIR,
 ) -> ReviewRunResult:
     """Append or replay one official result and its exact frozen reviews."""
 
@@ -990,6 +1064,16 @@ def run_review(
 
     frozen_reviews = tuple(review_records)
     managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+    (
+        calibration_mapping,
+        calibration_sample_size,
+        confirmed_game_count,
+        confirmed_decision_counts,
+    ) = _calibration_report_state(store, ledger_path)
+    report_artifacts = write_calibration_reports(
+        calibration_mapping,
+        report_dir=report_dir,
+    )
     return ReviewRunResult(
         stage="review",
         game_pk=bundle.game_pk,
@@ -1004,11 +1088,18 @@ def run_review(
         official_result_replayed=existing_result is not None,
         review_replay_count=review_replay_count,
         classification_counts=_classification_count_mapping(frozen_reviews),
+        calibration_json_path=report_artifacts.json_path,
+        calibration_markdown_path=report_artifacts.markdown_path,
+        calibration_sample_size=calibration_sample_size,
+        confirmed_game_count=confirmed_game_count,
+        confirmed_decision_count=sum(confirmed_decision_counts.values()),
+        confirmed_decision_counts=confirmed_decision_counts,
     )
 
 
 __all__ = (
     "DEFAULT_LEDGER_PATH",
+    "DEFAULT_REPORT_DIR",
     "PregameRunResult",
     "ReviewRunResult",
     "run_confirmed",
