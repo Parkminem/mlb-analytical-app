@@ -23,6 +23,7 @@ from analysis.ledger import (
     CaptureForecastLink,
     CaptureRecord,
     ForecastRecord,
+    LedgerHeadChangedError,
     LedgerStore,
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
@@ -182,6 +183,12 @@ class TrackingStore:
     def link_capture_forecast(self, *args, **kwargs):
         self.calls.append("link")
         return self.store.link_capture_forecast(*args, **kwargs)
+
+
+class LegacyCaptureSignatureStore(TrackingStore):
+    def append_capture(self, idempotency_key, command):
+        self.calls.append("capture")
+        return self.store.append_capture(idempotency_key, command)
 
 
 class FailOnceAfterAppendStore(TrackingStore):
@@ -805,6 +812,35 @@ class ShadowRecordingTests(unittest.TestCase):
             len(tuple(self.store.iter_records("capture_forecast_link"))),
             1,
         )
+
+    def test_recording_omits_expected_head_for_legacy_store_signature(
+        self,
+    ) -> None:
+        tracking = LegacyCaptureSignatureStore(self.store)
+
+        result = self.record(store=tracking)
+
+        self.assertEqual(tracking.calls, ["capture", "forecast", "link"])
+        self.assertEqual(result.capture.game_pk, self.game.identity.game_pk)
+
+    def test_recording_forwards_explicit_expected_head(self) -> None:
+        existing = self.store.append_capture(
+            "capture:existing-head",
+            build_shadow_capture_command(self.game),
+        )
+
+        with self.assertRaisesRegex(
+            LedgerHeadChangedError,
+            existing.capture_id,
+        ):
+            record_shadow_run(
+                self.store,
+                self.game,
+                self.legacy,
+                self.forecast,
+                self.keys("expected-head"),
+                expected_active_capture_id=None,
+            )
 
     def test_recording_preserves_candidate_market_mismatch_state(self) -> None:
         mismatched_binding = replace(

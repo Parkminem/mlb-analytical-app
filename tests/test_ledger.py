@@ -27,6 +27,7 @@ from analysis.ledger import (
     ReviewCommand,
     ReviewRecord,
     LedgerCorruptionError,
+    LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
     RecordEnvelope,
@@ -449,6 +450,69 @@ class LedgerStoreTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(len(tuple(store.iter_records("capture"))), 1)
             self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_capture_append_without_expected_head_keeps_legacy_behavior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+
+            first = store.append_capture("capture:legacy:1", capture_command())
+            second = store.append_capture(
+                "capture:legacy:2",
+                capture_command(
+                    captured_at=CAPTURED_AT + timedelta(minutes=1),
+                    payload={"revision": 2},
+                ),
+            )
+
+            self.assertIsNone(first.supersedes_capture_id)
+            self.assertIsNone(second.supersedes_capture_id)
+            self.assertEqual(len(tuple(store.iter_records("capture"))), 2)
+
+    def test_capture_append_expected_head_is_checked_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            first = store.append_capture("capture:head:1", capture_command())
+
+            with self.assertRaisesRegex(
+                LedgerHeadChangedError,
+                first.capture_id,
+            ):
+                store.append_capture(
+                    "capture:head:2",
+                    capture_command(
+                        captured_at=CAPTURED_AT + timedelta(minutes=1),
+                        payload={"revision": 2},
+                    ),
+                    expected_active_capture_id=None,
+                )
+
+            self.assertEqual(len(tuple(store.iter_records("capture"))), 1)
+
+    def test_exact_capture_replay_returns_before_expected_head_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            command = capture_command()
+            original = store.append_capture("capture:replay", command)
+            store.append_capture(
+                "capture:new-head",
+                capture_command(
+                    captured_at=CAPTURED_AT + timedelta(minutes=1),
+                    payload={"revision": 2},
+                ),
+            )
+
+            replay = store.append_capture(
+                "capture:replay",
+                command,
+                expected_active_capture_id=None,
+            )
+
+            self.assertEqual(replay, original)
+            self.assertEqual(len(tuple(store.iter_records("capture"))), 2)
 
     def test_same_capture_key_with_different_payload_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

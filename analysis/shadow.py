@@ -181,6 +181,13 @@ _BASE_COMPONENT_SUFFIXES = (
 )
 
 
+class _ExpectedActiveCaptureIdUnset:
+    __slots__ = ()
+
+
+_EXPECTED_ACTIVE_CAPTURE_ID_UNSET = _ExpectedActiveCaptureIdUnset()
+
+
 def _is_finite_number(value: object) -> bool:
     return (
         not isinstance(value, bool)
@@ -1671,6 +1678,9 @@ def record_shadow_run(
     idempotency_keys: ShadowRunIdempotencyKeys,
     *,
     supersedes_capture_id: str | None = None,
+    expected_active_capture_id: (
+        str | None | _ExpectedActiveCaptureIdUnset
+    ) = _EXPECTED_ACTIVE_CAPTURE_ID_UNSET,
 ) -> ShadowRunRecords:
     """Append or replay capture, capture-independent forecast, and link."""
 
@@ -1715,7 +1725,14 @@ def record_shadow_run(
         outputs=_forecast_outputs(forecast, comparison),
     )
 
-    capture = store.append_capture(idempotency_keys.capture, capture_command)
+    if expected_active_capture_id is _EXPECTED_ACTIVE_CAPTURE_ID_UNSET:
+        capture = store.append_capture(idempotency_keys.capture, capture_command)
+    else:
+        capture = store.append_capture(
+            idempotency_keys.capture,
+            capture_command,
+            expected_active_capture_id=expected_active_capture_id,
+        )
     forecast_record = store.append_forecast(forecast_command)
     link = store.link_capture_forecast(
         capture.capture_id,

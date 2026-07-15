@@ -1,12 +1,8 @@
 """Projected and confirmed pregame shadow-run orchestration."""
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
-import fcntl
-import os
 from pathlib import Path
-import stat
 from typing import TypeVar
 
 from analysis.forecasting import LineupState, run_forecast
@@ -22,6 +18,7 @@ from analysis.ledger import (
     ForecastRecord,
     IdempotencyConflict,
     LedgerCorruptionError,
+    LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
 )
@@ -53,6 +50,7 @@ DEFAULT_LEDGER_PATH = (
 
 _Bundle = ProjectedBundle | ConfirmedBundle
 _T = TypeVar("_T")
+_HEAD_CAS_MAX_ATTEMPTS = 3
 _LEDGER_ERRORS = (
     IdempotencyConflict,
     LedgerCorruptionError,
@@ -79,150 +77,12 @@ class PregameRunResult:
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
     try:
         return operation()
+    except LedgerHeadChangedError:
+        raise
     except _LEDGER_ERRORS as error:
         raise OperatorLedgerError(f"{label}: {error}") from error
     except OSError as error:
         raise OperatorIOError(f"{label}: {error}") from error
-
-
-def _validate_operator_lock(
-    directory_descriptor: int,
-    lock_descriptor: int,
-    lock_name: str,
-) -> None:
-    descriptor_stat = os.fstat(lock_descriptor)
-    path_stat = os.stat(
-        lock_name,
-        dir_fd=directory_descriptor,
-        follow_symlinks=False,
-    )
-    if (
-        not stat.S_ISREG(descriptor_stat.st_mode)
-        or not stat.S_ISREG(path_stat.st_mode)
-        or (descriptor_stat.st_dev, descriptor_stat.st_ino)
-        != (path_stat.st_dev, path_stat.st_ino)
-        or descriptor_stat.st_nlink > 1
-    ):
-        raise OperatorIOError(
-            "operator lock path must be one stable regular file"
-        )
-
-
-def _open_operator_lock_file(
-    directory_descriptor: int,
-    lock_name: str,
-    lock_flags: int,
-) -> int:
-    last_error: FileNotFoundError | None = None
-    for _ in range(3):
-        try:
-            return os.open(
-                lock_name,
-                lock_flags,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
-        except FileNotFoundError as error:
-            last_error = error
-    if last_error is None:
-        raise RuntimeError("operator lock retry exited without an error")
-    raise last_error
-
-
-def _close_operator_lock_descriptors(
-    lock_descriptor: int,
-    directory_descriptor: int,
-) -> OSError | None:
-    close_error: OSError | None = None
-    for descriptor in (lock_descriptor, directory_descriptor):
-        if descriptor < 0:
-            continue
-        try:
-            os.close(descriptor)
-        except OSError as error:
-            if close_error is None:
-                close_error = error
-    return close_error
-
-
-@contextmanager
-def _operator_advisory_lock(ledger_path: str | Path) -> Iterator[None]:
-    """Serialize pregame read-select-append transactions for one ledger."""
-
-    directory_descriptor = -1
-    lock_descriptor = -1
-    lock_acquired = False
-    try:
-        resolved_ledger = Path(ledger_path).expanduser().resolve(strict=False)
-        parent = resolved_ledger.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        directory_flags = os.O_RDONLY
-        directory_flags |= getattr(os, "O_CLOEXEC", 0)
-        directory_flags |= getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-        directory_descriptor = os.open(parent, directory_flags)
-
-        lock_name = f"{resolved_ledger.name}.operator.lock"
-        lock_flags = os.O_CREAT | os.O_RDWR
-        lock_flags |= getattr(os, "O_CLOEXEC", 0)
-        lock_flags |= getattr(os, "O_NOFOLLOW", 0)
-        lock_descriptor = _open_operator_lock_file(
-            directory_descriptor,
-            lock_name,
-            lock_flags,
-        )
-        _validate_operator_lock(
-            directory_descriptor,
-            lock_descriptor,
-            lock_name,
-        )
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        lock_acquired = True
-        _validate_operator_lock(
-            directory_descriptor,
-            lock_descriptor,
-            lock_name,
-        )
-    except OperatorIOError:
-        _close_operator_lock_descriptors(
-            lock_descriptor,
-            directory_descriptor,
-        )
-        raise
-    except OSError as error:
-        _close_operator_lock_descriptors(
-            lock_descriptor,
-            directory_descriptor,
-        )
-        raise OperatorIOError(
-            f"unable to acquire operator lock for {ledger_path}: {error}"
-        ) from error
-
-    body_failed = False
-    try:
-        yield
-    except BaseException:
-        body_failed = True
-        raise
-    finally:
-        release_error: OSError | None = None
-        try:
-            if lock_acquired:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        except OSError as error:
-            release_error = error
-        finally:
-            close_error = _close_operator_lock_descriptors(
-                lock_descriptor,
-                directory_descriptor,
-            )
-            if release_error is None:
-                release_error = close_error
-        if release_error is not None and not body_failed:
-            raise OperatorIOError(
-                f"unable to release operator lock for {ledger_path}: "
-                f"{release_error}"
-            ) from release_error
 
 
 def _pregame_operation(operation: Callable[[], _T]) -> _T:
@@ -417,10 +277,11 @@ def _run_pregame(
         lambda: run_forecast(bundle.payload.game_input, config)
     )
 
-    with _operator_advisory_lock(ledger_path):
-        store = _open_ledger(ledger_path)
+    store = _open_ledger(ledger_path)
+    for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
         captures = _captures(store)
         existing_capture = _existing_keyed_capture(captures, capture_key)
+        active_head = _latest_active_capture(captures, bundle.game_pk)
         supersedes_capture_id = _resolve_supersession_target(
             stage=expected_stage,
             captures=captures,
@@ -432,19 +293,36 @@ def _run_pregame(
             existing_capture=existing_capture,
             forecast_run_id=forecast.forecast_run_id,
         )
-        records = _pregame_operation(
-            lambda: _ledger_operation(
-                "unable to record shadow pregame run",
-                lambda: record_shadow_run(
-                    store,
-                    bundle.payload.game_input,
-                    bundle.payload.legacy_decision,
-                    forecast,
-                    ShadowRunIdempotencyKeys(capture=capture_key),
-                    supersedes_capture_id=supersedes_capture_id,
-                ),
+        try:
+            records = _pregame_operation(
+                lambda: _ledger_operation(
+                    "unable to record shadow pregame run",
+                    lambda: record_shadow_run(
+                        store,
+                        bundle.payload.game_input,
+                        bundle.payload.legacy_decision,
+                        forecast,
+                        ShadowRunIdempotencyKeys(capture=capture_key),
+                        supersedes_capture_id=supersedes_capture_id,
+                        expected_active_capture_id=(
+                            None
+                            if active_head is None
+                            else active_head.capture_id
+                        ),
+                    ),
+                )
             )
-        )
+        except LedgerHeadChangedError as error:
+            if attempt + 1 == _HEAD_CAS_MAX_ATTEMPTS:
+                raise OperatorLedgerError(
+                    "unable to record shadow pregame run: active capture "
+                    f"head changed after {_HEAD_CAS_MAX_ATTEMPTS} attempts: "
+                    f"{error}"
+                ) from error
+            continue
+        break
+    else:
+        raise RuntimeError("pregame head CAS retry loop exited unexpectedly")
     managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
     return PregameRunResult(
         stage=expected_stage,

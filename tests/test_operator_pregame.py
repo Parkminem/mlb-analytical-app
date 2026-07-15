@@ -1,8 +1,6 @@
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 from pathlib import Path
-import threading
 
 import pytest
 
@@ -25,6 +23,7 @@ from analysis.forecasting.validation import (
 from analysis.ledger import (
     IdempotencyConflict,
     LedgerCorruptionError,
+    LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
 )
@@ -636,43 +635,42 @@ def test_postgame_successor_deactivates_pregame_supersession_target(
     assert result.capture.supersedes_capture_id is None
 
 
-def test_concurrent_projected_runs_serialize_head_selection(
+def test_projected_run_retries_when_head_changes_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
-    base_game = _projected_game()
-    bundles = tuple(
-        _pregame_bundle(
-            "projected",
-            replace(
-                base_game,
-                captured_at=base_game.captured_at + timedelta(minutes=offset),
-            ),
-        )
-        for offset in (1, 2)
+    game = _projected_game()
+    bundle = _pregame_bundle(
+        "projected",
+        replace(game, captured_at=game.captured_at + timedelta(minutes=1)),
     )
-    original_forecast = service_module.run_forecast
-    forecast_barrier = threading.Barrier(2)
+    original_record = service_module.record_shadow_run
+    attempts = 0
+    interloper_capture_id = None
 
-    def synchronized_forecast(*args, **kwargs):
-        forecast = original_forecast(*args, **kwargs)
-        forecast_barrier.wait(timeout=5)
-        return forecast
-
-    monkeypatch.setattr(service_module, "run_forecast", synchronized_forecast)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = tuple(
-            executor.submit(
-                run_projected,
-                bundle,
-                ledger_path=ledger_path,
-                bundle_root=bundle_root,
+    def change_head_then_record(store, game_input, *args, **kwargs):
+        nonlocal attempts, interloper_capture_id
+        attempts += 1
+        if attempts == 1:
+            interloper = store.append_capture(
+                "manual:interloper",
+                build_shadow_capture_command(game_input),
             )
-            for bundle in bundles
-        )
-        results = tuple(future.result(timeout=10) for future in futures)
+            interloper_capture_id = interloper.capture_id
+        return original_record(store, game_input, *args, **kwargs)
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        change_head_then_record,
+    )
+
+    result = run_projected(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
 
     captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
     superseded_ids = frozenset(
@@ -685,10 +683,39 @@ def test_concurrent_projected_runs_serialize_head_selection(
         for capture in captures
         if capture.capture_id not in superseded_ids
     )
-    assert len(results) == 2
+    assert attempts == 2
     assert len(captures) == 2
     assert len(active) == 1
+    assert result.capture.supersedes_capture_id == interloper_capture_id
     assert sum(capture.supersedes_capture_id is None for capture in captures) == 1
+
+
+def test_projected_run_maps_repeated_head_changes_to_operator_ledger_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    attempts = 0
+
+    def fail_with_head_change(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise LedgerHeadChangedError("active capture head changed")
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        fail_with_head_change,
+    )
+
+    with pytest.raises(OperatorLedgerError, match="head changed"):
+        run_projected(
+            _pregame_bundle("projected", _projected_game()),
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    assert attempts == 3
 
 
 @pytest.mark.parametrize(
@@ -758,28 +785,6 @@ def test_ledger_append_filesystem_error_maps_to_operator_io(
             ledger_path=ledger_path,
             bundle_root=bundle_root,
         )
-
-
-def test_operator_lock_rejects_symlink_without_following_it(
-    tmp_path: Path,
-) -> None:
-    ledger_path, bundle_root = _run_paths(tmp_path)
-    ledger_path.parent.mkdir(parents=True)
-    outside = tmp_path / "outside.lock"
-    outside.write_text("outside", encoding="utf-8")
-    operator_lock = ledger_path.with_name(
-        f"{ledger_path.name}.operator.lock"
-    )
-    operator_lock.symlink_to(outside)
-
-    with pytest.raises(OperatorIOError, match="operator lock"):
-        run_projected(
-            _pregame_bundle("projected", _projected_game()),
-            ledger_path=ledger_path,
-            bundle_root=bundle_root,
-        )
-
-    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 @pytest.mark.parametrize(

@@ -55,6 +55,17 @@ class LedgerReferenceError(ValueError):
     """Raised when an append references a missing or mismatched record."""
 
 
+class LedgerHeadChangedError(LedgerReferenceError):
+    """Raised when the active pregame capture changed before append."""
+
+
+class _ExpectedActiveCaptureIdUnset:
+    __slots__ = ()
+
+
+_EXPECTED_ACTIVE_CAPTURE_ID_UNSET = _ExpectedActiveCaptureIdUnset()
+
+
 _F5_MARKET_TYPES = frozenset(("f5_side", "f5_total"))
 _FULL_MARKET_TYPES = frozenset(("ml", "plus_1_5", "full_total"))
 _CONVERSION_PATHS = frozenset(
@@ -1013,9 +1024,25 @@ class LedgerStore:
         self,
         idempotency_key: str,
         command: CaptureCommand,
+        *,
+        expected_active_capture_id: (
+            str | None | _ExpectedActiveCaptureIdUnset
+        ) = _EXPECTED_ACTIVE_CAPTURE_ID_UNSET,
     ) -> CaptureRecord:
         if not isinstance(command, CaptureCommand):
             raise TypeError("command must be CaptureCommand")
+        if (
+            expected_active_capture_id
+            is not _EXPECTED_ACTIVE_CAPTURE_ID_UNSET
+            and expected_active_capture_id is not None
+            and (
+                not isinstance(expected_active_capture_id, str)
+                or not expected_active_capture_id.strip()
+            )
+        ):
+            raise ValueError(
+                "expected_active_capture_id must be None or a non-empty string"
+            )
 
         def validate(records: tuple[_RecordT, ...]) -> None:
             captures_by_id = {
@@ -1028,6 +1055,49 @@ class LedgerStore:
                 for record in captures_by_id.values()
                 if record.supersedes_capture_id is not None
             }
+            if (
+                expected_active_capture_id
+                is not _EXPECTED_ACTIVE_CAPTURE_ID_UNSET
+            ):
+                game_captures = tuple(
+                    record
+                    for record in captures_by_id.values()
+                    if record.game_pk == command.game_pk
+                )
+                game_supersession_targets = frozenset(
+                    record.supersedes_capture_id
+                    for record in game_captures
+                    if record.supersedes_capture_id is not None
+                )
+                active_pregame = tuple(
+                    record
+                    for record in game_captures
+                    if record.captured_at < record.first_pitch
+                    if record.capture_id not in game_supersession_targets
+                )
+                latest_active = (
+                    max(
+                        active_pregame,
+                        key=lambda record: (
+                            record.captured_at,
+                            record.envelope.appended_at,
+                            record.envelope.record_id,
+                        ),
+                    )
+                    if active_pregame
+                    else None
+                )
+                actual_active_capture_id = (
+                    None
+                    if latest_active is None
+                    else latest_active.capture_id
+                )
+                if actual_active_capture_id != expected_active_capture_id:
+                    raise LedgerHeadChangedError(
+                        "active pregame capture head changed: expected "
+                        f"{expected_active_capture_id!r}, found "
+                        f"{actual_active_capture_id!r}"
+                    )
             if command.supersedes_capture_id is not None:
                 superseded = captures_by_id.get(command.supersedes_capture_id)
                 if superseded is None:
@@ -1503,6 +1573,7 @@ class LedgerStore:
 __all__ = (
     "IdempotencyConflict",
     "LedgerCorruptionError",
+    "LedgerHeadChangedError",
     "LedgerReferenceError",
     "LedgerStore",
 )
