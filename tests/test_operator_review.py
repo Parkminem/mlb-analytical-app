@@ -295,6 +295,28 @@ def _records(context: ReviewContext, kind: str) -> tuple[object, ...]:
     return tuple(LedgerStore(context.ledger_path).iter_records(kind))
 
 
+def _supersede_confirmed_capture(
+    context: ReviewContext,
+    store: LedgerStore,
+    suffix: str,
+):
+    capture = context.confirmed.capture
+    return store.append_capture(
+        f"capture:concurrent:{suffix}",
+        CaptureCommand(
+            game_pk=capture.game_pk,
+            captured_at=capture.captured_at + timedelta(seconds=1),
+            first_pitch=capture.first_pitch,
+            lineup_state="confirmed",
+            out_of_sample_eligible=capture.out_of_sample_eligible,
+            normalized_input_hash=capture.normalized_input_hash,
+            payload=capture.payload,
+            supersedes_capture_id=capture.capture_id,
+        ),
+        expected_active_capture_id=capture.capture_id,
+    )
+
+
 def test_run_review_records_exact_confirmed_result_closing_and_all_eligible_markets(
     review_context: ReviewContext,
 ) -> None:
@@ -347,6 +369,32 @@ def test_exact_review_retry_replays_every_record_and_managed_bundle(
     assert len(_records(review_context, "market_observation")) == 1
     assert len(_records(review_context, "official_result")) == 1
     assert len(_records(review_context, "review")) == 2
+
+
+def test_completed_reviews_replay_after_a_newer_result_correction(
+    review_context: ReviewContext,
+) -> None:
+    first = _run(review_context)
+    correction = replace(
+        review_context.bundle.payload.official_result,
+        source_revision="final-2",
+        finalized_at=(
+            review_context.bundle.payload.official_result.finalized_at
+            + timedelta(minutes=10)
+        ),
+        supersedes_record_id=first.official_result.envelope.record_id,
+    )
+    store = LedgerStore(review_context.ledger_path)
+    corrected_result = store.append_official_result(correction)
+
+    replay = _run(review_context)
+
+    assert replay.official_result == first.official_result
+    assert replay.reviews == first.reviews
+    assert replay.official_result_replayed is True
+    assert replay.review_replay_count == len(first.reviews)
+    assert store.latest_official_result(replay.game_pk) == corrected_result
+    assert len(_records(review_context, "review")) == len(first.reviews)
 
 
 @pytest.mark.parametrize(
@@ -773,13 +821,126 @@ def test_existing_key_still_uses_store_hash_validation_for_close_and_result(
         _run(review_context, changed_result)
 
 
+def test_concurrent_closing_head_change_is_retried_without_forking(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LedgerStore.append_market_observation
+    injected = False
+
+    def append_after_competing_close(
+        self,
+        command,
+        idempotency_key=None,
+        **kwargs,
+    ):
+        nonlocal injected
+        if not injected:
+            injected = True
+            original(
+                self,
+                replace(
+                    command,
+                    source_revision="concurrent-close",
+                    selected_decimal_price=2.05,
+                    opposing_decimal_price=1.79,
+                ),
+            )
+        return original(self, command, idempotency_key, **kwargs)
+
+    monkeypatch.setattr(
+        LedgerStore,
+        "append_market_observation",
+        append_after_competing_close,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="explicitly supersede|current latest",
+    ):
+        _run(review_context)
+
+    closes = _records(review_context, "market_observation")
+    assert len(closes) == 1
+    assert closes[0].source_revision == "concurrent-close"
+    assert not _records(review_context, "official_result")
+    assert not _records(review_context, "review")
+
+
+def test_capture_supersession_before_result_append_prevents_result_write(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LedgerStore.append_official_result
+    injected = False
+    bundle = parse_review_bundle_json(
+        _raw(_review_mapping(review_context.confirmed, with_close=False))
+    )
+
+    def append_after_capture_supersession(
+        self,
+        command,
+        idempotency_key=None,
+        **kwargs,
+    ):
+        nonlocal injected
+        if not injected:
+            injected = True
+            _supersede_confirmed_capture(review_context, self, "before-result")
+        return original(self, command, idempotency_key, **kwargs)
+
+    monkeypatch.setattr(
+        LedgerStore,
+        "append_official_result",
+        append_after_capture_supersession,
+    )
+
+    with pytest.raises(OperatorPreconditionError, match="active.*capture"):
+        _run(review_context, bundle)
+
+    assert not _records(review_context, "official_result")
+    assert not _records(review_context, "review")
+
+
+def test_capture_supersession_before_review_append_prevents_review_write(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LedgerStore.append_review
+    injected = False
+
+    def append_after_capture_supersession(
+        self,
+        command,
+        idempotency_key=None,
+        **kwargs,
+    ):
+        nonlocal injected
+        if not injected:
+            injected = True
+            _supersede_confirmed_capture(review_context, self, "before-review")
+        return original(self, command, idempotency_key, **kwargs)
+
+    monkeypatch.setattr(
+        LedgerStore,
+        "append_review",
+        append_after_capture_supersession,
+    )
+
+    with pytest.raises(OperatorPreconditionError, match="active.*capture"):
+        _run(review_context)
+
+    assert len(_records(review_context, "official_result")) == 1
+    assert not _records(review_context, "review")
+
+
 def test_partial_retry_after_close_append_completes_without_duplicates(
     review_context: ReviewContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = LedgerStore.append_official_result
 
-    def interrupt(self, command, idempotency_key=None):
+    def interrupt(self, command, idempotency_key=None, **kwargs):
         raise OSError("interrupted after close")
 
     monkeypatch.setattr(LedgerStore, "append_official_result", interrupt)
@@ -809,7 +970,13 @@ def test_partial_retry_after_result_and_one_review_completes_all_sorted_reviews(
 ) -> None:
     calls: list[str] = []
 
-    def interrupt_second(store, link_record_id, result_record_id, market_key):
+    def interrupt_second(
+        store,
+        link_record_id,
+        result_record_id,
+        market_key,
+        **kwargs,
+    ):
         calls.append(market_key)
         if len(calls) == 2:
             raise OSError("interrupted during reviews")
@@ -818,6 +985,7 @@ def test_partial_retry_after_result_and_one_review_completes_all_sorted_reviews(
             link_record_id,
             result_record_id,
             market_key,
+            **kwargs,
         )
 
     monkeypatch.setattr(

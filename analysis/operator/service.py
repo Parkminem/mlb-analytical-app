@@ -18,8 +18,10 @@ from analysis.ledger import (
     CaptureRecord,
     ForecastRecord,
     IdempotencyConflict,
+    LedgerActiveCaptureHeadChangedError,
     LedgerCorruptionError,
     LedgerHeadChangedError,
+    LedgerMarketHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
     MarketObservationCommand,
@@ -99,6 +101,12 @@ class ReviewRunResult:
     official_result_replayed: bool
     review_replay_count: int
     classification_counts: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class _ClosingPreflight:
+    existing: MarketObservationRecord | None
+    expected_latest_record_id: str | None
 
 
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
@@ -498,16 +506,16 @@ def _require_frozen_review_relationships(
         raise OperatorPreconditionError(
             "frozen capture and forecast normalized_input_hash must match"
         )
-    superseded_capture_ids = frozenset(
-        record.supersedes_capture_id
-        for record in records
-        if isinstance(record, CaptureRecord)
-        and record.game_pk == capture.game_pk
-        and record.supersedes_capture_id is not None
+    latest_active = _latest_active_capture(
+        tuple(
+            record for record in records if isinstance(record, CaptureRecord)
+        ),
+        capture.game_pk,
     )
-    if capture.capture_id in superseded_capture_ids:
+    if latest_active is None or latest_active.capture_id != capture.capture_id:
         raise OperatorPreconditionError(
-            "review requires the exact frozen capture to remain active"
+            "review requires the exact frozen capture to remain the latest active "
+            "pregame capture"
         )
 
 
@@ -706,7 +714,7 @@ def _latest_result_record(
 def _preflight_closing_lineage(
     records: tuple[object, ...],
     command: MarketObservationCommand,
-) -> MarketObservationRecord | None:
+) -> _ClosingPreflight:
     existing = _record_with_key(
         records,
         MarketObservationRecord,
@@ -722,7 +730,7 @@ def _preflight_closing_lineage(
             raise OperatorLedgerError(
                 "stored closing observation supersedes itself"
             )
-        return existing
+        return _ClosingPreflight(existing, original_target)
 
     latest = _latest_closing_observation(records, command)
     if latest is None:
@@ -730,7 +738,7 @@ def _preflight_closing_lineage(
             raise OperatorPreconditionError(
                 "initial closing observation supersession target must be null"
             )
-        return None
+        return _ClosingPreflight(None, None)
     if command.supersedes_record_id is None:
         raise OperatorPreconditionError(
             "closing observation correction must explicitly supersede the "
@@ -741,7 +749,7 @@ def _preflight_closing_lineage(
             "closing observation correction supersession target must be the "
             "current latest record"
         )
-    return None
+    return _ClosingPreflight(None, latest.envelope.record_id)
 
 
 def _preflight_result_lineage(
@@ -786,21 +794,60 @@ def _preflight_result_lineage(
 def _append_closing_observation(
     store: LedgerStore,
     command: MarketObservationCommand,
-) -> MarketObservationRecord:
-    return _ledger_operation(
-        "unable to record closing observation",
-        lambda: store.append_market_observation(command),
-    )
+    preflight: _ClosingPreflight,
+) -> tuple[MarketObservationRecord, bool]:
+    current = preflight
+    for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
+        try:
+            record = store.append_market_observation(
+                command,
+                expected_latest_record_id=current.expected_latest_record_id,
+            )
+            return record, current.existing is not None
+        except LedgerMarketHeadChangedError as error:
+            current = _preflight_closing_lineage(
+                _review_ledger_records(store),
+                command,
+            )
+            if attempt + 1 == _HEAD_CAS_MAX_ATTEMPTS:
+                raise OperatorLedgerError(
+                    "unable to record closing observation after repeated "
+                    f"stream head changes: {error}"
+                ) from error
+        except _LEDGER_ERRORS as error:
+            raise OperatorLedgerError(
+                f"unable to record closing observation: {error}"
+            ) from error
+        except OSError as error:
+            raise OperatorIOError(
+                f"unable to record closing observation: {error}"
+            ) from error
+    raise AssertionError("closing observation CAS retry loop exhausted")
 
 
 def _append_official_result(
     store: LedgerStore,
     command: OfficialResultCommand,
+    required_active_capture_id: str,
 ) -> OfficialResultRecord:
-    return _ledger_operation(
-        "unable to record official result",
-        lambda: store.append_official_result(command),
-    )
+    try:
+        return store.append_official_result(
+            command,
+            required_active_capture_id=required_active_capture_id,
+        )
+    except LedgerActiveCaptureHeadChangedError as error:
+        raise OperatorPreconditionError(
+            "unable to record official result because the frozen active capture "
+            f"changed: {error}"
+        ) from error
+    except _LEDGER_ERRORS as error:
+        raise OperatorLedgerError(
+            f"unable to record official result: {error}"
+        ) from error
+    except OSError as error:
+        raise OperatorIOError(
+            f"unable to record official result: {error}"
+        ) from error
 
 
 def _review_idempotency_key(
@@ -820,6 +867,7 @@ def _build_exact_review(
     link: CaptureForecastLink,
     result: OfficialResultRecord,
     market_key: str,
+    required_active_capture_id: str,
 ):
     try:
         return build_and_record_review(
@@ -827,7 +875,13 @@ def _build_exact_review(
             link.envelope.record_id,
             result.envelope.record_id,
             market_key,
+            required_active_capture_id=required_active_capture_id,
         )
+    except LedgerActiveCaptureHeadChangedError as error:
+        raise OperatorPreconditionError(
+            "unable to record exact review because the frozen active capture "
+            f"changed: {error}"
+        ) from error
     except _LEDGER_ERRORS as error:
         raise OperatorLedgerError(
             f"unable to record exact review for {market_key}: {error}"
@@ -886,17 +940,26 @@ def run_review(
     for command in close_commands:
         _require_close_preconditions(command, capture)
     _require_unique_closing_streams(close_commands)
-    existing_closings = tuple(
+    closing_preflights = tuple(
         _preflight_closing_lineage(records, command)
         for command in close_commands
     )
     existing_result = _preflight_result_lineage(records, result_command)
 
-    closing_records = tuple(
-        _append_closing_observation(store, command)
-        for command in close_commands
+    closing_outcomes = tuple(
+        _append_closing_observation(store, command, preflight)
+        for command, preflight in zip(
+            close_commands,
+            closing_preflights,
+            strict=True,
+        )
     )
-    result_record = _append_official_result(store, result_command)
+    closing_records = tuple(record for record, _ in closing_outcomes)
+    result_record = _append_official_result(
+        store,
+        result_command,
+        capture.capture_id,
+    )
 
     review_records: list[ReviewRecord] = []
     review_replay_count = 0
@@ -912,14 +975,18 @@ def run_review(
                 market_key,
             ),
         )
+        if existing_review is not None:
+            review_records.append(existing_review)
+            review_replay_count += 1
+            continue
         recorded = _build_exact_review(
             store,
             link,
             result_record,
             market_key,
+            capture.capture_id,
         )
         review_records.append(recorded.record)
-        review_replay_count += existing_review is not None
 
     frozen_reviews = tuple(review_records)
     managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
@@ -933,9 +1000,7 @@ def run_review(
         official_result=result_record,
         reviews=frozen_reviews,
         managed_bundle=managed_bundle,
-        closing_replay_count=sum(
-            record is not None for record in existing_closings
-        ),
+        closing_replay_count=sum(replayed for _, replayed in closing_outcomes),
         official_result_replayed=existing_result is not None,
         review_replay_count=review_replay_count,
         classification_counts=_classification_count_mapping(frozen_reviews),

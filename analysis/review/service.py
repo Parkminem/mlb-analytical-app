@@ -56,6 +56,13 @@ _EVIDENCE_PATH_ORDER = {
 }
 
 
+class _RequiredActiveCaptureIdUnset:
+    __slots__ = ()
+
+
+_REQUIRED_ACTIVE_CAPTURE_ID_UNSET = _RequiredActiveCaptureIdUnset()
+
+
 @dataclass(frozen=True)
 class RecordedReview:
     candidate: ReviewCandidate
@@ -673,6 +680,10 @@ def build_and_record_review(
     link_record_id: str,
     result_record_id: str,
     market_key: str,
+    *,
+    required_active_capture_id: (
+        str | None | _RequiredActiveCaptureIdUnset
+    ) = _REQUIRED_ACTIVE_CAPTURE_ID_UNSET,
 ) -> RecordedReview:
     """Classify and idempotently append one review after a pure build."""
 
@@ -689,7 +700,14 @@ def build_and_record_review(
         f"review:{candidate.capture_id}:{candidate.forecast_run_id}:"
         f"{candidate.official_result_record_id}:{candidate.market_key}"
     )
-    record = store.append_review(command, idempotency_key=idempotency_key)
+    if required_active_capture_id is _REQUIRED_ACTIVE_CAPTURE_ID_UNSET:
+        record = store.append_review(command, idempotency_key=idempotency_key)
+    else:
+        record = store.append_review(
+            command,
+            idempotency_key=idempotency_key,
+            required_active_capture_id=required_active_capture_id,
+        )
     if not isinstance(record, ReviewRecord):
         raise TypeError("store.append_review must return ReviewRecord")
     return RecordedReview(

@@ -59,11 +59,26 @@ class LedgerHeadChangedError(LedgerReferenceError):
     """Raised when the active pregame capture changed before append."""
 
 
+class LedgerMarketHeadChangedError(LedgerReferenceError):
+    """Raised when a market observation stream changed before append."""
+
+
+class LedgerActiveCaptureHeadChangedError(LedgerReferenceError):
+    """Raised when a required active pregame capture is no longer latest."""
+
+
 class _ExpectedActiveCaptureIdUnset:
     __slots__ = ()
 
 
 _EXPECTED_ACTIVE_CAPTURE_ID_UNSET = _ExpectedActiveCaptureIdUnset()
+
+
+class _ExpectedLatestRecordIdUnset:
+    __slots__ = ()
+
+
+_EXPECTED_LATEST_RECORD_ID_UNSET = _ExpectedLatestRecordIdUnset()
 
 
 _F5_MARKET_TYPES = frozenset(("f5_side", "f5_total"))
@@ -514,6 +529,75 @@ def _review_relationship_error(
     return None
 
 
+def _latest_active_pregame_capture(
+    records: tuple[_RecordT, ...],
+    game_pk: int,
+) -> CaptureRecord | None:
+    game_captures = tuple(
+        record
+        for record in records
+        if isinstance(record, CaptureRecord) and record.game_pk == game_pk
+    )
+    superseded_ids = frozenset(
+        record.supersedes_capture_id
+        for record in game_captures
+        if record.supersedes_capture_id is not None
+    )
+    active_pregame = tuple(
+        record
+        for record in game_captures
+        if record.captured_at < record.first_pitch
+        if record.capture_id not in superseded_ids
+    )
+    if not active_pregame:
+        return None
+    return max(
+        active_pregame,
+        key=lambda record: (
+            record.captured_at,
+            record.envelope.appended_at,
+            record.envelope.record_id,
+        ),
+    )
+
+
+def _require_active_capture_head(
+    records: tuple[_RecordT, ...],
+    required_capture_id: str,
+    *,
+    game_pk: int | None = None,
+) -> None:
+    required_capture = next(
+        (
+            record
+            for record in records
+            if isinstance(record, CaptureRecord)
+            and record.capture_id == required_capture_id
+        ),
+        None,
+    )
+    resolved_game_pk = (
+        game_pk
+        if game_pk is not None
+        else None if required_capture is None else required_capture.game_pk
+    )
+    latest = (
+        None
+        if resolved_game_pk is None
+        else _latest_active_pregame_capture(records, resolved_game_pk)
+    )
+    actual_capture_id = None if latest is None else latest.capture_id
+    if (
+        required_capture is None
+        or required_capture.game_pk != resolved_game_pk
+        or actual_capture_id != required_capture_id
+    ):
+        raise LedgerActiveCaptureHeadChangedError(
+            "active pregame capture head changed: expected "
+            f"{required_capture_id!r}, found {actual_capture_id!r}"
+        )
+
+
 class LedgerStore:
     """A JSONL ledger whose file is the sole authoritative state."""
 
@@ -932,6 +1016,7 @@ class LedgerStore:
         logical_payload: object,
         validate: Callable[[tuple[_RecordT, ...]], None],
         build: Callable[[RecordEnvelope], _RecordT],
+        prevalidate: Callable[[tuple[_RecordT, ...]], None] | None = None,
     ) -> _RecordT:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("idempotency_key must be a non-empty string")
@@ -961,6 +1046,8 @@ class LedgerStore:
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
                     ledger_locked = True
                     records = self._read_records(descriptor)
+                    if prevalidate is not None:
+                        prevalidate(records)
                     logical_hash = _payload_hash(logical_payload)
                     for existing in records:
                         if (
@@ -1059,33 +1146,9 @@ class LedgerStore:
                 expected_active_capture_id
                 is not _EXPECTED_ACTIVE_CAPTURE_ID_UNSET
             ):
-                game_captures = tuple(
-                    record
-                    for record in captures_by_id.values()
-                    if record.game_pk == command.game_pk
-                )
-                game_supersession_targets = frozenset(
-                    record.supersedes_capture_id
-                    for record in game_captures
-                    if record.supersedes_capture_id is not None
-                )
-                active_pregame = tuple(
-                    record
-                    for record in game_captures
-                    if record.captured_at < record.first_pitch
-                    if record.capture_id not in game_supersession_targets
-                )
-                latest_active = (
-                    max(
-                        active_pregame,
-                        key=lambda record: (
-                            record.captured_at,
-                            record.envelope.appended_at,
-                            record.envelope.record_id,
-                        ),
-                    )
-                    if active_pregame
-                    else None
+                latest_active = _latest_active_pregame_capture(
+                    records,
+                    command.game_pk,
                 )
                 actual_active_capture_id = (
                     None
@@ -1226,9 +1289,25 @@ class LedgerStore:
         self,
         command: MarketObservationCommand,
         idempotency_key: str | None = None,
+        *,
+        expected_latest_record_id: (
+            str | None | _ExpectedLatestRecordIdUnset
+        ) = _EXPECTED_LATEST_RECORD_ID_UNSET,
     ) -> MarketObservationRecord:
         if not isinstance(command, MarketObservationCommand):
             raise TypeError("command must be MarketObservationCommand")
+        if (
+            expected_latest_record_id
+            is not _EXPECTED_LATEST_RECORD_ID_UNSET
+            and expected_latest_record_id is not None
+            and (
+                not isinstance(expected_latest_record_id, str)
+                or not expected_latest_record_id.strip()
+            )
+        ):
+            raise ValueError(
+                "expected_latest_record_id must be None or a non-empty string"
+            )
         resolved_key = (
             f"market:{command.source_name}:{command.source_record}:"
             f"{command.source_revision}:{command.observation_kind}:"
@@ -1238,6 +1317,43 @@ class LedgerStore:
         )
 
         def validate(records: tuple[_RecordT, ...]) -> None:
+            if (
+                expected_latest_record_id
+                is not _EXPECTED_LATEST_RECORD_ID_UNSET
+            ):
+                stream = tuple(
+                    record
+                    for record in records
+                    if isinstance(record, MarketObservationRecord)
+                    and record.game_pk == command.game_pk
+                    and record.source_name == command.source_name
+                    and record.source_record == command.source_record
+                    and record.observation_kind == command.observation_kind
+                    and record.market_key == command.market_key
+                )
+                superseded_ids = frozenset(
+                    record.supersedes_record_id
+                    for record in stream
+                    if record.supersedes_record_id is not None
+                )
+                latest = tuple(
+                    record
+                    for record in stream
+                    if record.envelope.record_id not in superseded_ids
+                )
+                if len(latest) > 1:
+                    raise LedgerMarketHeadChangedError(
+                        "market observation stream has multiple latest records"
+                    )
+                actual_latest_record_id = (
+                    None if not latest else latest[0].envelope.record_id
+                )
+                if actual_latest_record_id != expected_latest_record_id:
+                    raise LedgerMarketHeadChangedError(
+                        "market observation stream head changed: expected "
+                        f"{expected_latest_record_id!r}, found "
+                        f"{actual_latest_record_id!r}"
+                    )
             if command.supersedes_record_id is None:
                 return
             superseded = next(
@@ -1309,9 +1425,18 @@ class LedgerStore:
         self,
         command: OfficialResultCommand,
         idempotency_key: str | None = None,
+        *,
+        required_active_capture_id: str | None = None,
     ) -> OfficialResultRecord:
         if not isinstance(command, OfficialResultCommand):
             raise TypeError("command must be OfficialResultCommand")
+        if required_active_capture_id is not None and (
+            not isinstance(required_active_capture_id, str)
+            or not required_active_capture_id.strip()
+        ):
+            raise ValueError(
+                "required_active_capture_id must be a non-empty string"
+            )
         resolved_key = (
             f"result:{command.source_name}:{command.game_pk}:"
             f"{command.source_revision}"
@@ -1348,6 +1473,14 @@ class LedgerStore:
                     "official result correction must supersede the latest result"
                 )
 
+        def prevalidate(records: tuple[_RecordT, ...]) -> None:
+            if required_active_capture_id is not None:
+                _require_active_capture_head(
+                    records,
+                    required_active_capture_id,
+                    game_pk=command.game_pk,
+                )
+
         def build(envelope: RecordEnvelope) -> OfficialResultRecord:
             return OfficialResultRecord(
                 envelope=envelope,
@@ -1371,6 +1504,7 @@ class LedgerStore:
             command,
             validate,
             build,
+            prevalidate if required_active_capture_id is not None else None,
         )
         if not isinstance(record, OfficialResultRecord):
             raise LedgerCorruptionError(
@@ -1382,9 +1516,18 @@ class LedgerStore:
         self,
         command: ReviewCommand,
         idempotency_key: str | None = None,
+        *,
+        required_active_capture_id: str | None = None,
     ) -> ReviewRecord:
         if not isinstance(command, ReviewCommand):
             raise TypeError("command must be ReviewCommand")
+        if required_active_capture_id is not None and (
+            not isinstance(required_active_capture_id, str)
+            or not required_active_capture_id.strip()
+        ):
+            raise ValueError(
+                "required_active_capture_id must be a non-empty string"
+            )
         resolved_key = (
             f"review:{command.capture_id}:{command.forecast_run_id}:"
             f"{command.official_result_record_id}:{command.market_key}"
@@ -1396,6 +1539,17 @@ class LedgerStore:
             relationship_error = _review_relationship_error(command, records)
             if relationship_error is not None:
                 raise LedgerReferenceError(relationship_error)
+
+        def prevalidate(records: tuple[_RecordT, ...]) -> None:
+            if required_active_capture_id is None:
+                return
+            if command.capture_id != required_active_capture_id:
+                raise LedgerActiveCaptureHeadChangedError(
+                    "review capture_id does not match required active capture: "
+                    f"expected {required_active_capture_id!r}, found "
+                    f"{command.capture_id!r}"
+                )
+            _require_active_capture_head(records, required_active_capture_id)
 
         def build(envelope: RecordEnvelope) -> ReviewRecord:
             return ReviewRecord(
@@ -1424,6 +1578,7 @@ class LedgerStore:
             command,
             validate,
             build,
+            prevalidate if required_active_capture_id is not None else None,
         )
         if not isinstance(record, ReviewRecord):
             raise LedgerCorruptionError(
@@ -1572,8 +1727,10 @@ class LedgerStore:
 
 __all__ = (
     "IdempotencyConflict",
+    "LedgerActiveCaptureHeadChangedError",
     "LedgerCorruptionError",
     "LedgerHeadChangedError",
+    "LedgerMarketHeadChangedError",
     "LedgerReferenceError",
     "LedgerStore",
 )

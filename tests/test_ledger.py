@@ -26,8 +26,10 @@ from analysis.ledger import (
     OfficialResultRecord,
     ReviewCommand,
     ReviewRecord,
+    LedgerActiveCaptureHeadChangedError,
     LedgerCorruptionError,
     LedgerHeadChangedError,
+    LedgerMarketHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
     RecordEnvelope,
@@ -1016,6 +1018,54 @@ class LedgerStoreTests(unittest.TestCase):
                 third.envelope.record_id,
             )
 
+    def test_market_expected_latest_cas_detects_changed_stream_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            original = store.append_market_observation(market_command())
+            correction_command = market_command(
+                source_revision="2",
+                selected_decimal_price=1.90,
+                supersedes_record_id=original.envelope.record_id,
+            )
+
+            with self.assertRaises(LedgerMarketHeadChangedError):
+                store.append_market_observation(
+                    market_command(source_revision="unexpected-root"),
+                    expected_latest_record_id=None,
+                )
+
+            correction = store.append_market_observation(
+                correction_command,
+                expected_latest_record_id=original.envelope.record_id,
+            )
+            replayed = store.append_market_observation(
+                correction_command,
+                expected_latest_record_id=None,
+            )
+
+            self.assertEqual(replayed, correction)
+            self.assertEqual(
+                tuple(store.iter_records("market_observation")),
+                (original, correction),
+            )
+
+    def test_market_expected_latest_is_optional_for_existing_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            original = store.append_market_observation(market_command())
+
+            parallel = store.append_market_observation(
+                market_command(
+                    source_revision="parallel-root",
+                )
+            )
+
+            self.assertIsNone(parallel.supersedes_record_id)
+            self.assertNotEqual(
+                parallel.envelope.record_id,
+                original.envelope.record_id,
+            )
+
     def test_result_correction_supersedes_latest_without_mutating_original(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")
@@ -1111,6 +1161,39 @@ class LedgerStoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(tuple(store.iter_records("official_result"))), 1)
+
+    def test_result_active_capture_is_checked_before_exact_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture = store.append_capture("capture:active:result", capture_command())
+            command = result_command()
+            original = store.append_official_result(
+                command,
+                required_active_capture_id=capture.capture_id,
+            )
+            replacement = store.append_capture(
+                "capture:active:result:replacement",
+                capture_command(
+                    captured_at=CAPTURED_AT + timedelta(minutes=1),
+                    payload={"revision": 2},
+                    supersedes_capture_id=capture.capture_id,
+                ),
+                expected_active_capture_id=capture.capture_id,
+            )
+
+            with self.assertRaisesRegex(
+                LedgerActiveCaptureHeadChangedError,
+                replacement.capture_id,
+            ):
+                store.append_official_result(
+                    command,
+                    required_active_capture_id=capture.capture_id,
+                )
+
+            self.assertEqual(
+                tuple(store.iter_records("official_result")),
+                (original,),
+            )
 
     def test_duplicate_result_source_revision_is_corruption_on_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1522,6 +1605,35 @@ class LedgerStoreTests(unittest.TestCase):
                     idempotency_key="review:stale-result:new-key",
                 )
             self.assertEqual(len(tuple(store.iter_records("review"))), 1)
+
+    def test_review_active_capture_is_checked_before_exact_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            capture, _, _, _, _, command = append_review_context(store)
+            original = store.append_review(
+                command,
+                required_active_capture_id=capture.capture_id,
+            )
+            replacement = store.append_capture(
+                "capture:active:review:replacement",
+                capture_command(
+                    captured_at=CAPTURED_AT + timedelta(minutes=1),
+                    payload={"revision": 2},
+                    supersedes_capture_id=capture.capture_id,
+                ),
+                expected_active_capture_id=capture.capture_id,
+            )
+
+            with self.assertRaisesRegex(
+                LedgerActiveCaptureHeadChangedError,
+                replacement.capture_id,
+            ):
+                store.append_review(
+                    command,
+                    required_active_capture_id=capture.capture_id,
+                )
+
+            self.assertEqual(tuple(store.iter_records("review")), (original,))
 
     def test_review_requires_existing_matching_link_result_and_market(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

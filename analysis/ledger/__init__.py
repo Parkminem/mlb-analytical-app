@@ -16,8 +16,10 @@ from .records import (
 )
 from .store import (
     IdempotencyConflict,
+    LedgerActiveCaptureHeadChangedError,
     LedgerCorruptionError,
     LedgerHeadChangedError,
+    LedgerMarketHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
 )
@@ -29,8 +31,10 @@ __all__ = (
     "ForecastCommand",
     "ForecastRecord",
     "IdempotencyConflict",
+    "LedgerActiveCaptureHeadChangedError",
     "LedgerCorruptionError",
     "LedgerHeadChangedError",
+    "LedgerMarketHeadChangedError",
     "LedgerReferenceError",
     "LedgerStore",
     "MarketObservationCommand",

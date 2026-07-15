@@ -148,6 +148,29 @@ class CorrectResultBeforeReviewAppend:
         return self.store.append_review(command, idempotency_key)
 
 
+class RequireActiveCaptureReviewAppend:
+    def __init__(self, store: LedgerStore) -> None:
+        self.store = store
+        self.required_active_capture_id = None
+
+    def iter_records(self, kind=None):
+        return self.store.iter_records(kind)
+
+    def append_review(
+        self,
+        command,
+        idempotency_key=None,
+        *,
+        required_active_capture_id,
+    ):
+        self.required_active_capture_id = required_active_capture_id
+        return self.store.append_review(
+            command,
+            idempotency_key,
+            required_active_capture_id=required_active_capture_id,
+        )
+
+
 class ReviewServiceApiAvailabilityTests(unittest.TestCase):
     def test_review_service_api_is_available(self):
         self.assertTrue(
@@ -930,6 +953,24 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(len(tuple(self.store.iter_records("review"))), 1)
         with self.assertRaises(FrozenInstanceError):
             first.record.market_result = "loss"
+
+    def test_required_active_capture_is_forwarded_only_when_supplied(self):
+        fixture = self.fixture()
+        guarded_store = RequireActiveCaptureReviewAppend(self.store)
+
+        result = build_and_record_review(
+            guarded_store,
+            fixture.link.envelope.record_id,
+            fixture.result.envelope.record_id,
+            MARKET_KEY,
+            required_active_capture_id=fixture.capture.capture_id,
+        )
+
+        self.assertEqual(
+            guarded_store.required_active_capture_id,
+            fixture.capture.capture_id,
+        )
+        self.assertEqual(result.record.capture_id, fixture.capture.capture_id)
 
     def test_retry_after_partial_failure_reuses_the_appended_review(self):
         fixture = self.fixture()
