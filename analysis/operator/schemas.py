@@ -42,6 +42,13 @@ class _BundleEnvelope(BaseModel):
     game_pk: int
     created_at: datetime
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _require_json_integer_schema_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be a JSON integer")
+        return value
+
     @field_validator("created_at")
     @classmethod
     def _require_aware_created_at(cls, value: datetime) -> datetime:
@@ -161,7 +168,12 @@ def _reject_json_constant(value: str) -> object:
 
 def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
     if isinstance(raw, str):
-        return raw.encode("utf-8"), raw
+        try:
+            return raw.encode("utf-8"), raw
+        except UnicodeEncodeError as error:
+            raise BundleValidationError(
+                f"bundle JSON must be valid UTF-8: {error}"
+            ) from error
     if isinstance(raw, (bytes, bytearray)):
         raw_bytes = bytes(raw)
         try:

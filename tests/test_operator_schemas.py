@@ -258,6 +258,27 @@ def test_bundle_rejects_unsupported_or_wrong_type_schema_versions(
         parse_projected_bundle_json(_raw(mapping))
 
 
+@pytest.mark.parametrize(
+    ("mapping_factory", "parser"),
+    (
+        (projected_bundle_mapping, parse_projected_bundle_json),
+        (confirmed_bundle_mapping, parse_confirmed_bundle_json),
+        (review_bundle_mapping, parse_review_bundle_json),
+    ),
+)
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_all_bundles_require_schema_version_json_integer_token(
+    mapping_factory,
+    parser,
+    schema_version: object,
+) -> None:
+    mapping = mapping_factory()
+    mapping["schema_version"] = schema_version
+
+    with pytest.raises(BundleValidationError, match="schema_version.*integer"):
+        parser(_raw(mapping))
+
+
 def test_bundle_rejects_duplicate_json_keys() -> None:
     raw = _raw(projected_bundle_mapping())
     raw = raw.replace(
@@ -268,6 +289,17 @@ def test_bundle_rejects_duplicate_json_keys() -> None:
 
     with pytest.raises(BundleValidationError, match="duplicate JSON object key"):
         parse_projected_bundle_json(raw)
+
+
+def test_bundle_translates_invalid_utf8_surrogate_in_python_string() -> None:
+    with pytest.raises(
+        BundleValidationError,
+        match="valid UTF-8",
+    ) as captured:
+        parse_projected_bundle_json("\ud800")
+
+    assert captured.value.exit_code == 3
+    assert isinstance(captured.value.__cause__, UnicodeEncodeError)
 
 
 @pytest.mark.parametrize("constant", [float("nan"), float("inf"), -float("inf")])
