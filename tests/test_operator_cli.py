@@ -12,6 +12,10 @@ import analysis.operator.service as service_module
 from analysis.forecasting import LineupState
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import capture_payload
+from analysis.forecasting.validation import (
+    PregameRelationshipError,
+    PregameTimingError,
+)
 from analysis.ledger import LedgerStore
 from analysis.operator.bundles import ManagedBundleCopy
 from analysis.operator.errors import (
@@ -594,6 +598,60 @@ def test_forecast_config_version_secret_is_not_printed(
     assert result.exit_code == 3
     assert "unknown forecast config" in result.output
     assert secret_version not in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("error_type", "exit_code", "safe_message"),
+    (
+        (
+            PregameRelationshipError,
+            3,
+            "invalid pregame relationship",
+        ),
+        (PregameTimingError, 4, "invalid pregame timing"),
+    ),
+)
+def test_cli_pregame_cross_field_error_omits_bundle_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[ValueError],
+    exit_code: int,
+    safe_message: str,
+) -> None:
+    secret = "https://attacker.example/?api_token=pregame-cross-field-secret"
+    game = _complete_game()
+    game = replace(
+        game,
+        away_lineup=replace(game.away_lineup, state=LineupState.PROJECTED),
+        observations=(
+            replace(game.observations[0], source_record=secret),
+        ),
+    )
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["game_input"] = capture_payload(game)
+    bundle_path = tmp_path / "projected-cross-field-secret.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    def fail_validation(game_input):
+        del game_input
+        raise error_type(f"invalid provenance observation: {secret}")
+
+    monkeypatch.setattr(
+        service_module,
+        "validate_pregame_input",
+        fail_validation,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        ["projected", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == exit_code
+    assert safe_message in result.output
+    assert secret not in result.output
+    assert "attacker.example" not in result.output
     assert "Traceback" not in result.output
 
 

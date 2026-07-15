@@ -371,7 +371,7 @@ def test_exact_review_retry_replays_every_record_and_managed_bundle(
     assert len(_records(review_context, "review")) == 2
 
 
-def test_completed_reviews_replay_after_a_newer_result_correction(
+def test_completed_review_bundle_rejects_a_superseded_result_head(
     review_context: ReviewContext,
 ) -> None:
     first = _run(review_context)
@@ -387,13 +387,13 @@ def test_completed_reviews_replay_after_a_newer_result_correction(
     store = LedgerStore(review_context.ledger_path)
     corrected_result = store.append_official_result(correction)
 
-    replay = _run(review_context)
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="current latest|superseded",
+    ):
+        _run(review_context)
 
-    assert replay.official_result == first.official_result
-    assert replay.reviews == first.reviews
-    assert replay.official_result_replayed is True
-    assert replay.review_replay_count == len(first.reviews)
-    assert store.latest_official_result(replay.game_pk) == corrected_result
+    assert store.latest_official_result(first.game_pk) == corrected_result
     assert len(_records(review_context, "review")) == len(first.reviews)
 
 
@@ -1134,6 +1134,123 @@ def test_report_failure_reports_all_progress_and_exact_retry_replays(
     )
     assert len(_records(review_context, "official_result")) == 1
     assert len(_records(review_context, "review")) == len(review_records)
+
+
+def test_result_correction_after_report_failure_makes_retry_unsafe(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_publish = service_module._publish_calibration_report
+    corrected_record_id = None
+
+    def correct_result_then_interrupt(store, *args, **kwargs):
+        nonlocal corrected_record_id
+        del args, kwargs
+        original = next(
+            record
+            for record in store.iter_records("official_result")
+            if isinstance(record, OfficialResultRecord)
+            and record.source_revision == "final-1"
+        )
+        correction = replace(
+            review_context.bundle.payload.official_result,
+            source_revision="final-competing-correction",
+            finalized_at=(
+                review_context.bundle.payload.official_result.finalized_at
+                + timedelta(minutes=20)
+            ),
+            documented_events=({"result_label": "official correction"},),
+            supersedes_record_id=original.envelope.record_id,
+        )
+        corrected = store.append_official_result(
+            correction,
+            required_active_capture_id=(
+                review_context.confirmed.capture.capture_id
+            ),
+        )
+        corrected_record_id = corrected.envelope.record_id
+        raise OperatorIOError("calibration publication interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        correct_result_then_interrupt,
+    )
+
+    with pytest.raises(OperatorIOError) as raised:
+        _run(review_context)
+
+    assert corrected_record_id is not None
+    assert raised.value.partial_progress.rerun_safe is False
+    assert len(_records(review_context, "official_result")) == 2
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        original_publish,
+    )
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="current latest|superseded",
+    ):
+        _run(review_context)
+    assert len(_records(review_context, "official_result")) == 2
+
+
+def test_closing_correction_after_report_failure_makes_retry_unsafe(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_publish = service_module._publish_calibration_report
+    corrected_record_id = None
+
+    def correct_close_then_interrupt(store, *args, **kwargs):
+        nonlocal corrected_record_id
+        del args, kwargs
+        original = next(
+            record
+            for record in store.iter_records("market_observation")
+            if isinstance(record, MarketObservationRecord)
+            and record.source_revision == "close-1"
+        )
+        correction = replace(
+            review_context.bundle.payload.closing_observations[0],
+            source_revision="close-competing-correction",
+            selected_decimal_price=2.07,
+            opposing_decimal_price=1.79,
+            supersedes_record_id=original.envelope.record_id,
+        )
+        corrected = store.append_market_observation(
+            correction,
+            expected_latest_record_id=original.envelope.record_id,
+        )
+        corrected_record_id = corrected.envelope.record_id
+        raise OperatorIOError("calibration publication interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        correct_close_then_interrupt,
+    )
+
+    with pytest.raises(OperatorIOError) as raised:
+        _run(review_context)
+
+    assert corrected_record_id is not None
+    assert raised.value.partial_progress.rerun_safe is False
+    assert len(_records(review_context, "market_observation")) == 2
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        original_publish,
+    )
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="current latest|superseded",
+    ):
+        _run(review_context)
+    assert len(_records(review_context, "market_observation")) == 2
 
 
 def test_post_persistence_replacement_is_never_exposed_in_progress(

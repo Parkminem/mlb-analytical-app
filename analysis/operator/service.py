@@ -1,7 +1,7 @@
 """Pregame shadow-run and exact confirmed-review orchestration."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeVar
@@ -179,13 +179,9 @@ def _pregame_operation(operation: Callable[[], _T]) -> _T:
     try:
         return operation()
     except PregameRelationshipError as error:
-        raise BundleValidationError(
-            f"invalid pregame relationship: {error}"
-        ) from error
+        raise BundleValidationError("invalid pregame relationship") from error
     except PregameTimingError as error:
-        raise OperatorPreconditionError(
-            f"invalid pregame timing: {error}"
-        ) from error
+        raise OperatorPreconditionError("invalid pregame timing") from error
 
 
 def _open_ledger(path: str | Path) -> LedgerStore:
@@ -310,6 +306,20 @@ def _resolve_supersession_target(
     if stage == "projected" and latest.lineup_state != "projected":
         return None
     return latest.capture_id
+
+
+def _require_chronological_new_capture(
+    command: CaptureCommand,
+    existing_capture: CaptureRecord | None,
+    active_head: CaptureRecord | None,
+) -> None:
+    if existing_capture is not None or active_head is None:
+        return
+    if command.captured_at < active_head.captured_at:
+        raise OperatorPreconditionError(
+            "new capture captured_at cannot be earlier than the latest active "
+            "capture"
+        )
 
 
 def _record_replay_state(
@@ -439,6 +449,11 @@ def _run_pregame(
             captures = _captures(store)
             existing_capture = _existing_keyed_capture(captures, capture_key)
             active_head = _latest_active_capture(captures, bundle.game_pk)
+            _require_chronological_new_capture(
+                command,
+                existing_capture,
+                active_head,
+            )
             supersedes_capture_id = _resolve_supersession_target(
                 stage=expected_stage,
                 captures=captures,
@@ -767,9 +782,19 @@ def _record_with_key(
     )
     if len(matches) > 1:
         raise OperatorLedgerError(
-            f"duplicate {record_type.__name__} idempotency key: {idempotency_key}"
+            f"duplicate {record_type.__name__} idempotency key"
         )
     return None if not matches else matches[0]
+
+
+def _record_matches_command(
+    record: MarketObservationRecord | OfficialResultRecord,
+    command: MarketObservationCommand | OfficialResultCommand,
+) -> bool:
+    return all(
+        getattr(record, field.name) == getattr(command, field.name)
+        for field in fields(command)
+    )
 
 
 def _market_observation_key(command: MarketObservationCommand) -> str:
@@ -873,6 +898,15 @@ def _preflight_closing_lineage(
             raise OperatorLedgerError(
                 "stored closing observation supersedes itself"
             )
+        latest = _latest_closing_observation(records, command)
+        if (
+            latest is None
+            or latest.envelope.record_id != existing.envelope.record_id
+        ):
+            raise OperatorPreconditionError(
+                "exact closing observation is no longer the current latest "
+                "record"
+            )
         return _ClosingPreflight(existing, original_target)
 
     latest = _latest_closing_observation(records, command)
@@ -912,6 +946,14 @@ def _preflight_result_lineage(
             )
         if original_target == existing.envelope.record_id:
             raise OperatorLedgerError("stored official result supersedes itself")
+        latest = _latest_result_record(records, command.game_pk)
+        if (
+            latest is None
+            or latest.envelope.record_id != existing.envelope.record_id
+        ):
+            raise OperatorPreconditionError(
+                "exact official result is no longer the current latest record"
+            )
         return existing
 
     latest = _latest_result_record(records, command.game_pk)
@@ -1067,6 +1109,11 @@ def _review_partial_progress(
             bundle.game_pk,
         )
     )
+    retry_lineage_safe = _review_retry_lineage_safe(
+        records,
+        bundle,
+        capture,
+    ) if reread_succeeded else False
     return OperatorPartialProgress(
         stage=bundle.stage,
         game_pk=bundle.game_pk,
@@ -1107,8 +1154,51 @@ def _review_partial_progress(
             isinstance(error, OperatorIOError)
             and latest_capture is not None
             and latest_capture.capture_id == capture.capture_id
+            and retry_lineage_safe
         ),
     )
+
+
+def _review_retry_lineage_safe(
+    records: tuple[object, ...],
+    bundle: ReviewBundle,
+    capture: CaptureRecord,
+) -> bool:
+    """Read-only proof that an exact retry still targets current ledger heads."""
+
+    try:
+        latest_capture = _latest_active_capture(
+            tuple(
+                record
+                for record in records
+                if isinstance(record, CaptureRecord)
+            ),
+            bundle.game_pk,
+        )
+        if (
+            latest_capture is None
+            or latest_capture.capture_id != capture.capture_id
+        ):
+            return False
+        for command in bundle.payload.closing_observations:
+            preflight = _preflight_closing_lineage(records, command)
+            if preflight.existing is not None and not _record_matches_command(
+                preflight.existing,
+                command,
+            ):
+                return False
+        existing_result = _preflight_result_lineage(
+            records,
+            bundle.payload.official_result,
+        )
+        if existing_result is not None and not _record_matches_command(
+            existing_result,
+            bundle.payload.official_result,
+        ):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _build_exact_review(

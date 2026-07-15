@@ -595,6 +595,116 @@ def test_later_capture_reuses_forecast_but_supersedes_projected_capture(
     assert replay.capture.supersedes_capture_id == first.capture.capture_id
 
 
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+def test_new_earlier_capture_cannot_replace_latest_but_history_replays(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    first_game = game_factory()
+    first = runner(
+        _pregame_bundle(stage, first_game),
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    historical_game = replace(
+        first_game,
+        captured_at=first_game.captured_at + timedelta(minutes=2),
+    )
+    historical_bundle = _pregame_bundle(stage, historical_game)
+    historical = runner(
+        historical_bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    latest_game = replace(
+        historical_game,
+        captured_at=first_game.captured_at + timedelta(minutes=5),
+    )
+    latest = runner(
+        _pregame_bundle(stage, latest_game),
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    changed_lineup = replace(
+        historical_game.away_lineup,
+        recent_form_index=replace(
+            historical_game.away_lineup.recent_form_index,
+            value=1.1,
+        ),
+    )
+    stale_bundle = _pregame_bundle(
+        stage,
+        replace(historical_game, away_lineup=changed_lineup),
+    )
+
+    with pytest.raises(OperatorPreconditionError, match="earlier|chronological"):
+        runner(
+            stale_bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    replay = runner(
+        historical_bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
+    assert replay.capture == historical.capture
+    assert replay.capture_replayed is True
+    assert historical.capture.supersedes_capture_id == first.capture.capture_id
+    assert latest.capture.supersedes_capture_id == historical.capture.capture_id
+    assert len(captures) == 3
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+def test_equal_capture_time_with_changed_semantics_becomes_latest(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    game = game_factory()
+    first = runner(
+        _pregame_bundle(stage, game),
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    changed_lineup = replace(
+        game.away_lineup,
+        recent_form_index=replace(
+            game.away_lineup.recent_form_index,
+            value=1.1,
+        ),
+    )
+
+    changed = runner(
+        _pregame_bundle(stage, replace(game, away_lineup=changed_lineup)),
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert changed.capture.captured_at == first.capture.captured_at
+    assert changed.capture.capture_id != first.capture.capture_id
+    assert changed.capture.supersedes_capture_id == first.capture.capture_id
+
+
 def test_changed_audit_provenance_creates_capture_and_reuses_forecast(
     tmp_path: Path,
 ) -> None:
@@ -770,7 +880,10 @@ def test_post_first_pitch_capture_is_a_precondition(
     base = _projected_game() if stage == "projected" else _confirmed_game()
     game = replace(base, captured_at=base.identity.first_pitch)
 
-    with pytest.raises(OperatorPreconditionError, match="captured_at"):
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="^invalid pregame timing$",
+    ):
         runner(
             _pregame_bundle(stage, game),
             ledger_path=ledger_path,
@@ -781,14 +894,27 @@ def test_post_first_pitch_capture_is_a_precondition(
 def test_relationship_failure_maps_to_bundle_validation(tmp_path: Path) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
     base = _projected_game()
-    game = replace(base, away_lineup=replace(base.away_lineup, team="WRONG"))
+    secret = "https://attacker.example/?api_token=pregame-secret"
+    game = replace(
+        base,
+        away_lineup=replace(
+            base.away_lineup,
+            state_provenance=replace(
+                base.away_lineup.state_provenance,
+                observation_ids=(secret,),
+            ),
+        ),
+    )
 
-    with pytest.raises(BundleValidationError, match="away team"):
+    with pytest.raises(BundleValidationError) as raised:
         run_projected(
             _pregame_bundle("projected", game),
             ledger_path=ledger_path,
             bundle_root=bundle_root,
         )
+
+    assert str(raised.value) == "invalid pregame relationship"
+    assert secret not in str(raised.value)
 
 
 def test_active_capture_selection_uses_latest_capture_order(tmp_path: Path) -> None:
@@ -907,6 +1033,48 @@ def test_projected_run_retries_when_head_changes_after_preflight(
     assert sum(capture.supersedes_capture_id is None for capture in captures) == 1
 
 
+def test_projected_run_rejects_older_capture_after_concurrent_newer_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    game = _projected_game()
+    original_record = service_module.record_shadow_run
+    attempts = 0
+
+    def change_head_then_record(store, game_input, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            concurrent_game = replace(
+                game_input,
+                captured_at=game_input.captured_at + timedelta(minutes=1),
+            )
+            store.append_capture(
+                "manual:newer-interloper",
+                build_shadow_capture_command(concurrent_game),
+            )
+        return original_record(store, game_input, *args, **kwargs)
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        change_head_then_record,
+    )
+
+    with pytest.raises(OperatorPreconditionError, match="earlier|chronological"):
+        run_projected(
+            _pregame_bundle("projected", game),
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
+    assert attempts == 1
+    assert len(captures) == 1
+    assert captures[0].captured_at > game.captured_at
+
+
 def test_projected_run_maps_repeated_head_changes_to_operator_ledger_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1005,10 +1173,20 @@ def test_ledger_append_filesystem_error_maps_to_operator_io(
 
 
 @pytest.mark.parametrize(
-    ("pregame_error", "expected_error"),
+    ("pregame_error", "expected_error", "safe_message"),
     (
-        (PregameRelationshipError("relationship"), BundleValidationError),
-        (PregameTimingError("timing"), OperatorPreconditionError),
+        (
+            PregameRelationshipError(
+                "missing observation api_token=relationship-secret"
+            ),
+            BundleValidationError,
+            "invalid pregame relationship",
+        ),
+        (
+            PregameTimingError("market_key=timing-secret arrived late"),
+            OperatorPreconditionError,
+            "invalid pregame timing",
+        ),
     ),
 )
 def test_typed_pregame_failures_from_recording_keep_stable_categories(
@@ -1016,6 +1194,7 @@ def test_typed_pregame_failures_from_recording_keep_stable_categories(
     monkeypatch: pytest.MonkeyPatch,
     pregame_error: ValueError,
     expected_error: type[Exception],
+    safe_message: str,
 ) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
     bundle = _pregame_bundle("projected", _projected_game())
@@ -1025,9 +1204,12 @@ def test_typed_pregame_failures_from_recording_keep_stable_categories(
 
     monkeypatch.setattr("analysis.operator.service.record_shadow_run", fail_record)
 
-    with pytest.raises(expected_error, match=str(pregame_error)):
+    with pytest.raises(expected_error) as raised:
         run_projected(
             bundle,
             ledger_path=ledger_path,
             bundle_root=bundle_root,
         )
+
+    assert str(raised.value) == safe_message
+    assert str(pregame_error) not in str(raised.value)
