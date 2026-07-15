@@ -43,11 +43,14 @@ Keep these output concepts separate:
 
 ### Three-Stage Daily Operation
 
-1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, then record the normalized pregame capture, deterministic shadow forecast, and capture-to-forecast link.
-2. Refresh with the RotoWire confirmed lineup and current starter and market state. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast. An exact retry returns the existing capture only when the caller reuses the same caller-supplied idempotency key; the same state with a new key may append another capture while reusing the deterministic forecast.
-3. Ingest the official MLB result, bind it to the selected frozen capture and forecast, perform the objective flow review, and build the calibration report.
+1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, prepare the versioned projected bundle, and run `.venv/bin/python -m analysis.operator projected --bundle <path>` to record the normalized pregame capture, deterministic shadow forecast, and exact capture-to-forecast link.
+2. Refresh with the RotoWire confirmed lineup and current starter and market state, prepare the confirmed bundle, and run `.venv/bin/python -m analysis.operator confirmed --bundle <path>`. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast.
+3. Put the exact frozen `capture_id`, `forecast_run_id`, and `capture_forecast_link_record_id` from the confirmed command into the review bundle with the official MLB result, then run `.venv/bin/python -m analysis.operator review --bundle <path>`. Review binds only to those records, performs the objective flow review, and builds the calibration report without forecasting again.
+
+The operator derives capture idempotency intrinsically from the bundle schema version, stage, and exact capture command content except the supersession target. It searches that key before resolving lineage, so an exact replay returns the original immutable capture, forecast, link, and supersession target. New state appends a new capture and explicit supersession relationship; no prior ledger record is edited. Lower-level `record_shadow_run` remains an append-only API whose direct callers supply the capture key.
 
 Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
+See `docs/shadow-operator.md` for bundle roles, path overrides, frozen-ID handoff, replay recovery, exit codes, and report publication paths.
 
 ### Forecast Feature Ownership and Double-Count Protection
 

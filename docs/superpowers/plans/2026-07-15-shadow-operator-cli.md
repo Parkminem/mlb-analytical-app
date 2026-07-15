@@ -43,7 +43,7 @@
 - Test: `tests/test_operator_schemas.py`
 - Test: `tests/test_forecasting_inputs.py`
 
-- [ ] **Step 1: Write failing config-registry and schema tests**
+- [x] **Step 1: Write failing config-registry and schema tests**
 
 Cover:
 
@@ -86,13 +86,13 @@ def test_pregame_validation_uses_typed_failure_categories():
         validate_pregame_input(game_captured_at_first_pitch())
 ```
 
-- [ ] **Step 2: Run tests and verify red**
+- [x] **Step 2: Run tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_schemas.py -q`
 
 Expected: collection failure because `analysis.operator` does not exist.
 
-- [ ] **Step 3: Add the immutable current config file**
+- [x] **Step 3: Add the immutable current config file**
 
 Serialize every `SimulationConfig.to_mapping()` field. The loader compares the
 file keys with `{field.name for field in dataclasses.fields(SimulationConfig)}`
@@ -101,7 +101,7 @@ Keep registry files additive, reject filename/content version mismatches, and
 test a second historical-version fixture with different complete values to
 prove that loading does not fall back to current defaults.
 
-- [ ] **Step 4: Implement strict Pydantic schemas**
+- [x] **Step 4: Implement strict Pydantic schemas**
 
 Use `ConfigDict(extra="forbid", frozen=True)` and direct domain types:
 
@@ -142,11 +142,11 @@ Translate `PregameRelationshipError` to `BundleValidationError` (3) and
 state checks also remain preconditions (4). Do not classify failures by
 matching error-message text.
 
-- [ ] **Step 5: Run schema tests and verify green**
+- [x] **Step 5: Run schema tests and verify green**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_schemas.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add config/forecasting analysis/forecasting/validation.py analysis/operator/errors.py analysis/operator/config.py analysis/operator/schemas.py tests/test_forecasting_inputs.py tests/test_operator_schemas.py
@@ -162,7 +162,7 @@ git commit -m "feat: add versioned shadow operator bundles"
 - Test: `tests/test_shadow.py`
 - Test: `tests/test_operator_pregame.py`
 
-- [ ] **Step 1: Write failing tests for capture construction and persistence**
+- [x] **Step 1: Write failing tests for capture construction and persistence**
 
 Cover:
 
@@ -181,18 +181,18 @@ def test_managed_bundle_copy_is_immutable_and_replayable(tmp_path):
     ...
 ```
 
-- [ ] **Step 2: Run targeted tests and verify red**
+- [x] **Step 2: Run targeted tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_shadow.py tests/test_operator_pregame.py -q`
 
-- [ ] **Step 3: Refactor capture construction into a public helper**
+- [x] **Step 3: Refactor capture construction into a public helper**
 
 Add a pure `build_shadow_capture_command(game_input, supersedes_capture_id=None)`
 that performs the existing validation, eligibility, input hash, lineup state,
 and payload construction. Make `record_shadow_run` use it and add a backward-
 compatible keyword-only supersession argument.
 
-- [ ] **Step 4: Implement bundle canonicalization and persistence**
+- [x] **Step 4: Implement bundle canonicalization and persistence**
 
 `bundles.py` must:
 
@@ -206,13 +206,13 @@ compatible keyword-only supersession argument.
 - Reuse identical existing bytes and reject conflicting bytes.
 - Map I/O failures to exit 6.
 
-- [ ] **Step 5: Add `data/shadow/` to `.gitignore`**
+- [x] **Step 5: Add `data/shadow/` to `.gitignore`**
 
-- [ ] **Step 6: Run targeted tests and verify green**
+- [x] **Step 6: Run targeted tests and verify green**
 
 Run: `.venv/bin/python -m pytest tests/test_shadow.py tests/test_operator_pregame.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add analysis/shadow.py analysis/operator/bundles.py .gitignore tests/test_shadow.py tests/test_operator_pregame.py
@@ -226,7 +226,7 @@ git commit -m "feat: add replay-safe shadow capture persistence"
 - Create: `analysis/operator/__init__.py`
 - Test: `tests/test_operator_pregame.py`
 
-- [ ] **Step 1: Write failing projected/confirmed orchestration tests**
+- [x] **Step 1: Write failing projected/confirmed orchestration tests**
 
 Required cases:
 
@@ -242,11 +242,11 @@ Required cases:
   historical projected replay succeeds.
 - Post-first-pitch captures and stage/lineup mismatches fail with exit 4.
 
-- [ ] **Step 2: Run pregame tests and verify red**
+- [x] **Step 2: Run pregame tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_pregame.py -q`
 
-- [ ] **Step 3: Implement active capture and keyed replay helpers**
+- [x] **Step 3: Implement active capture and keyed replay helpers**
 
 Read captures through `LedgerStore.iter_records("capture")`. Match an existing
 record by `(record_kind, envelope.idempotency_key)` before choosing a target.
@@ -257,7 +257,7 @@ supersession target and sort by:
 (capture.captured_at, capture.envelope.appended_at, capture.envelope.record_id)
 ```
 
-- [ ] **Step 4: Implement `run_projected` and `run_confirmed`**
+- [x] **Step 4: Implement `run_projected` and `run_confirmed`**
 
 Both functions:
 
@@ -269,11 +269,11 @@ Both functions:
 6. Persist the canonical managed bundle only after ledger operations succeed.
 7. Return a frozen result with IDs, lineup state, replay flags, and bundle path.
 
-- [ ] **Step 5: Run targeted tests and verify green**
+- [x] **Step 5: Run targeted tests and verify green**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_pregame.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add analysis/operator/__init__.py analysis/operator/service.py tests/test_operator_pregame.py
@@ -286,7 +286,7 @@ git commit -m "feat: orchestrate projected and confirmed shadow runs"
 - Modify: `analysis/operator/service.py`
 - Test: `tests/test_operator_review.py`
 
-- [ ] **Step 1: Write failing review-stage tests**
+- [x] **Step 1: Write failing review-stage tests**
 
 Cover:
 
@@ -306,11 +306,11 @@ Cover:
 - One recorded review for every exact review-eligible comparison, including
   structurally eligible legacy passes.
 
-- [ ] **Step 2: Run review tests and verify red**
+- [x] **Step 2: Run review tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_review.py -q`
 
-- [ ] **Step 3: Implement frozen-record validation**
+- [x] **Step 3: Implement frozen-record validation**
 
 Resolve the bundle's three IDs directly from ledger records. Require:
 
@@ -323,7 +323,7 @@ link.forecast_run_id == forecast.forecast_run_id
 capture is active
 ```
 
-- [ ] **Step 4: Implement closing and result preflight**
+- [x] **Step 4: Implement closing and result preflight**
 
 Before checking latest-target constraints, search each exact idempotency key.
 When a key exists, recover its original supersession target for preflight but
@@ -336,18 +336,18 @@ replay. For every closing observation, require non-null `available_at` and
 validate both observation timestamps against the exact frozen capture interval
 before append or replay.
 
-- [ ] **Step 5: Implement exact review creation**
+- [x] **Step 5: Implement exact review creation**
 
 Deserialize `shadow_comparison` from the frozen forecast. Select sorted unique
 market keys where `review_eligible` is true and call
 `build_and_record_review(store, link_record_id, result_record_id, market_key)`.
 Return review IDs and classification counts without changing legacy priority.
 
-- [ ] **Step 6: Run review tests and verify green**
+- [x] **Step 6: Run review tests and verify green**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_review.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add analysis/operator/service.py tests/test_operator_review.py
@@ -361,7 +361,7 @@ git commit -m "feat: record exact confirmed shadow reviews"
 - Modify: `analysis/operator/service.py`
 - Test: `tests/test_operator_reporting.py`
 
-- [ ] **Step 1: Write failing report tests**
+- [x] **Step 1: Write failing report tests**
 
 Cover:
 
@@ -376,11 +376,11 @@ Cover:
 - Missing price metrics render as unavailable, not zero.
 - Atomic replacement and I/O failure mapping.
 
-- [ ] **Step 2: Run report tests and verify red**
+- [x] **Step 2: Run report tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_reporting.py -q`
 
-- [ ] **Step 3: Implement report payload and atomic writers**
+- [x] **Step 3: Implement report payload and atomic writers**
 
 Build a versioned mapping with the resolved ledger path, `ledger_as_of`,
 overall/group metrics, migration counts, thresholds, and progress. Serialize
@@ -388,16 +388,16 @@ JSON through `canonical_json` plus a trailing newline. Render a Korean Markdown
 summary from the same mapping.
 Write temporary sibling files, fsync, and `os.replace`.
 
-- [ ] **Step 4: Integrate reporting into `run_review`**
+- [x] **Step 4: Integrate reporting into `run_review`**
 
 After idempotent reviews complete, rebuild rows from the full ledger, write
 both reports, and return paths plus sample counts.
 
-- [ ] **Step 5: Run report tests and verify green**
+- [x] **Step 5: Run report tests and verify green**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_reporting.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add analysis/operator/reporting.py analysis/operator/service.py tests/test_operator_reporting.py
@@ -411,7 +411,7 @@ git commit -m "feat: write deterministic shadow calibration reports"
 - Create: `analysis/operator/__main__.py`
 - Test: `tests/test_operator_cli.py`
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Use `typer.testing.CliRunner` to cover:
 
@@ -425,11 +425,11 @@ Use `typer.testing.CliRunner` to cover:
 - Projected/confirmed summaries expose lineup and replay state. Review summaries
   expose classification counts, calibration sample size, and both report paths.
 
-- [ ] **Step 2: Run CLI tests and verify red**
+- [x] **Step 2: Run CLI tests and verify red**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_cli.py -q`
 
-- [ ] **Step 3: Implement the Typer app**
+- [x] **Step 3: Implement the Typer app**
 
 Each command loads one bundle, creates `LedgerStore`, calls the matching service
 function, and prints a concise Rich summary. Add boundary-specific exception
@@ -446,15 +446,15 @@ translation rather than a broad `ValueError` catch:
 - Typer usage remains 2 and any otherwise unexpected exception is caught only
   at the CLI boundary and returns 1.
 
-- [ ] **Step 4: Add `python -m analysis.operator` entry point**
+- [x] **Step 4: Add `python -m analysis.operator` entry point**
 
-- [ ] **Step 5: Run CLI tests and smoke help**
+- [x] **Step 5: Run CLI tests and smoke help**
 
 Run: `.venv/bin/python -m pytest tests/test_operator_cli.py -q`
 
 Run: `.venv/bin/python -m analysis.operator --help`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add analysis/operator/cli.py analysis/operator/__main__.py tests/test_operator_cli.py
@@ -469,7 +469,7 @@ git commit -m "feat: add three-stage shadow operator cli"
 - Create: `docs/shadow-operator.md`
 - Modify: `docs/superpowers/plans/2026-07-15-shadow-operator-cli.md`
 
-- [ ] **Step 1: Document exact daily usage and bundle locations**
+- [x] **Step 1: Document exact daily usage and bundle locations**
 
 Include natural-language-to-CLI mapping, defaults, frozen ID handoff, result
 corrections, replay behavior, report interpretation, and the fact that no live
