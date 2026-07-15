@@ -1,5 +1,6 @@
 """Canonical loading and immutable persistence for operator bundles."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 import fcntl
 import hashlib
@@ -77,10 +78,32 @@ def _serialized_bundle(bundle: _Bundle) -> dict[str, object]:
         bundle,
         mode="python",
         round_trip=True,
+        warnings=False,
     )
     if not isinstance(payload, dict):
         raise TypeError("validated bundle must serialize to a mapping")
-    return payload
+    normalized = _normalize_bundle_collections(payload)
+    if not isinstance(normalized, dict):
+        raise TypeError("normalized bundle must serialize to a mapping")
+    return normalized
+
+
+def _normalize_bundle_collections(value: object) -> object:
+    """Convert unordered domain collections into deterministic JSON arrays."""
+
+    if isinstance(value, (set, frozenset)):
+        normalized = tuple(
+            _normalize_bundle_collections(item) for item in value
+        )
+        return sorted(normalized, key=canonical_json)
+    if isinstance(value, Mapping):
+        return {
+            key: _normalize_bundle_collections(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_normalize_bundle_collections(item) for item in value]
+    return value
 
 
 def bundle_canonical_bytes(bundle: _Bundle) -> bytes:

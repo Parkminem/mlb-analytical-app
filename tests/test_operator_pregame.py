@@ -1,6 +1,8 @@
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
+import json
 from pathlib import Path
+import warnings
 
 import pytest
 
@@ -37,6 +39,7 @@ from analysis.operator.schemas import (
     ProjectedBundle,
     parse_confirmed_bundle_json,
     parse_projected_bundle_json,
+    parse_review_bundle_json,
 )
 from analysis.operator.service import (
     PregameRunResult,
@@ -47,9 +50,11 @@ from analysis.shadow import build_shadow_capture_command
 from tests.test_forecasting_engine import _complete_game
 from tests.test_forecasting_inputs import complete_forecast_game
 from tests.test_operator_schemas import (
+    _complete_legacy_decision_mapping,
     _raw,
     confirmed_bundle_mapping,
     projected_bundle_mapping,
+    review_bundle_mapping,
 )
 
 
@@ -162,6 +167,35 @@ def test_canonical_bundle_bytes_normalize_offsets_and_hash_exact_bytes() -> None
     assert canonical == bundle_canonical_bytes(offset_bundle)
     assert canonical == canonical.strip()
     assert bundle_sha256(bundle) == __import__("hashlib").sha256(canonical).hexdigest()
+
+
+def test_canonical_bundle_bytes_support_nonempty_legacy_evidence_paths(
+    tmp_path: Path,
+) -> None:
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["legacy_decision"] = (
+        _complete_legacy_decision_mapping()
+    )
+    bundle = parse_projected_bundle_json(_raw(mapping))
+
+    canonical = bundle_canonical_bytes(bundle)
+    decoded = json.loads(canonical)
+
+    assert decoded["payload"]["legacy_decision"]["candidates"][0][
+        "evidence_paths"
+    ] == ["starter_suppression"]
+    persisted = persist_managed_bundle(bundle, root=tmp_path)
+    assert load_bundle(persisted.path) == bundle
+
+
+def test_canonical_bundle_bytes_do_not_emit_validated_domain_warnings() -> None:
+    bundle = parse_review_bundle_json(_raw(review_bundle_mapping()))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        canonical = bundle_canonical_bytes(bundle)
+
+    assert json.loads(canonical)["stage"] == "review"
 
 
 def test_load_bundle_delegates_strict_stage_schema_parsing(tmp_path: Path) -> None:
