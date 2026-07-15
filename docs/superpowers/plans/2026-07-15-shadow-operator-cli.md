@@ -475,13 +475,13 @@ Include natural-language-to-CLI mapping, defaults, frozen ID handoff, result
 corrections, replay behavior, report interpretation, and the fact that no live
 sources or automatic tuning are included.
 
-- [ ] **Step 2: Run focused tests**
+- [x] **Step 2: Run focused tests**
 
 ```bash
 .venv/bin/python -m pytest tests/test_operator_schemas.py tests/test_operator_pregame.py tests/test_operator_review.py tests/test_operator_reporting.py tests/test_operator_cli.py -q
 ```
 
-- [ ] **Step 3: Run the complete suite**
+- [x] **Step 3: Run the complete suite**
 
 ```bash
 .venv/bin/python -m unittest discover -s tests
@@ -494,14 +494,14 @@ git diff --check origin/main...HEAD
 Expected: all tests pass; manifest keeps `legacy_fixed_model` authority,
 forecasting mode `shadow`, and `may_change_recommendations=false`.
 
-- [ ] **Step 4: Run a synthetic three-stage CLI smoke test in a temporary directory**
+- [x] **Step 4: Run a synthetic three-stage CLI smoke test in a temporary directory**
 
 Verify projected IDs, confirmed supersession/frozen IDs, result/review records,
 and deterministic report replay.
 
-- [ ] **Step 5: Request independent code review and fix every P1/P2 finding**
+- [x] **Step 5: Request independent code review and fix every P1/P2 finding**
 
-- [ ] **Step 6: Commit final documentation and verification updates**
+- [x] **Step 6: Commit final documentation and verification updates**
 
 ```bash
 git add README.md docs/model.md docs/shadow-operator.md docs/superpowers/plans/2026-07-15-shadow-operator-cli.md
