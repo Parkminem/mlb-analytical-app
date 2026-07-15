@@ -33,8 +33,11 @@ GAME_PK = 900001
 
 def test_partial_progress_is_not_rerun_safe_without_authoritative_state() -> None:
     progress = OperatorPartialProgress(stage="projected", game_pk=GAME_PK)
+    field_names = {field.name for field in fields(OperatorPartialProgress)}
 
     assert progress.rerun_safe is False
+    assert "managed_bundle_path" not in field_names
+    assert "managed_bundle_replayed" not in field_names
 
 
 def _legacy_decision_mapping() -> dict[str, object]:

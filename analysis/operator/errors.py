@@ -1,12 +1,11 @@
 """Stable exception categories for shadow operator commands."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 
 @dataclass(frozen=True)
 class OperatorPartialProgress:
-    """Authoritative committed state discovered after an interrupted stage."""
+    """Authoritative ledger state discovered after an interrupted stage."""
 
     stage: str
     game_pk: int
@@ -16,14 +15,12 @@ class OperatorPartialProgress:
     closing_observation_record_ids: tuple[str, ...] = ()
     official_result_record_id: str | None = None
     review_record_ids: tuple[str, ...] = ()
-    managed_bundle_path: Path | None = None
     capture_replayed: bool | None = None
     forecast_replayed: bool | None = None
     link_replayed: bool | None = None
     closing_replay_count: int | None = None
     official_result_replayed: bool | None = None
     review_replay_count: int | None = None
-    managed_bundle_replayed: bool | None = None
     rerun_safe: bool = False
 
 

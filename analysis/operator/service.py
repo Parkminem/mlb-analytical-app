@@ -2,9 +2,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import stat
 from types import MappingProxyType
 from typing import TypeVar
 
@@ -47,8 +45,6 @@ from analysis.shadow import (
 from .bundles import (
     DEFAULT_BUNDLE_ROOT,
     ManagedBundleCopy,
-    bundle_canonical_bytes,
-    bundle_sha256,
     intrinsic_capture_key,
     persist_managed_bundle,
 )
@@ -76,7 +72,6 @@ DEFAULT_LEDGER_PATH = (
 )
 
 _Bundle = ProjectedBundle | ConfirmedBundle
-_AnyBundle = ProjectedBundle | ConfirmedBundle | ReviewBundle
 _T = TypeVar("_T")
 _HEAD_CAS_MAX_ATTEMPTS = 3
 _REPORT_PUBLICATION_MAX_ATTEMPTS = 3
@@ -167,134 +162,6 @@ def _single_record(
         if isinstance(record, record_type) and predicate(record)
     )
     return matches[0] if len(matches) == 1 else None
-
-
-def _path_matches_opened_descriptor(
-    path: Path,
-    opened_stat: os.stat_result,
-    mode_check: Callable[[int], bool],
-) -> bool:
-    current_stat = os.stat(path, follow_symlinks=False)
-    return (
-        mode_check(current_stat.st_mode)
-        and current_stat.st_dev == opened_stat.st_dev
-        and current_stat.st_ino == opened_stat.st_ino
-    )
-
-
-def _committed_managed_bundle_path(
-    bundle: _AnyBundle,
-    bundle_root: str | Path,
-) -> Path | None:
-    """Best-effort verification of the canonical artifact at its exact path."""
-
-    root_descriptor = -1
-    game_descriptor = -1
-    file_descriptor = -1
-    try:
-        expected_bytes = bundle_canonical_bytes(bundle)
-        digest = bundle_sha256(bundle)
-        supplied_root = Path(bundle_root).expanduser()
-        if supplied_root.is_symlink():
-            return None
-        resolved_root = supplied_root.resolve(strict=True)
-        if not resolved_root.is_dir():
-            return None
-        game_dir = resolved_root / str(bundle.game_pk)
-        if game_dir.is_symlink() or not game_dir.is_dir():
-            return None
-        resolved_game_dir = game_dir.resolve(strict=True)
-        if (
-            resolved_game_dir.parent != resolved_root
-            or resolved_game_dir.name != str(bundle.game_pk)
-        ):
-            return None
-        candidate = (
-            resolved_game_dir
-            / (
-                f"{bundle.stage}-v{bundle.schema_version}-"
-                f"{digest[:16]}.json"
-            )
-        )
-        if candidate.is_symlink() or not candidate.is_file():
-            return None
-
-        directory_flags = os.O_RDONLY
-        directory_flags |= getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-        root_descriptor = os.open(resolved_root, directory_flags)
-        opened_root_stat = os.fstat(root_descriptor)
-        if not stat.S_ISDIR(opened_root_stat.st_mode):
-            return None
-        game_descriptor = os.open(
-            str(bundle.game_pk),
-            directory_flags,
-            dir_fd=root_descriptor,
-        )
-        opened_game_stat = os.fstat(game_descriptor)
-        if not stat.S_ISDIR(opened_game_stat.st_mode):
-            return None
-        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        file_descriptor = os.open(
-            candidate.name,
-            file_flags,
-            dir_fd=game_descriptor,
-        )
-        opened_stat = os.fstat(file_descriptor)
-        if not stat.S_ISREG(opened_stat.st_mode):
-            return None
-        chunks: list[bytes] = []
-        while chunk := os.read(file_descriptor, 1024 * 1024):
-            chunks.append(chunk)
-        if b"".join(chunks) != expected_bytes:
-            return None
-        opened_candidate_stat = os.stat(
-            candidate.name,
-            dir_fd=game_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(opened_candidate_stat.st_mode)
-            or opened_candidate_stat.st_dev != opened_stat.st_dev
-            or opened_candidate_stat.st_ino != opened_stat.st_ino
-        ):
-            return None
-
-        public_game_dir = supplied_root / str(bundle.game_pk)
-        public_candidate = public_game_dir / candidate.name
-        if not _path_matches_opened_descriptor(
-            supplied_root,
-            opened_root_stat,
-            stat.S_ISDIR,
-        ):
-            return None
-        if not _path_matches_opened_descriptor(
-            public_game_dir,
-            opened_game_stat,
-            stat.S_ISDIR,
-        ):
-            return None
-        if not _path_matches_opened_descriptor(
-            public_candidate,
-            opened_stat,
-            stat.S_ISREG,
-        ):
-            return None
-        return candidate
-    except Exception:
-        return None
-    finally:
-        for descriptor in (
-            file_descriptor,
-            game_descriptor,
-            root_descriptor,
-        ):
-            if descriptor < 0:
-                continue
-            try:
-                os.close(descriptor)
-            except Exception:
-                pass
 
 
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
@@ -482,8 +349,6 @@ def _pregame_partial_progress(
     error: OperatorError,
     capture_key: str,
     forecast_run_id: str,
-    bundle_root: str | Path,
-    managed_bundle: ManagedBundleCopy | None,
     capture_replayed: bool | None,
     forecast_replayed: bool | None,
     link_replayed: bool | None,
@@ -524,10 +389,6 @@ def _pregame_partial_progress(
         capture_forecast_link_record_id=(
             None if link is None else link.envelope.record_id
         ),
-        managed_bundle_path=_committed_managed_bundle_path(
-            bundle,
-            bundle_root,
-        ),
         capture_replayed=(
             capture_replayed if capture is not None else None
         ),
@@ -535,9 +396,6 @@ def _pregame_partial_progress(
             forecast_replayed if committed_forecast is not None else None
         ),
         link_replayed=link_replayed if link is not None else None,
-        managed_bundle_replayed=(
-            None if managed_bundle is None else managed_bundle.replayed
-        ),
         rerun_safe=(
             isinstance(error, OperatorIOError)
             and reread_succeeded
@@ -646,8 +504,6 @@ def _run_pregame(
                 error=error,
                 capture_key=capture_key,
                 forecast_run_id=forecast.forecast_run_id,
-                bundle_root=bundle_root,
-                managed_bundle=managed_bundle,
                 capture_replayed=capture_replayed,
                 forecast_replayed=forecast_replayed,
                 link_replayed=link_replayed,
@@ -1159,8 +1015,6 @@ def _review_partial_progress(
     link: CaptureForecastLink,
     market_keys: tuple[str, ...],
     baseline_record_ids: frozenset[str],
-    bundle_root: str | Path,
-    managed_bundle: ManagedBundleCopy | None,
 ) -> OperatorPartialProgress:
     recovered_records = _partial_progress_records(store)
     reread_succeeded = recovered_records is not None
@@ -1201,7 +1055,6 @@ def _review_partial_progress(
             if record is not None:
                 review_records.append(record)
 
-    managed_path = _committed_managed_bundle_path(bundle, bundle_root)
     latest_capture = (
         None
         if not reread_succeeded
@@ -1229,7 +1082,6 @@ def _review_partial_progress(
         review_record_ids=tuple(
             record.envelope.record_id for record in review_records
         ),
-        managed_bundle_path=managed_path,
         closing_replay_count=(
             None
             if not reread_succeeded
@@ -1250,9 +1102,6 @@ def _review_partial_progress(
                 record.envelope.record_id in baseline_record_ids
                 for record in review_records
             )
-        ),
-        managed_bundle_replayed=(
-            None if managed_bundle is None else managed_bundle.replayed
         ),
         rerun_safe=(
             isinstance(error, OperatorIOError)
@@ -1528,8 +1377,6 @@ def run_review(
                 link=link,
                 market_keys=market_keys,
                 baseline_record_ids=baseline_record_ids,
-                bundle_root=bundle_root,
-                managed_bundle=managed_bundle,
             )
         except Exception:
             progress = OperatorPartialProgress(

@@ -766,6 +766,7 @@ def test_cli_prints_authoritative_partial_progress_and_reruns_safely(
         "partial.capture_forecast_link_record_id: "
         f"{link.envelope.record_id}"
     ) in failed.output
+    assert "partial.managed_bundle" not in failed.output
     assert "partial.rerun_safe: true" in failed.output
     assert "Traceback" not in failed.output
 

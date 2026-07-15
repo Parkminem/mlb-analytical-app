@@ -1119,8 +1119,8 @@ def test_report_failure_reports_all_progress_and_exact_retry_replays(
     assert progress.review_record_ids == tuple(
         record.envelope.record_id for record in review_records
     )
-    assert progress.managed_bundle_path is not None
-    assert progress.managed_bundle_path.is_file()
+    assert not hasattr(progress, "managed_bundle_path")
+    assert not hasattr(progress, "managed_bundle_replayed")
     assert progress.rerun_safe is True
 
     completed = _run(review_context)
@@ -1136,7 +1136,7 @@ def test_report_failure_reports_all_progress_and_exact_retry_replays(
     assert len(_records(review_context, "review")) == len(review_records)
 
 
-def test_post_persistence_symlink_replacement_is_omitted_from_progress(
+def test_post_persistence_replacement_is_never_exposed_in_progress(
     review_context: ReviewContext,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1162,92 +1162,13 @@ def test_post_persistence_symlink_replacement_is_omitted_from_progress(
         _run(review_context)
 
     progress = raised.value.partial_progress
-    assert progress.managed_bundle_path is None
+    assert not hasattr(progress, "managed_bundle_path")
+    assert not hasattr(progress, "managed_bundle_replayed")
     assert progress.rerun_safe is True
 
 
-@pytest.mark.parametrize("replacement_level", ("game", "root"))
-def test_parent_replacement_during_recovery_read_omits_bundle_path(
-    review_context: ReviewContext,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    replacement_level: str,
-) -> None:
-    original_read = service_module.os.read
-    replaced = False
-
-    def replace_parent_after_read(descriptor: int, size: int) -> bytes:
-        nonlocal replaced
-        chunk = original_read(descriptor, size)
-        if not chunk or replaced:
-            return chunk
-        replaced = True
-        root = review_context.bundle_root
-        game_dir = root / str(review_context.bundle.game_pk)
-        (managed_path,) = tuple(game_dir.glob("review-*.json"))
-        canonical_bytes = managed_path.read_bytes()
-        filename = managed_path.name
-        if replacement_level == "game":
-            game_dir.rename(tmp_path / "replaced-game-directory")
-            game_dir.mkdir()
-            (game_dir / filename).write_bytes(canonical_bytes)
-        else:
-            root.rename(tmp_path / "replaced-bundle-root")
-            replacement_game_dir = root / str(review_context.bundle.game_pk)
-            replacement_game_dir.mkdir(parents=True)
-            (replacement_game_dir / filename).write_bytes(canonical_bytes)
-        return chunk
-
-    monkeypatch.setattr(service_module.os, "read", replace_parent_after_read)
-
-    def interrupt_publication(*args, **kwargs):
-        del args, kwargs
-        raise OperatorIOError("calibration publication interrupted")
-
-    monkeypatch.setattr(
-        service_module,
-        "_publish_calibration_report",
-        interrupt_publication,
-    )
-
-    with pytest.raises(OperatorIOError, match="publication") as raised:
-        _run(review_context)
-
-    assert replaced is True
-    assert raised.value.partial_progress.managed_bundle_path is None
-    assert raised.value.partial_progress.rerun_safe is True
-
-
-def test_recovery_hash_fault_preserves_original_operator_error(
-    review_context: ReviewContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def interrupt_after_breaking_hash(*args, **kwargs):
-        del args, kwargs
-
-        def fail_hash(bundle):
-            del bundle
-            raise RuntimeError("recovery-hash-api-token-secret")
-
-        monkeypatch.setattr(service_module, "bundle_sha256", fail_hash)
-        raise OperatorIOError("calibration publication interrupted")
-
-    monkeypatch.setattr(
-        service_module,
-        "_publish_calibration_report",
-        interrupt_after_breaking_hash,
-    )
-
-    with pytest.raises(
-        OperatorIOError,
-        match="calibration publication interrupted",
-    ) as raised:
-        _run(review_context)
-
-    progress = raised.value.partial_progress
-    assert raised.value.exit_code == 6
-    assert progress.managed_bundle_path is None
-    assert progress.rerun_safe is True
+def test_partial_recovery_has_no_managed_artifact_discovery_api() -> None:
+    assert not hasattr(service_module, "_committed_managed_bundle_path")
 
 
 def test_review_bundle_is_persisted_only_after_all_ledger_operations_succeed(

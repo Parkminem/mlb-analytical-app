@@ -73,7 +73,6 @@ def _partial_progress_rows(
             progress.capture_forecast_link_record_id,
         ),
         ("partial.official_result_record_id", progress.official_result_record_id),
-        ("partial.managed_bundle_path", progress.managed_bundle_path),
         ("partial.capture_replayed", progress.capture_replayed),
         ("partial.forecast_replayed", progress.forecast_replayed),
         ("partial.link_replayed", progress.link_replayed),
@@ -83,10 +82,6 @@ def _partial_progress_rows(
             progress.official_result_replayed,
         ),
         ("partial.review_replay_count", progress.review_replay_count),
-        (
-            "partial.managed_bundle_replayed",
-            progress.managed_bundle_replayed,
-        ),
     )
     rows.extend((label, value) for label, value in optional_rows if value is not None)
     rows.extend(

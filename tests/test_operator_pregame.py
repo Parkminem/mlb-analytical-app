@@ -528,7 +528,7 @@ def test_non_io_error_after_pregame_commit_is_not_claimed_rerun_safe(
     assert progress.rerun_safe is False
 
 
-def test_partial_progress_never_claims_symlinked_managed_bundle(
+def test_partial_progress_never_exposes_managed_bundle_fields(
     tmp_path: Path,
 ) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
@@ -554,7 +554,8 @@ def test_partial_progress_never_claims_symlinked_managed_bundle(
         )
 
     assert raised.value.partial_progress.capture_id is not None
-    assert raised.value.partial_progress.managed_bundle_path is None
+    assert not hasattr(raised.value.partial_progress, "managed_bundle_path")
+    assert not hasattr(raised.value.partial_progress, "managed_bundle_replayed")
 
 
 def test_later_capture_reuses_forecast_but_supersedes_projected_capture(
