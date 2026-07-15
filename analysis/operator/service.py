@@ -584,6 +584,25 @@ def _require_close_preconditions(
             )
 
 
+def _require_unique_closing_streams(
+    commands: tuple[MarketObservationCommand, ...],
+) -> None:
+    streams = tuple(
+        (
+            command.game_pk,
+            command.source_name,
+            command.source_record,
+            command.observation_kind,
+            command.market_key,
+        )
+        for command in commands
+    )
+    if len(set(streams)) != len(streams):
+        raise OperatorPreconditionError(
+            "review bundle contains a duplicate logical closing stream"
+        )
+
+
 def _record_with_key(
     records: tuple[object, ...],
     record_type: type[_T],
@@ -866,6 +885,7 @@ def run_review(
     _require_result_preconditions(result_command, capture)
     for command in close_commands:
         _require_close_preconditions(command, capture)
+    _require_unique_closing_streams(close_commands)
     existing_closings = tuple(
         _preflight_closing_lineage(records, command)
         for command in close_commands

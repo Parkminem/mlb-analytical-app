@@ -485,6 +485,68 @@ def test_review_rejects_capture_at_or_after_first_pitch(
         _run(review_context, bundle)
 
 
+def test_duplicate_closing_streams_are_rejected_before_any_ledger_append(
+    review_context: ReviewContext,
+) -> None:
+    first = review_context.bundle.payload.closing_observations[0]
+    duplicate = replace(
+        first,
+        source_revision="close-2",
+        selected_decimal_price=2.01,
+        opposing_decimal_price=1.82,
+    )
+    bundle = _replace_review_commands(
+        review_context.bundle,
+        closing_observations=(first, duplicate),
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="duplicate.*closing.*stream",
+    ):
+        _run(review_context, bundle)
+
+    assert not _records(review_context, "market_observation")
+    assert not _records(review_context, "official_result")
+    assert not _records(review_context, "review")
+    assert not tuple(
+        (review_context.bundle_root / str(review_context.bundle.game_pk)).glob(
+            "review-*.json"
+        )
+    )
+
+
+def test_distinct_closing_streams_in_one_bundle_still_succeed(
+    review_context: ReviewContext,
+) -> None:
+    first = review_context.bundle.payload.closing_observations[0]
+    distinct = replace(
+        first,
+        source_record=f"quote/{review_context.bundle.game_pk}/full_under",
+        market_key="full_under",
+        market_type="full_total",
+        selected_side="under",
+        line=8.5,
+    )
+    bundle = _replace_review_commands(
+        review_context.bundle,
+        closing_observations=(first, distinct),
+    )
+
+    result = _run(review_context, bundle)
+
+    assert result.closing_observations == _records(
+        review_context,
+        "market_observation",
+    )
+    assert tuple(close.market_key for close in result.closing_observations) == (
+        "sea_ml",
+        "full_under",
+    )
+    assert len(_records(review_context, "official_result")) == 1
+    assert len(_records(review_context, "review")) == 2
+
+
 @pytest.mark.parametrize(
     ("field_name", "offset", "message"),
     (
