@@ -36,6 +36,7 @@ from analysis.shadow import (
     ShadowComparison,
     ShadowMarketComparison,
     ShadowRunIdempotencyKeys,
+    build_shadow_capture_command,
     compare_shadow_forecast,
     record_shadow_run,
 )
@@ -720,6 +721,7 @@ class ShadowRecordingTests(unittest.TestCase):
         legacy=None,
         forecast=None,
         keys=None,
+        supersedes_capture_id=None,
     ):
         return record_shadow_run(
             self.store if store is None else store,
@@ -727,7 +729,51 @@ class ShadowRecordingTests(unittest.TestCase):
             self.legacy if legacy is None else legacy,
             self.forecast if forecast is None else forecast,
             self.keys() if keys is None else keys,
+            supersedes_capture_id=supersedes_capture_id,
         )
+
+    def test_capture_command_builder_matches_recorded_capture(self) -> None:
+        command = build_shadow_capture_command(self.game)
+
+        result = self.record()
+
+        self.assertEqual(result.capture.game_pk, command.game_pk)
+        self.assertEqual(result.capture.captured_at, command.captured_at)
+        self.assertEqual(result.capture.first_pitch, command.first_pitch)
+        self.assertEqual(result.capture.lineup_state, command.lineup_state)
+        self.assertEqual(
+            result.capture.out_of_sample_eligible,
+            command.out_of_sample_eligible,
+        )
+        self.assertEqual(
+            result.capture.normalized_input_hash,
+            command.normalized_input_hash,
+        )
+        self.assertEqual(result.capture.payload, command.payload)
+        self.assertIsNone(command.supersedes_capture_id)
+
+    def test_recording_supports_explicit_supersession_and_retry(self) -> None:
+        first = self.record(keys=self.keys("superseded"))
+
+        second = self.record(
+            keys=self.keys("successor"),
+            supersedes_capture_id=first.capture.capture_id,
+        )
+        replay = self.record(
+            keys=self.keys("successor"),
+            supersedes_capture_id=first.capture.capture_id,
+        )
+
+        self.assertEqual(
+            second.capture.supersedes_capture_id,
+            first.capture.capture_id,
+        )
+        self.assertEqual(replay.capture.capture_id, second.capture.capture_id)
+        self.assertEqual(
+            replay.link.envelope.record_id,
+            second.link.envelope.record_id,
+        )
+        self.assertEqual(len(tuple(self.store.iter_records("capture"))), 2)
 
     def test_idempotency_keys_are_explicit_frozen_and_validated(self) -> None:
         keys = self.keys()

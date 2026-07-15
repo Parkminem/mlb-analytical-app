@@ -1628,6 +1628,28 @@ def _capture_lineup_state(game_input: NormalizedGameInput) -> str:
     return "projected"
 
 
+def build_shadow_capture_command(
+    game_input: NormalizedGameInput,
+    supersedes_capture_id: str | None = None,
+) -> CaptureCommand:
+    """Build the validated, audit-complete command for a shadow capture."""
+
+    if not isinstance(game_input, NormalizedGameInput):
+        raise TypeError("game_input must be NormalizedGameInput")
+    validation = validate_pregame_input(game_input)
+    resolved_game = resolve_forecast_input(game_input)
+    return CaptureCommand(
+        game_pk=game_input.identity.game_pk,
+        captured_at=game_input.captured_at,
+        first_pitch=game_input.identity.first_pitch,
+        lineup_state=_capture_lineup_state(game_input),
+        out_of_sample_eligible=validation.out_of_sample_eligible,
+        normalized_input_hash=normalized_input_hash(resolved_game),
+        payload=capture_payload(game_input),
+        supersedes_capture_id=supersedes_capture_id,
+    )
+
+
 def _require_store_interface(store: object) -> None:
     for method_name in (
         "append_capture",
@@ -1647,6 +1669,8 @@ def record_shadow_run(
     legacy: LegacyDecisionSnapshot,
     forecast: ForecastOutput,
     idempotency_keys: ShadowRunIdempotencyKeys,
+    *,
+    supersedes_capture_id: str | None = None,
 ) -> ShadowRunRecords:
     """Append or replay capture, capture-independent forecast, and link."""
 
@@ -1659,7 +1683,10 @@ def record_shadow_run(
         raise TypeError(
             "idempotency_keys must be ShadowRunIdempotencyKeys"
         )
-    validation = validate_pregame_input(game_input)
+    capture_command = build_shadow_capture_command(
+        game_input,
+        supersedes_capture_id=supersedes_capture_id,
+    )
     resolved_game = resolve_forecast_input(game_input)
     expected_forecast_run_id = build_forecast_run_id(
         resolved_game,
@@ -1679,16 +1706,7 @@ def record_shadow_run(
             "forecast market_inputs do not match canonical game_input markets"
         )
     comparison = compare_shadow_forecast(legacy, forecast)
-    input_hash = normalized_input_hash(resolved_game)
-    capture_command = CaptureCommand(
-        game_pk=game_input.identity.game_pk,
-        captured_at=game_input.captured_at,
-        first_pitch=game_input.identity.first_pitch,
-        lineup_state=_capture_lineup_state(game_input),
-        out_of_sample_eligible=validation.out_of_sample_eligible,
-        normalized_input_hash=input_hash,
-        payload=capture_payload(game_input),
-    )
+    input_hash = capture_command.normalized_input_hash
     forecast_command = ForecastCommand(
         forecast_run_id=forecast.forecast_run_id,
         model_version=forecast.model_version,
@@ -1718,6 +1736,7 @@ __all__ = (
     "ShadowMarketComparison",
     "ShadowRunIdempotencyKeys",
     "ShadowRunRecords",
+    "build_shadow_capture_command",
     "compare_shadow_forecast",
     "deserialize_forecast_context",
     "deserialize_shadow_comparison",

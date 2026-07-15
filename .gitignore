@@ -9,4 +9,5 @@ _tmp_*
 .worktrees/
 data/cache/
 data/ledger/
+data/shadow/
 reports/private/
