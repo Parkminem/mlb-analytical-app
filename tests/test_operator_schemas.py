@@ -41,6 +41,38 @@ def _legacy_decision_mapping() -> dict[str, object]:
     return json.loads(canonical_json(snapshot))
 
 
+def _complete_legacy_decision_mapping() -> dict[str, object]:
+    return {
+        "model_version": "legacy-fixed-v1",
+        "candidates": [
+            {
+                "market": "ml",
+                "score": 78,
+                "decision_rating": "play",
+                "evidence_paths": ["starter_suppression"],
+            }
+        ],
+        "final_priority": ["ml"],
+        "review_bindings": [
+            {
+                "market_key": "game:900001:ml:SEA",
+                "legacy_candidate_index": 0,
+                "legacy_market": "ml",
+                "principal_paths": [
+                    {
+                        "evidence_path": "starter_suppression",
+                        "component_ids": [
+                            "home_pitcher_chain_runs_allowed"
+                        ],
+                        "contradiction_rule": "starter_suppression",
+                    }
+                ],
+            }
+        ],
+        "notes": [],
+    }
+
+
 def projected_bundle_mapping() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -237,6 +269,70 @@ def test_parsing_does_not_run_pregame_service_preflight() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("container_path", "field_name"),
+    (
+        ((), "model_version"),
+        ((), "candidates"),
+        ((), "final_priority"),
+        ((), "review_bindings"),
+        ((), "notes"),
+        (("candidates", 0), "market"),
+        (("candidates", 0), "score"),
+        (("candidates", 0), "decision_rating"),
+        (("candidates", 0), "evidence_paths"),
+        (("review_bindings", 0), "market_key"),
+        (("review_bindings", 0), "legacy_candidate_index"),
+        (("review_bindings", 0), "legacy_market"),
+        (("review_bindings", 0), "principal_paths"),
+        (
+            ("review_bindings", 0, "principal_paths", 0),
+            "evidence_path",
+        ),
+        (
+            ("review_bindings", 0, "principal_paths", 0),
+            "component_ids",
+        ),
+        (
+            ("review_bindings", 0, "principal_paths", 0),
+            "contradiction_rule",
+        ),
+    ),
+)
+def test_legacy_snapshot_requires_every_nested_field_explicitly(
+    container_path: tuple[str | int, ...],
+    field_name: str,
+) -> None:
+    mapping = projected_bundle_mapping()
+    legacy_decision = _complete_legacy_decision_mapping()
+    mapping["payload"]["legacy_decision"] = legacy_decision
+    target: object = legacy_decision
+    for path_part in container_path:
+        target = target[path_part]
+    assert isinstance(target, dict)
+    target.pop(field_name)
+
+    with pytest.raises(
+        BundleValidationError,
+        match=rf"legacy_decision.*{field_name}",
+    ):
+        parse_projected_bundle_json(_raw(mapping))
+
+
+def test_unbound_candidate_cannot_default_omitted_evidence_paths() -> None:
+    mapping = projected_bundle_mapping()
+    legacy_decision = _complete_legacy_decision_mapping()
+    legacy_decision["review_bindings"] = []
+    legacy_decision["candidates"][0].pop("evidence_paths")
+    mapping["payload"]["legacy_decision"] = legacy_decision
+
+    with pytest.raises(
+        BundleValidationError,
+        match="legacy_decision.*evidence_paths",
+    ):
+        parse_projected_bundle_json(_raw(mapping))
+
+
 @pytest.mark.parametrize("location", ["envelope", "payload"])
 def test_bundle_rejects_unknown_fields(location: str) -> None:
     mapping = projected_bundle_mapping()
@@ -402,6 +498,29 @@ def test_review_bundle_round_trips_domain_values_and_optional_closes() -> None:
     mapping["payload"].pop("closing_observations")
     without_closes = parse_review_bundle_json(_raw(mapping))
     assert without_closes.payload.closing_observations == ()
+
+
+@pytest.mark.parametrize(
+    ("container_path", "field_name"),
+    (
+        (("official_result",), "supersedes_record_id"),
+        (("closing_observations", 0), "available_at"),
+        (("closing_observations", 0), "supersedes_record_id"),
+    ),
+)
+def test_review_commands_require_audit_fields_even_when_nullable(
+    container_path: tuple[str | int, ...],
+    field_name: str,
+) -> None:
+    mapping = review_bundle_mapping()
+    target: object = mapping["payload"]
+    for path_part in container_path:
+        target = target[path_part]
+    assert isinstance(target, dict)
+    target.pop(field_name)
+
+    with pytest.raises(BundleValidationError, match=field_name):
+        parse_review_bundle_json(_raw(mapping))
 
 
 @pytest.mark.parametrize(

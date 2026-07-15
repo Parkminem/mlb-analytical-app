@@ -1,5 +1,7 @@
 """Strict version-1 JSON bundle schemas for shadow operator stages."""
 
+from collections.abc import Callable
+from dataclasses import fields
 from datetime import datetime
 import json
 from typing import Literal, TypeVar
@@ -15,7 +17,12 @@ from pydantic import (
 
 from analysis.forecasting import NormalizedGameInput
 from analysis.ledger import MarketObservationCommand, OfficialResultCommand
-from analysis.shadow import LegacyDecisionSnapshot
+from analysis.model import PriorityMarketCandidate
+from analysis.review.classification import PrincipalPathBinding
+from analysis.shadow import (
+    CandidateReviewBinding,
+    LegacyDecisionSnapshot,
+)
 
 from .errors import BundleValidationError
 
@@ -149,6 +156,19 @@ _PROJECTED_ADAPTER = TypeAdapter(ProjectedBundle)
 _CONFIRMED_ADAPTER = TypeAdapter(ConfirmedBundle)
 _REVIEW_ADAPTER = TypeAdapter(ReviewBundle)
 _BundleType = TypeVar("_BundleType", bound=BaseModel)
+_AuditPresenceCheck = Callable[[object], None]
+_LEGACY_SNAPSHOT_FIELDS = tuple(
+    field.name for field in fields(LegacyDecisionSnapshot)
+)
+_LEGACY_CANDIDATE_FIELDS = tuple(
+    field.name for field in fields(PriorityMarketCandidate)
+)
+_LEGACY_BINDING_FIELDS = tuple(
+    field.name for field in fields(CandidateReviewBinding)
+)
+_PRINCIPAL_PATH_FIELDS = tuple(
+    field.name for field in fields(PrincipalPathBinding)
+)
 
 
 def _reject_duplicate_keys(
@@ -164,6 +184,93 @@ def _reject_duplicate_keys(
 
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"invalid JSON number: {value}")
+
+
+def _require_explicit_fields(
+    value: object,
+    field_names: tuple[str, ...],
+    path: str,
+) -> None:
+    if not isinstance(value, dict):
+        return
+    for field_name in field_names:
+        if field_name not in value:
+            raise BundleValidationError(
+                f"missing explicit bundle field: {path}.{field_name}"
+            )
+
+
+def _bundle_payload(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def _require_pregame_audit_fields(value: object) -> None:
+    payload = _bundle_payload(value)
+    if payload is None:
+        return
+    legacy_decision = payload.get("legacy_decision")
+    if not isinstance(legacy_decision, dict):
+        return
+    legacy_path = "payload.legacy_decision"
+    _require_explicit_fields(
+        legacy_decision,
+        _LEGACY_SNAPSHOT_FIELDS,
+        legacy_path,
+    )
+
+    candidates = legacy_decision.get("candidates")
+    if isinstance(candidates, list):
+        for index, candidate in enumerate(candidates):
+            _require_explicit_fields(
+                candidate,
+                _LEGACY_CANDIDATE_FIELDS,
+                f"{legacy_path}.candidates[{index}]",
+            )
+
+    bindings = legacy_decision.get("review_bindings")
+    if not isinstance(bindings, list):
+        return
+    for binding_index, binding in enumerate(bindings):
+        binding_path = f"{legacy_path}.review_bindings[{binding_index}]"
+        _require_explicit_fields(
+            binding,
+            _LEGACY_BINDING_FIELDS,
+            binding_path,
+        )
+        if not isinstance(binding, dict):
+            continue
+        principal_paths = binding.get("principal_paths")
+        if not isinstance(principal_paths, list):
+            continue
+        for path_index, principal_path in enumerate(principal_paths):
+            _require_explicit_fields(
+                principal_path,
+                _PRINCIPAL_PATH_FIELDS,
+                f"{binding_path}.principal_paths[{path_index}]",
+            )
+
+
+def _require_review_audit_fields(value: object) -> None:
+    payload = _bundle_payload(value)
+    if payload is None:
+        return
+    _require_explicit_fields(
+        payload.get("official_result"),
+        ("supersedes_record_id",),
+        "payload.official_result",
+    )
+    closing_observations = payload.get("closing_observations")
+    if not isinstance(closing_observations, list):
+        return
+    for index, observation in enumerate(closing_observations):
+        _require_explicit_fields(
+            observation,
+            ("available_at", "supersedes_record_id"),
+            f"payload.closing_observations[{index}]",
+        )
 
 
 def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
@@ -188,16 +295,18 @@ def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
 def _parse_bundle_json(
     raw: str | bytes | bytearray,
     adapter: TypeAdapter[_BundleType],
+    audit_presence_check: _AuditPresenceCheck,
 ) -> _BundleType:
     raw_bytes, decoded = _raw_json_bytes(raw)
     try:
-        json.loads(
+        decoded_value = json.loads(
             decoded,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_json_constant,
         )
     except (json.JSONDecodeError, ValueError) as error:
         raise BundleValidationError(f"invalid bundle JSON: {error}") from error
+    audit_presence_check(decoded_value)
 
     try:
         return adapter.validate_json(raw_bytes, strict=True)
@@ -208,16 +317,28 @@ def _parse_bundle_json(
 def parse_projected_bundle_json(
     raw: str | bytes | bytearray,
 ) -> ProjectedBundle:
-    return _parse_bundle_json(raw, _PROJECTED_ADAPTER)
+    return _parse_bundle_json(
+        raw,
+        _PROJECTED_ADAPTER,
+        _require_pregame_audit_fields,
+    )
 
 
 def parse_confirmed_bundle_json(
     raw: str | bytes | bytearray,
 ) -> ConfirmedBundle:
-    return _parse_bundle_json(raw, _CONFIRMED_ADAPTER)
+    return _parse_bundle_json(
+        raw,
+        _CONFIRMED_ADAPTER,
+        _require_pregame_audit_fields,
+    )
 
 
 def parse_review_bundle_json(
     raw: str | bytes | bytearray,
 ) -> ReviewBundle:
-    return _parse_bundle_json(raw, _REVIEW_ADAPTER)
+    return _parse_bundle_json(
+        raw,
+        _REVIEW_ADAPTER,
+        _require_review_audit_fields,
+    )
