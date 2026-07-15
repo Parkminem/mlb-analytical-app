@@ -445,6 +445,47 @@ def test_pregame_artifact_failure_reports_committed_progress_and_reruns(
     assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
 
 
+def test_recovery_reread_fault_preserves_original_operator_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+
+    def interrupt_and_break_recovery(bundle, *, root):
+        del bundle, root
+
+        def fail_reread(self, kind=None):
+            del self, kind
+            raise RuntimeError("recovery-api-token-secret")
+
+        monkeypatch.setattr(LedgerStore, "iter_records", fail_reread)
+        raise OperatorIOError("managed bundle persistence interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        interrupt_and_break_recovery,
+    )
+
+    with pytest.raises(
+        OperatorIOError,
+        match="managed bundle persistence interrupted",
+    ) as raised:
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    progress = raised.value.partial_progress
+    assert raised.value.exit_code == 6
+    assert progress.stage == "projected"
+    assert progress.game_pk == bundle.game_pk
+    assert progress.capture_id is None
+    assert progress.rerun_safe is False
+
+
 def test_partial_progress_never_claims_symlinked_managed_bundle(
     tmp_path: Path,
 ) -> None:

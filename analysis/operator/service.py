@@ -2,7 +2,9 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 from types import MappingProxyType
 from typing import TypeVar
 
@@ -143,13 +145,15 @@ class _LedgerSnapshot:
         return iter(self.records)
 
 
-def _partial_progress_records(store: LedgerStore) -> tuple[object, ...]:
+def _partial_progress_records(
+    store: LedgerStore,
+) -> tuple[object, ...] | None:
     """Best-effort authoritative reread that never masks the original error."""
 
     try:
         return _review_ledger_records(store)
-    except OperatorError:
-        return ()
+    except Exception:
+        return None
 
 
 def _single_record(
@@ -168,16 +172,21 @@ def _single_record(
 def _committed_managed_bundle_path(
     bundle: _AnyBundle,
     bundle_root: str | Path,
-    managed_bundle: ManagedBundleCopy | None,
 ) -> Path | None:
-    if managed_bundle is not None:
-        return managed_bundle.path
+    """Best-effort verification of the canonical artifact at its exact path."""
+
+    root_descriptor = -1
+    game_descriptor = -1
+    file_descriptor = -1
     try:
+        expected_bytes = bundle_canonical_bytes(bundle)
+        digest = bundle_sha256(bundle)
         supplied_root = Path(bundle_root).expanduser()
         if supplied_root.is_symlink():
             return None
-        resolved_root = supplied_root.resolve(strict=False)
-        digest = bundle_sha256(bundle)
+        resolved_root = supplied_root.resolve(strict=True)
+        if not resolved_root.is_dir():
+            return None
         game_dir = resolved_root / str(bundle.game_pk)
         if game_dir.is_symlink() or not game_dir.is_dir():
             return None
@@ -196,11 +205,60 @@ def _committed_managed_bundle_path(
         )
         if candidate.is_symlink() or not candidate.is_file():
             return None
-        if candidate.read_bytes() != bundle_canonical_bytes(bundle):
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor = os.open(resolved_root, directory_flags)
+        if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
             return None
-        return candidate.resolve(strict=True)
-    except OSError:
+        game_descriptor = os.open(
+            str(bundle.game_pk),
+            directory_flags,
+            dir_fd=root_descriptor,
+        )
+        if not stat.S_ISDIR(os.fstat(game_descriptor).st_mode):
+            return None
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(
+            candidate.name,
+            file_flags,
+            dir_fd=game_descriptor,
+        )
+        opened_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return None
+        chunks: list[bytes] = []
+        while chunk := os.read(file_descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        if b"".join(chunks) != expected_bytes:
+            return None
+        current_stat = os.stat(
+            candidate.name,
+            dir_fd=game_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or current_stat.st_dev != opened_stat.st_dev
+            or current_stat.st_ino != opened_stat.st_ino
+        ):
+            return None
+        return candidate
+    except Exception:
         return None
+    finally:
+        for descriptor in (
+            file_descriptor,
+            game_descriptor,
+            root_descriptor,
+        ):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except Exception:
+                pass
 
 
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
@@ -393,7 +451,9 @@ def _pregame_partial_progress(
     forecast_replayed: bool | None,
     link_replayed: bool | None,
 ) -> OperatorPartialProgress:
-    records = _partial_progress_records(store)
+    recovered_records = _partial_progress_records(store)
+    reread_succeeded = recovered_records is not None
+    records = () if recovered_records is None else recovered_records
     capture = _single_record(
         records,
         CaptureRecord,
@@ -430,7 +490,6 @@ def _pregame_partial_progress(
         managed_bundle_path=_committed_managed_bundle_path(
             bundle,
             bundle_root,
-            managed_bundle,
         ),
         capture_replayed=(
             capture_replayed if capture is not None else None
@@ -442,6 +501,7 @@ def _pregame_partial_progress(
         managed_bundle_replayed=(
             None if managed_bundle is None else managed_bundle.replayed
         ),
+        rerun_safe=reread_succeeded and capture is not None,
     )
 
 
@@ -538,17 +598,23 @@ def _run_pregame(
             link_replayed=bool(link_replayed),
         )
     except OperatorError as error:
-        progress = _pregame_partial_progress(
-            store,
-            bundle,
-            capture_key=capture_key,
-            forecast_run_id=forecast.forecast_run_id,
-            bundle_root=bundle_root,
-            managed_bundle=managed_bundle,
-            capture_replayed=capture_replayed,
-            forecast_replayed=forecast_replayed,
-            link_replayed=link_replayed,
-        )
+        try:
+            progress = _pregame_partial_progress(
+                store,
+                bundle,
+                capture_key=capture_key,
+                forecast_run_id=forecast.forecast_run_id,
+                bundle_root=bundle_root,
+                managed_bundle=managed_bundle,
+                capture_replayed=capture_replayed,
+                forecast_replayed=forecast_replayed,
+                link_replayed=link_replayed,
+            )
+        except Exception:
+            progress = OperatorPartialProgress(
+                stage=bundle.stage,
+                game_pk=bundle.game_pk,
+            )
         raise error.with_partial_progress(progress) from error
 
 
@@ -1053,7 +1119,9 @@ def _review_partial_progress(
     bundle_root: str | Path,
     managed_bundle: ManagedBundleCopy | None,
 ) -> OperatorPartialProgress:
-    records = _partial_progress_records(store)
+    recovered_records = _partial_progress_records(store)
+    reread_succeeded = recovered_records is not None
+    records = () if recovered_records is None else recovered_records
     closing_records: list[MarketObservationRecord] = []
     for command in bundle.payload.closing_observations:
         record = _single_record(
@@ -1090,10 +1158,18 @@ def _review_partial_progress(
             if record is not None:
                 review_records.append(record)
 
-    managed_path = _committed_managed_bundle_path(
-        bundle,
-        bundle_root,
-        managed_bundle,
+    managed_path = _committed_managed_bundle_path(bundle, bundle_root)
+    latest_capture = (
+        None
+        if not reread_succeeded
+        else _latest_active_capture(
+            tuple(
+                record
+                for record in records
+                if isinstance(record, CaptureRecord)
+            ),
+            bundle.game_pk,
+        )
     )
     return OperatorPartialProgress(
         stage=bundle.stage,
@@ -1108,24 +1184,36 @@ def _review_partial_progress(
             None if result is None else result.envelope.record_id
         ),
         review_record_ids=tuple(
-            record.review_id for record in review_records
+            record.envelope.record_id for record in review_records
         ),
         managed_bundle_path=managed_path,
-        closing_replay_count=sum(
-            record.envelope.record_id in baseline_record_ids
-            for record in closing_records
+        closing_replay_count=(
+            None
+            if not reread_succeeded
+            else sum(
+                record.envelope.record_id in baseline_record_ids
+                for record in closing_records
+            )
         ),
         official_result_replayed=(
             None
-            if result is None
+            if not reread_succeeded or result is None
             else result.envelope.record_id in baseline_record_ids
         ),
-        review_replay_count=sum(
-            record.envelope.record_id in baseline_record_ids
-            for record in review_records
+        review_replay_count=(
+            None
+            if not reread_succeeded
+            else sum(
+                record.envelope.record_id in baseline_record_ids
+                for record in review_records
+            )
         ),
         managed_bundle_replayed=(
             None if managed_bundle is None else managed_bundle.replayed
+        ),
+        rerun_safe=(
+            latest_capture is not None
+            and latest_capture.capture_id == capture.capture_id
         ),
     )
 
@@ -1386,17 +1474,26 @@ def run_review(
             confirmed_decision_counts=confirmed_decision_counts,
         )
     except OperatorError as error:
-        progress = _review_partial_progress(
-            store,
-            bundle,
-            capture=capture,
-            forecast=forecast,
-            link=link,
-            market_keys=market_keys,
-            baseline_record_ids=baseline_record_ids,
-            bundle_root=bundle_root,
-            managed_bundle=managed_bundle,
-        )
+        try:
+            progress = _review_partial_progress(
+                store,
+                bundle,
+                capture=capture,
+                forecast=forecast,
+                link=link,
+                market_keys=market_keys,
+                baseline_record_ids=baseline_record_ids,
+                bundle_root=bundle_root,
+                managed_bundle=managed_bundle,
+            )
+        except Exception:
+            progress = OperatorPartialProgress(
+                stage=bundle.stage,
+                game_pk=bundle.game_pk,
+                capture_id=capture.capture_id,
+                forecast_run_id=forecast.forecast_run_id,
+                capture_forecast_link_record_id=link.envelope.record_id,
+            )
         raise error.with_partial_progress(progress) from error
 
 

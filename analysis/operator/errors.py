@@ -24,7 +24,7 @@ class OperatorPartialProgress:
     official_result_replayed: bool | None = None
     review_replay_count: int | None = None
     managed_bundle_replayed: bool | None = None
-    rerun_safe: bool = True
+    rerun_safe: bool = False
 
 
 class OperatorError(Exception):

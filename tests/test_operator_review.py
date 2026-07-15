@@ -927,11 +927,20 @@ def test_capture_supersession_before_review_append_prevents_review_write(
         append_after_capture_supersession,
     )
 
-    with pytest.raises(OperatorPreconditionError, match="active.*capture"):
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="active.*capture",
+    ) as raised:
         _run(review_context)
 
+    progress = raised.value.partial_progress
+    assert progress.rerun_safe is False
     assert len(_records(review_context, "official_result")) == 1
     assert not _records(review_context, "review")
+
+    monkeypatch.setattr(LedgerStore, "append_review", original)
+    with pytest.raises(OperatorPreconditionError, match="latest active"):
+        _run(review_context)
 
 
 def test_partial_retry_after_close_append_completes_without_duplicates(
@@ -1018,7 +1027,9 @@ def test_partial_retry_after_result_and_one_review_completes_all_sorted_reviews(
     assert progress.official_result_record_id == (
         result_records[0].envelope.record_id
     )
-    assert progress.review_record_ids == (review_records[0].review_id,)
+    assert progress.review_record_ids == (
+        review_records[0].envelope.record_id,
+    )
     assert progress.rerun_safe is True
     assert not tuple(
         (review_context.bundle_root / str(review_context.bundle.game_pk)).glob(
@@ -1075,7 +1086,7 @@ def test_report_failure_reports_all_progress_and_exact_retry_replays(
         result_records[0].envelope.record_id
     )
     assert progress.review_record_ids == tuple(
-        record.review_id for record in review_records
+        record.envelope.record_id for record in review_records
     )
     assert progress.managed_bundle_path is not None
     assert progress.managed_bundle_path.is_file()
@@ -1092,6 +1103,68 @@ def test_report_failure_reports_all_progress_and_exact_retry_replays(
     )
     assert len(_records(review_context, "official_result")) == 1
     assert len(_records(review_context, "review")) == len(review_records)
+
+
+def test_post_persistence_symlink_replacement_is_omitted_from_progress(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "replacement-review-bundle.json"
+
+    def replace_bundle_with_symlink(*args, **kwargs):
+        del args, kwargs
+        game_dir = review_context.bundle_root / str(review_context.bundle.game_pk)
+        (managed_path,) = tuple(game_dir.glob("review-*.json"))
+        outside.write_bytes(managed_path.read_bytes())
+        managed_path.unlink()
+        managed_path.symlink_to(outside)
+        raise OperatorIOError("calibration publication interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        replace_bundle_with_symlink,
+    )
+
+    with pytest.raises(OperatorIOError, match="publication") as raised:
+        _run(review_context)
+
+    progress = raised.value.partial_progress
+    assert progress.managed_bundle_path is None
+    assert progress.rerun_safe is True
+
+
+def test_recovery_hash_fault_preserves_original_operator_error(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt_after_breaking_hash(*args, **kwargs):
+        del args, kwargs
+
+        def fail_hash(bundle):
+            del bundle
+            raise RuntimeError("recovery-hash-api-token-secret")
+
+        monkeypatch.setattr(service_module, "bundle_sha256", fail_hash)
+        raise OperatorIOError("calibration publication interrupted")
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        interrupt_after_breaking_hash,
+    )
+
+    with pytest.raises(
+        OperatorIOError,
+        match="calibration publication interrupted",
+    ) as raised:
+        _run(review_context)
+
+    progress = raised.value.partial_progress
+    assert raised.value.exit_code == 6
+    assert progress.managed_bundle_path is None
+    assert progress.rerun_safe is True
 
 
 def test_review_bundle_is_persisted_only_after_all_ledger_operations_succeed(
@@ -1142,5 +1215,8 @@ def test_review_result_score_conservation_errors_remain_bundle_validation_errors
         "home_bullpen_runs_allowed": 1.0,
     }
 
-    with pytest.raises(BundleValidationError, match="must sum"):
+    with pytest.raises(
+        BundleValidationError,
+        match="payload.official_result: invalid_value",
+    ):
         parse_review_bundle_json(_raw(mapping))

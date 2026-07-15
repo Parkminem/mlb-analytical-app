@@ -178,13 +178,14 @@ def _reject_duplicate_keys(
     value: dict[str, object] = {}
     for key, item in pairs:
         if key in value:
-            raise ValueError(f"duplicate JSON object key: {key}")
+            raise ValueError("duplicate JSON object key")
         value[key] = item
     return value
 
 
 def _reject_json_constant(value: str) -> object:
-    raise ValueError(f"invalid JSON number: {value}")
+    del value
+    raise ValueError("invalid JSON number")
 
 
 def _require_explicit_fields(
@@ -280,7 +281,7 @@ def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
             return raw.encode("utf-8"), raw
         except UnicodeEncodeError as error:
             raise BundleValidationError(
-                f"bundle JSON must be valid UTF-8: {error}"
+                "bundle JSON must be valid UTF-8"
             ) from error
     if isinstance(raw, (bytes, bytearray)):
         raw_bytes = bytes(raw)
@@ -288,7 +289,7 @@ def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
             return raw_bytes, raw_bytes.decode("utf-8")
         except UnicodeDecodeError as error:
             raise BundleValidationError(
-                f"bundle JSON must be valid UTF-8: {error}"
+                "bundle JSON must be valid UTF-8"
             ) from error
     raise BundleValidationError("bundle JSON must be raw UTF-8 text or bytes")
 
@@ -303,19 +304,25 @@ def _decode_bundle_json(
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_json_constant,
         )
-    except (json.JSONDecodeError, ValueError) as error:
+    except json.JSONDecodeError as error:
+        raise BundleValidationError(
+            "invalid bundle JSON: malformed JSON"
+        ) from error
+    except ValueError as error:
         raise BundleValidationError(f"invalid bundle JSON: {error}") from error
     return raw_bytes, decoded_value
 
 
-def bundle_stage_from_json(raw: str | bytes | bytearray) -> str | None:
+def bundle_stage_from_json(raw: str | bytes | bytearray) -> str:
     """Return a recognized envelope stage without validating its payload."""
 
     _, decoded_value = _decode_bundle_json(raw)
     if not isinstance(decoded_value, dict):
-        return None
+        raise BundleValidationError("invalid bundle: stage envelope")
     stage = decoded_value.get("stage")
-    return stage if stage in _KNOWN_BUNDLE_STAGES else None
+    if not isinstance(stage, str) or stage not in _KNOWN_BUNDLE_STAGES:
+        raise BundleValidationError("invalid bundle: stage envelope")
+    return stage
 
 
 def _validation_location(location: tuple[object, ...]) -> str:
@@ -323,12 +330,41 @@ def _validation_location(location: tuple[object, ...]) -> str:
 
 
 def _safe_validation_diagnostics(error: ValidationError) -> str:
+    safe_categories = {
+        "bool_type": "invalid_type",
+        "date_type": "invalid_type",
+        "datetime_type": "invalid_type",
+        "dict_type": "invalid_type",
+        "extra_forbidden": "extra_forbidden",
+        "finite_number": "invalid_value",
+        "float_type": "invalid_type",
+        "greater_than": "invalid_value",
+        "greater_than_equal": "invalid_value",
+        "int_type": "invalid_type",
+        "is_instance_of": "invalid_type",
+        "less_than": "invalid_value",
+        "less_than_equal": "invalid_value",
+        "list_type": "invalid_type",
+        "literal_error": "invalid_literal",
+        "missing": "missing",
+        "set_type": "invalid_type",
+        "string_type": "invalid_type",
+        "tuple_type": "invalid_type",
+        "value_error": "invalid_value",
+    }
     diagnostics: list[str] = []
     for detail in error.errors(include_input=False, include_url=False):
-        location = _validation_location(tuple(detail.get("loc", ())))
-        message = str(detail.get("msg", "validation failed"))
-        error_type = str(detail.get("type", "validation_error"))
-        diagnostics.append(f"{location}: {message} [type={error_type}]")
+        raw_location = detail.get("loc", ())
+        location = _validation_location(
+            tuple(raw_location) if isinstance(raw_location, tuple) else ()
+        )
+        raw_type = detail.get("type")
+        category = safe_categories.get(raw_type, "validation_error")
+        if raw_type == "value_error" and location.endswith("schema_version"):
+            category = "invalid_integer"
+        elif raw_type == "value_error" and location.endswith("created_at"):
+            category = "invalid_timezone"
+        diagnostics.append(f"{location}: {category}")
     return "; ".join(diagnostics) or "bundle validation failed"
 
 

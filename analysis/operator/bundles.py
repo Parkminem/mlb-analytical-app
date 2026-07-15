@@ -13,7 +13,7 @@ from pydantic import TypeAdapter
 from analysis.forecasting.identity import canonical_json
 from analysis.ledger import CaptureCommand
 
-from .errors import BundleValidationError, OperatorIOError
+from .errors import OperatorIOError
 from .schemas import (
     ConfirmedBundle,
     ProjectedBundle,
@@ -63,15 +63,7 @@ def load_bundle(path: str | os.PathLike[str]) -> _Bundle:
             f"unable to read bundle {bundle_path}: {error}"
         ) from error
     stage = bundle_stage_from_json(raw)
-    if stage is not None:
-        return _BUNDLE_PARSERS[stage](raw)
-    parse_errors: list[BundleValidationError] = []
-    for candidate in _BUNDLE_PARSERS.values():
-        try:
-            return candidate(raw)
-        except BundleValidationError as error:
-            parse_errors.append(error)
-    raise parse_errors[0]
+    return _BUNDLE_PARSERS[stage](raw)
 
 
 def _serialized_bundle(bundle: _Bundle) -> dict[str, object]:

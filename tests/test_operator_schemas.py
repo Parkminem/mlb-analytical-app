@@ -15,6 +15,7 @@ from analysis.operator.errors import (
     BundleValidationError,
     OperatorIOError,
     OperatorLedgerError,
+    OperatorPartialProgress,
     OperatorPreconditionError,
 )
 from analysis.operator.schemas import (
@@ -28,6 +29,12 @@ from tests.test_forecasting_inputs import complete_forecast_game
 
 UTC = timezone.utc
 GAME_PK = 900001
+
+
+def test_partial_progress_is_not_rerun_safe_without_authoritative_state() -> None:
+    progress = OperatorPartialProgress(stage="projected", game_pk=GAME_PK)
+
+    assert progress.rerun_safe is False
 
 
 def _legacy_decision_mapping() -> dict[str, object]:
@@ -180,8 +187,15 @@ def test_current_registry_file_exactly_matches_default_config() -> None:
 
 
 def test_unknown_registry_version_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(BundleValidationError, match="unknown forecast config"):
-        load_forecast_config("missing", registry_root=tmp_path)
+    secret_version = "missing-api-token-secret"
+
+    with pytest.raises(
+        BundleValidationError,
+        match="unknown forecast config",
+    ) as raised:
+        load_forecast_config(secret_version, registry_root=tmp_path)
+
+    assert secret_version not in str(raised.value)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unknown"])
@@ -205,11 +219,54 @@ def test_registry_rejects_filename_content_version_mismatch(
     tmp_path: Path,
 ) -> None:
     mapping = SimulationConfig().to_mapping()
-    path = tmp_path / "historical-complete.json"
+    filename_secret = "filename-api-token-secret"
+    content_secret = "content-api-token-secret"
+    mapping["version"] = content_secret
+    path = tmp_path / f"{filename_secret}.json"
     path.write_text(json.dumps(mapping), encoding="utf-8")
 
-    with pytest.raises(BundleValidationError, match="filename/content version"):
-        load_forecast_config("historical-complete", registry_root=tmp_path)
+    with pytest.raises(
+        BundleValidationError,
+        match="filename/content version",
+    ) as raised:
+        load_forecast_config(filename_secret, registry_root=tmp_path)
+
+    assert filename_secret not in str(raised.value)
+    assert content_secret not in str(raised.value)
+
+
+def test_registry_parse_error_does_not_echo_secret_content(
+    tmp_path: Path,
+) -> None:
+    version = "historical-invalid"
+    secret_key = "api_token_secret_duplicate_key"
+    (tmp_path / f"{version}.json").write_text(
+        '{"' + secret_key + '": 1, "' + secret_key + '": 2}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError) as raised:
+        load_forecast_config(version, registry_root=tmp_path)
+
+    assert secret_key not in str(raised.value)
+
+
+def test_registry_simulation_validation_does_not_echo_secret_value(
+    tmp_path: Path,
+) -> None:
+    version = "historical-invalid-simulation"
+    secret_value = "simulation-api-token-secret"
+    mapping = SimulationConfig().to_mapping()
+    mapping.update(version=version, simulations=secret_value)
+    (tmp_path / f"{version}.json").write_text(
+        json.dumps(mapping),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError) as raised:
+        load_forecast_config(version, registry_root=tmp_path)
+
+    assert secret_value not in str(raised.value)
 
 
 def test_registry_loads_second_complete_historical_config_without_defaults(
@@ -410,19 +467,25 @@ def test_bundle_rejects_non_finite_json_numbers(constant: float) -> None:
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "diagnostic"),
     (
-        lambda mapping: mapping.update(created_at="2026-07-14T01:35:00"),
-        lambda mapping: mapping["payload"]["game_input"].update(
-            captured_at="2026-07-14T01:30:00"
+        (
+            lambda mapping: mapping.update(created_at="2026-07-14T01:35:00"),
+            "created_at: invalid_timezone",
+        ),
+        (
+            lambda mapping: mapping["payload"]["game_input"].update(
+                captured_at="2026-07-14T01:30:00"
+            ),
+            "payload.game_input: invalid_value",
         ),
     ),
 )
-def test_bundle_rejects_naive_timestamps(mutate) -> None:
+def test_bundle_rejects_naive_timestamps(mutate, diagnostic: str) -> None:
     mapping = projected_bundle_mapping()
     mutate(mapping)
 
-    with pytest.raises(BundleValidationError, match="timezone|offset|aware"):
+    with pytest.raises(BundleValidationError, match=diagnostic):
         parse_projected_bundle_json(_raw(mapping))
 
 
@@ -470,7 +533,7 @@ def test_pregame_envelope_game_pk_must_match_game_identity() -> None:
     mapping = projected_bundle_mapping()
     mapping["game_pk"] = GAME_PK + 1
 
-    with pytest.raises(BundleValidationError, match="game_pk.*game_input"):
+    with pytest.raises(BundleValidationError, match="bundle: invalid_value"):
         parse_projected_bundle_json(_raw(mapping))
 
 
@@ -478,7 +541,10 @@ def test_domain_construction_failures_map_to_bundle_validation_error() -> None:
     mapping = projected_bundle_mapping()
     mapping["payload"]["game_input"]["identity"]["away_team"] = ""
 
-    with pytest.raises(BundleValidationError, match="away_team") as captured:
+    with pytest.raises(
+        BundleValidationError,
+        match="payload.game_input.identity: invalid_value",
+    ) as captured:
         parse_projected_bundle_json(_raw(mapping))
 
     assert captured.value.__cause__ is not None
@@ -543,7 +609,7 @@ def test_review_envelope_game_pk_must_match_official_result() -> None:
     mapping = review_bundle_mapping()
     mapping["game_pk"] = GAME_PK + 1
 
-    with pytest.raises(BundleValidationError, match="game_pk.*official_result"):
+    with pytest.raises(BundleValidationError, match="bundle: invalid_value"):
         parse_review_bundle_json(_raw(mapping))
 
 
@@ -566,7 +632,10 @@ def test_review_bundle_requires_strict_closing_terms(
     mapping = review_bundle_mapping()
     mapping["payload"]["closing_observations"][0][field_name] = value
 
-    with pytest.raises(BundleValidationError, match=field_name):
+    with pytest.raises(
+        BundleValidationError,
+        match="payload.*invalid_value",
+    ):
         parse_review_bundle_json(_raw(mapping))
 
 
@@ -574,7 +643,7 @@ def test_review_closing_observation_must_match_bundle_game() -> None:
     mapping = review_bundle_mapping()
     mapping["payload"]["closing_observations"][0]["game_pk"] = GAME_PK + 1
 
-    with pytest.raises(BundleValidationError, match="closing.*game_pk"):
+    with pytest.raises(BundleValidationError, match="bundle: invalid_value"):
         parse_review_bundle_json(_raw(mapping))
 
 
@@ -582,7 +651,10 @@ def test_review_domain_errors_map_to_bundle_validation_error() -> None:
     mapping = review_bundle_mapping()
     mapping["payload"]["official_result"]["home_full_runs"] = 4
 
-    with pytest.raises(BundleValidationError, match="winner") as captured:
+    with pytest.raises(
+        BundleValidationError,
+        match="payload.official_result: invalid_value",
+    ) as captured:
         parse_review_bundle_json(_raw(mapping))
 
     assert captured.value.__cause__ is not None

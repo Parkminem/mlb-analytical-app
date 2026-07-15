@@ -451,6 +451,80 @@ def test_malicious_unknown_bundle_value_is_never_printed(
     assert "Traceback" not in result.output
 
 
+def test_custom_validator_diagnostic_never_prints_secret_key(
+    tmp_path: Path,
+) -> None:
+    secret_key = "component-api-token-secret"
+    mapping = review_bundle_mapping()
+    mapping["payload"]["official_result"]["component_values"] = {
+        secret_key: 1.0,
+    }
+    bundle_path = tmp_path / "review-secret-component.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        ["review", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert "payload.official_result" in result.output
+    assert "invalid_value" in result.output
+    assert secret_key not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_validation_diagnostic_never_prints_secret_value(
+    tmp_path: Path,
+) -> None:
+    secret_value = "component-value-api-token-secret"
+    mapping = review_bundle_mapping()
+    mapping["payload"]["official_result"]["component_values"] = {
+        "home_pitcher_chain_runs_allowed": secret_value,
+    }
+    bundle_path = tmp_path / "review-secret-component-value.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        ["review", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert "payload.official_result.component_values" in result.output
+    assert "invalid_type" in result.output
+    assert secret_value not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_forecast_config_version_secret_is_not_printed(
+    tmp_path: Path,
+) -> None:
+    secret_version = "forecast-api-token-secret"
+    mapping = confirmed_bundle_mapping()
+    mapping["payload"]["forecast_config_version"] = secret_version
+    bundle_path = tmp_path / "confirmed-secret-config.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "confirmed",
+            "--bundle",
+            str(bundle_path),
+            "--ledger",
+            str(tmp_path / "ledger.jsonl"),
+            "--bundle-root",
+            str(tmp_path / "bundles"),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "unknown forecast config" in result.output
+    assert secret_version not in result.output
+    assert "Traceback" not in result.output
+
+
 @pytest.mark.parametrize(
     ("command", "mapping_factory", "missing_path"),
     (
@@ -508,6 +582,42 @@ def test_valid_wrong_stage_bundle_is_a_cli_precondition(
 
     assert result.exit_code == 4
     assert "bundle stage/type mismatch" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("command", ("projected", "confirmed", "review"))
+@pytest.mark.parametrize(
+    ("stage_kind", "stage_value"),
+    (
+        ("list", ["projected"]),
+        ("object", {"name": "projected"}),
+        ("unknown", "unknown-stage-api-token-secret"),
+        ("missing", None),
+    ),
+)
+def test_invalid_stage_envelope_has_common_safe_diagnostic(
+    tmp_path: Path,
+    command: str,
+    stage_kind: str,
+    stage_value: object,
+) -> None:
+    mapping = projected_bundle_mapping()
+    if stage_kind == "missing":
+        del mapping["stage"]
+    else:
+        mapping["stage"] = stage_value
+    bundle_path = tmp_path / f"{command}-{stage_kind}.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        [command, "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert "stage envelope" in result.output
+    assert "unknown-stage-api-token-secret" not in result.output
+    assert "literal_error" not in result.output
     assert "Traceback" not in result.output
 
 
