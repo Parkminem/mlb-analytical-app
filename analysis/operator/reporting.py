@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import stat
-import tempfile
 
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
@@ -23,6 +22,15 @@ from analysis.review.calibration import (
 from analysis.shadow import deserialize_shadow_comparison
 
 from .errors import OperatorIOError, OperatorLedgerError
+from .fdio import (
+    create_temporary_directory,
+    create_temporary_symlink,
+    open_directory,
+    read_regular_file,
+    stat_at,
+    verify_child_directory,
+    verify_public_directory,
+)
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -87,7 +95,7 @@ class _StaleCalibrationPublicationError(Exception):
 
 @dataclass(frozen=True)
 class _CurrentGeneration:
-    generation_dir: Path
+    generation_name: str
     mapping: Mapping[str, object] | None
 
     @property
@@ -434,15 +442,12 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _open_directory_without_following_links(path: Path) -> int:
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    return os.open(path, flags)
-
-
-def _path_exists(path: Path) -> bool:
-    return os.path.lexists(path)
+def _open_directory_without_following_links(
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    return open_directory(path, dir_fd=dir_fd)
 
 
 def _report_revision(
@@ -489,37 +494,71 @@ def _report_ledger_path(
     return ledger_path
 
 
-def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+def _open_generations_directory(report_descriptor: int) -> int:
+    metadata = stat_at(report_descriptor, GENERATIONS_DIRNAME)
+    if metadata is None:
+        os.mkdir(GENERATIONS_DIRNAME, mode=0o700, dir_fd=report_descriptor)
+        os.fsync(report_descriptor)
+    elif stat.S_ISLNK(metadata.st_mode):
+        raise OperatorIOError(
+            "calibration generations directory cannot be a symbolic link"
+        )
+    elif not stat.S_ISDIR(metadata.st_mode):
+        raise OperatorIOError(
+            "calibration generations path must be a directory"
+        )
+    return _open_directory_without_following_links(
+        GENERATIONS_DIRNAME,
+        dir_fd=report_descriptor,
+    )
+
+
+def _open_generation_directory(
+    generations_descriptor: int,
+    generation_name: str,
+) -> int:
+    metadata = stat_at(generations_descriptor, generation_name)
+    if (
+        metadata is None
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise OperatorIOError(
+            "calibration generation directory is missing or unsafe: "
+            f"{generation_name}"
+        )
+    return _open_directory_without_following_links(
+        generation_name,
+        dir_fd=generations_descriptor,
+    )
+
+
+def _read_generation_bytes(
+    generations_descriptor: int,
+    generation_name: str,
+) -> tuple[bytes, bytes]:
+    generation_descriptor = _open_generation_directory(
+        generations_descriptor,
+        generation_name,
+    )
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise OperatorIOError(
-                f"calibration generation path must be a regular file: {path}"
-            )
-        with os.fdopen(descriptor, "rb") as report_file:
-            descriptor = -1
-            return report_file.read()
+        return (
+            read_regular_file(
+                generation_descriptor,
+                CALIBRATION_JSON_FILENAME,
+                label="calibration generation JSON",
+            ),
+            read_regular_file(
+                generation_descriptor,
+                CALIBRATION_MARKDOWN_FILENAME,
+                label="calibration generation Markdown",
+            ),
+        )
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        os.close(generation_descriptor)
 
 
-def _read_generation_bytes(generation_dir: Path) -> tuple[bytes, bytes]:
-    json_path = generation_dir / CALIBRATION_JSON_FILENAME
-    markdown_path = generation_dir / CALIBRATION_MARKDOWN_FILENAME
-    for path in (json_path, markdown_path):
-        if path.is_symlink() or not path.is_file():
-            raise OperatorIOError(
-                f"calibration generation file is missing or unsafe: {path}"
-            )
-    return _read_regular_file(json_path), _read_regular_file(markdown_path)
-
-
-def _read_generation_mapping(
-    generation_dir: Path,
-    raw_json: bytes,
-) -> Mapping[str, object]:
+def _read_generation_mapping(raw_json: bytes) -> Mapping[str, object]:
     try:
         mapping = json.loads(raw_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -544,18 +583,19 @@ def _compatibility_generation_name(
 
 
 def _current_generation(
-    report_dir: Path,
-    generations_dir: Path,
+    report_descriptor: int,
+    generations_descriptor: int,
 ) -> _CurrentGeneration | None:
-    current_path = report_dir / CURRENT_GENERATION_NAME
-    if not _path_exists(current_path):
+    current_metadata = stat_at(report_descriptor, CURRENT_GENERATION_NAME)
+    if current_metadata is None:
         return None
-    if not current_path.is_symlink():
+    if not stat.S_ISLNK(current_metadata.st_mode):
         raise OperatorIOError(
-            f"calibration current generation must be a symbolic link: "
-            f"{current_path}"
+            "calibration current generation must be a symbolic link"
         )
-    target = Path(os.readlink(current_path))
+    target = Path(
+        os.readlink(CURRENT_GENERATION_NAME, dir_fd=report_descriptor)
+    )
     if (
         target.is_absolute()
         or len(target.parts) != 2
@@ -565,109 +605,109 @@ def _current_generation(
         raise OperatorIOError(
             f"calibration current generation target is unsafe: {target}"
         )
-    generation_path = report_dir / target
-    if generation_path.is_symlink() or not generation_path.is_dir():
-        raise OperatorIOError(
-            f"calibration current generation is missing or unsafe: "
-            f"{generation_path}"
-        )
-    resolved_generation = generation_path.resolve(strict=True)
-    if resolved_generation.parent != generations_dir.resolve(strict=True):
-        raise OperatorIOError(
-            "calibration current generation escapes the generations directory"
-        )
-    raw_json, raw_markdown = _read_generation_bytes(resolved_generation)
-    marker_path = (
-        resolved_generation / COMPATIBILITY_MIGRATION_MARKER_FILENAME
+    generation_name = target.parts[1]
+    raw_json, raw_markdown = _read_generation_bytes(
+        generations_descriptor,
+        generation_name,
     )
-    if _path_exists(marker_path):
-        if marker_path.is_symlink() or not marker_path.is_file():
+    generation_descriptor = _open_generation_directory(
+        generations_descriptor,
+        generation_name,
+    )
+    try:
+        marker_metadata = stat_at(
+            generation_descriptor,
+            COMPATIBILITY_MIGRATION_MARKER_FILENAME,
+        )
+        if marker_metadata is None:
+            return _CurrentGeneration(
+                generation_name,
+                _read_generation_mapping(raw_json),
+            )
+        if (
+            stat.S_ISLNK(marker_metadata.st_mode)
+            or not stat.S_ISREG(marker_metadata.st_mode)
+        ):
             raise OperatorIOError(
                 "calibration compatibility migration marker is unsafe"
             )
         if (
-            _read_regular_file(marker_path)
+            read_regular_file(
+                generation_descriptor,
+                COMPATIBILITY_MIGRATION_MARKER_FILENAME,
+                label="calibration compatibility migration marker",
+            )
             != _COMPATIBILITY_MIGRATION_MARKER_BYTES
-            or resolved_generation.name
+            or generation_name
             != _compatibility_generation_name(raw_json, raw_markdown)
         ):
             raise OperatorLedgerError(
                 "calibration compatibility migration generation is corrupt"
             )
-        return _CurrentGeneration(resolved_generation, None)
-    return _CurrentGeneration(
-        resolved_generation,
-        _read_generation_mapping(resolved_generation, raw_json),
-    )
+        return _CurrentGeneration(generation_name, None)
+    finally:
+        os.close(generation_descriptor)
 
 
 def _compatibility_target(filename: str) -> str:
     return f"{CURRENT_GENERATION_NAME}/{filename}"
 
 
-def _compatibility_path_status(path: Path, target: str) -> str:
-    if not _path_exists(path):
+def _compatibility_path_status(
+    report_descriptor: int,
+    filename: str,
+    target: str,
+) -> str:
+    metadata = stat_at(report_descriptor, filename)
+    if metadata is None:
         return "missing"
-    if path.is_symlink():
-        if os.readlink(path) != target:
+    if stat.S_ISLNK(metadata.st_mode):
+        if os.readlink(filename, dir_fd=report_descriptor) != target:
             raise OperatorIOError(
-                f"calibration report path has an unsafe symbolic link: {path}"
+                "calibration report path has an unsafe symbolic link: "
+                f"{filename}"
             )
         return "link"
-    if not path.is_file():
+    if not stat.S_ISREG(metadata.st_mode):
         raise OperatorIOError(
             f"calibration report path must be a regular file or managed link: "
-            f"{path}"
+            f"{filename}"
         )
     return "regular"
 
 
-def _remove_staging_directory(
-    staging_dir: Path,
-    staged_name: str,
-) -> None:
-    staged_path = staging_dir / staged_name
-    try:
-        staged_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    try:
-        staging_dir.rmdir()
-    except OSError:
-        pass
-
-
 def _replace_with_symlink(
-    destination: Path,
+    report_descriptor: int,
+    destination: str,
     target: str,
 ) -> None:
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            dir=destination.parent,
-        )
+    staged_name = create_temporary_symlink(
+        report_descriptor,
+        target,
+        prefix=f".{destination}.",
+        suffix=".tmp",
+        target_is_directory=False,
     )
-    staged_path = staging_dir / destination.name
     try:
-        os.symlink(target, staged_path, target_is_directory=False)
-        staging_descriptor = _open_directory_without_following_links(staging_dir)
-        try:
-            os.fsync(staging_descriptor)
-        finally:
-            os.close(staging_descriptor)
-        os.replace(staged_path, destination)
+        os.replace(
+            staged_name,
+            destination,
+            src_dir_fd=report_descriptor,
+            dst_dir_fd=report_descriptor,
+        )
     finally:
-        _remove_staging_directory(staging_dir, destination.name)
+        try:
+            os.unlink(staged_name, dir_fd=report_descriptor)
+        except FileNotFoundError:
+            pass
 
 
 def _compatibility_entries(
-    report_dir: Path,
-) -> tuple[tuple[str, Path, str], ...]:
+    report_descriptor: int,
+) -> tuple[tuple[str, str], ...]:
     return tuple(
         (
             filename,
-            report_dir / filename,
             _compatibility_target(filename),
         )
         for filename in (
@@ -678,16 +718,19 @@ def _compatibility_entries(
 
 
 def _prepare_compatibility_links(
-    report_dir: Path,
-    directory_descriptor: int,
-    generations_dir: Path,
+    report_path: Path,
+    report_descriptor: int,
     generations_descriptor: int,
     current: _CurrentGeneration | None,
 ) -> _CurrentGeneration | None:
-    entries = _compatibility_entries(report_dir)
+    entries = _compatibility_entries(report_descriptor)
     statuses = {
-        filename: _compatibility_path_status(path, target)
-        for filename, path, target in entries
+        filename: _compatibility_path_status(
+            report_descriptor,
+            filename,
+            target,
+        )
+        for filename, target in entries
     }
     regular_entries = tuple(
         entry for entry in entries if statuses[entry[0]] == "regular"
@@ -695,13 +738,17 @@ def _prepare_compatibility_links(
 
     if not regular_entries:
         changed = False
-        for filename, path, target in entries:
+        for filename, target in entries:
             if statuses[filename] != "missing":
                 continue
-            _replace_with_symlink(path, target)
+            _replace_with_symlink(
+                report_descriptor,
+                filename,
+                target,
+            )
             changed = True
         if changed:
-            os.fsync(directory_descriptor)
+            os.fsync(report_descriptor)
         return current
 
     if any(status == "missing" for status in statuses.values()):
@@ -715,16 +762,19 @@ def _prepare_compatibility_links(
                 "cannot resume a partial legacy calibration conversion "
                 "without its migration generation"
             )
-        legacy_json = _read_regular_file(
-            report_dir / CALIBRATION_JSON_FILENAME
+        legacy_json = read_regular_file(
+            report_descriptor,
+            CALIBRATION_JSON_FILENAME,
+            label="legacy calibration JSON",
         )
-        legacy_markdown = _read_regular_file(
-            report_dir / CALIBRATION_MARKDOWN_FILENAME
+        legacy_markdown = read_regular_file(
+            report_descriptor,
+            CALIBRATION_MARKDOWN_FILENAME,
+            label="legacy calibration Markdown",
         )
         # Convert each path through a current generation with identical bytes.
-        migration_dir, migration_created = (
+        migration_name, migration_created = (
             _materialize_compatibility_generation(
-                generations_dir,
                 generations_descriptor,
                 legacy_json,
                 legacy_markdown,
@@ -732,44 +782,64 @@ def _prepare_compatibility_links(
         )
         migration_pointer_replaced = False
         try:
-            _swap_current_pointer(report_dir, migration_dir.name)
+            _publish_current_pointer(
+                report_path,
+                report_descriptor,
+                generations_descriptor,
+                migration_name,
+                None,
+            )
             migration_pointer_replaced = True
-            os.fsync(directory_descriptor)
         finally:
             if migration_created and not migration_pointer_replaced:
-                _remove_generation_directory(migration_dir)
-                try:
-                    os.fsync(generations_descriptor)
-                except OSError:
-                    pass
-        current = _CurrentGeneration(migration_dir, None)
+                _remove_generation_directory(
+                    generations_descriptor,
+                    migration_name,
+                )
+        current = _CurrentGeneration(migration_name, None)
     elif not current.is_compatibility_migration:
         raise OperatorIOError(
             "cannot atomically convert legacy calibration files while a "
             "published current generation exists"
         )
 
-    for filename, path, _ in regular_entries:
-        expected = _read_regular_file(current.generation_dir / filename)
-        if _read_regular_file(path) != expected:
+    for filename, _ in regular_entries:
+        expected = _read_generation_member(
+            generations_descriptor,
+            current.generation_name,
+            filename,
+        )
+        if read_regular_file(
+            report_descriptor,
+            filename,
+            label=f"legacy calibration path {filename}",
+        ) != expected:
             raise OperatorLedgerError(
                 "legacy calibration compatibility content changed during "
                 "migration"
             )
 
-    for filename, path, target in regular_entries:
-        _replace_with_symlink(path, target)
+    for filename, target in regular_entries:
+        _replace_with_symlink(
+            report_descriptor,
+            filename,
+            target,
+        )
     if regular_entries:
-        os.fsync(directory_descriptor)
+        os.fsync(report_descriptor)
     return current
 
 
 def _require_equal_revision_content(
-    generation_dir: Path,
+    generations_descriptor: int,
+    generation_name: str,
     json_bytes: bytes,
     markdown_bytes: bytes,
 ) -> None:
-    published_json, published_markdown = _read_generation_bytes(generation_dir)
+    published_json, published_markdown = _read_generation_bytes(
+        generations_descriptor,
+        generation_name,
+    )
     mismatches: list[str] = []
     if published_json != json_bytes:
         mismatches.append("JSON")
@@ -783,206 +853,316 @@ def _require_equal_revision_content(
         )
 
 
-def _write_generation_file(path: Path, content: bytes) -> None:
+def _verify_report_directories(
+    report_path: Path,
+    report_descriptor: int,
+    generations_descriptor: int,
+) -> None:
+    verify_public_directory(
+        report_path,
+        report_descriptor,
+        label="calibration report directory",
+    )
+    verify_child_directory(
+        report_descriptor,
+        GENERATIONS_DIRNAME,
+        generations_descriptor,
+        label="calibration generations directory",
+    )
+
+
+def _read_generation_member(
+    generations_descriptor: int,
+    generation_name: str,
+    filename: str,
+) -> bytes:
+    generation_descriptor = _open_generation_directory(
+        generations_descriptor,
+        generation_name,
+    )
+    try:
+        return read_regular_file(
+            generation_descriptor,
+            filename,
+            label=f"calibration generation member {filename}",
+        )
+    finally:
+        os.close(generation_descriptor)
+
+
+def _write_generation_file(
+    directory_descriptor: int,
+    filename: str,
+    content: bytes,
+) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = os.open(
+        filename,
+        flags,
+        0o600,
+        dir_fd=directory_descriptor,
+    )
     with os.fdopen(descriptor, "wb") as report_file:
         report_file.write(content)
         report_file.flush()
         os.fsync(report_file.fileno())
 
 
-def _materialize_compatibility_generation(
-    generations_dir: Path,
+def _remove_generation_directory(
     generations_descriptor: int,
-    json_bytes: bytes,
-    markdown_bytes: bytes,
-) -> tuple[Path, bool]:
-    generation_dir = generations_dir / _compatibility_generation_name(
-        json_bytes,
-        markdown_bytes,
-    )
-    if _path_exists(generation_dir):
-        marker_path = (
-            generation_dir / COMPATIBILITY_MIGRATION_MARKER_FILENAME
-        )
-        if (
-            generation_dir.is_symlink()
-            or not generation_dir.is_dir()
-            or marker_path.is_symlink()
-            or not marker_path.is_file()
-            or _read_regular_file(marker_path)
-            != _COMPATIBILITY_MIGRATION_MARKER_BYTES
-            or _read_generation_bytes(generation_dir)
-            != (json_bytes, markdown_bytes)
-        ):
-            raise OperatorLedgerError(
-                "legacy calibration compatibility generation conflicts with "
-                "its content hash"
-            )
-        return generation_dir.resolve(strict=True), False
-
-    temporary_dir: Path | None = Path(
-        tempfile.mkdtemp(
-            prefix=f".{generation_dir.name}.",
-            suffix=".tmp",
-            dir=generations_dir,
-        )
-    )
+    generation_name: str,
+) -> None:
+    metadata = stat_at(generations_descriptor, generation_name)
+    if (
+        metadata is None
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        return
     try:
-        _write_generation_file(
-            temporary_dir / CALIBRATION_JSON_FILENAME,
-            json_bytes,
+        generation_descriptor = _open_generation_directory(
+            generations_descriptor,
+            generation_name,
         )
-        _write_generation_file(
-            temporary_dir / CALIBRATION_MARKDOWN_FILENAME,
-            markdown_bytes,
-        )
-        _write_generation_file(
-            temporary_dir / COMPATIBILITY_MIGRATION_MARKER_FILENAME,
-            _COMPATIBILITY_MIGRATION_MARKER_BYTES,
-        )
-        temporary_descriptor = _open_directory_without_following_links(
-            temporary_dir
-        )
-        try:
-            os.fsync(temporary_descriptor)
-        finally:
-            os.close(temporary_descriptor)
-        os.replace(temporary_dir, generation_dir)
-        temporary_dir = None
-        try:
-            os.fsync(generations_descriptor)
-        except OSError:
-            _remove_generation_directory(generation_dir)
+    except OSError:
+        return
+    try:
+        for filename in (
+            CALIBRATION_JSON_FILENAME,
+            CALIBRATION_MARKDOWN_FILENAME,
+            COMPATIBILITY_MIGRATION_MARKER_FILENAME,
+        ):
             try:
-                os.fsync(generations_descriptor)
+                os.unlink(filename, dir_fd=generation_descriptor)
             except OSError:
                 pass
-            raise
-        return generation_dir.resolve(strict=True), True
-    finally:
-        if temporary_dir is not None:
-            _remove_generation_directory(temporary_dir)
-
-
-def _remove_generation_directory(path: Path) -> None:
-    if not _path_exists(path) or path.is_symlink() or not path.is_dir():
-        return
-    for filename in (
-        CALIBRATION_JSON_FILENAME,
-        CALIBRATION_MARKDOWN_FILENAME,
-        COMPATIBILITY_MIGRATION_MARKER_FILENAME,
-    ):
         try:
-            (path / filename).unlink(missing_ok=True)
+            os.fsync(generation_descriptor)
         except OSError:
             pass
+    finally:
+        os.close(generation_descriptor)
     try:
-        path.rmdir()
+        os.rmdir(generation_name, dir_fd=generations_descriptor)
+    except OSError:
+        return
+    try:
+        os.fsync(generations_descriptor)
     except OSError:
         pass
 
 
+def _materialize_immutable_generation(
+    generations_descriptor: int,
+    generation_name: str,
+    members: tuple[tuple[str, bytes], ...],
+    *,
+    conflict_message: str,
+) -> tuple[str, bool]:
+    metadata = stat_at(generations_descriptor, generation_name)
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise OperatorIOError(
+                "calibration generation path is unsafe: "
+                f"{generation_name}"
+            )
+        generation_descriptor = _open_generation_directory(
+            generations_descriptor,
+            generation_name,
+        )
+        try:
+            if any(
+                read_regular_file(
+                    generation_descriptor,
+                    filename,
+                    label=f"calibration generation member {filename}",
+                )
+                != content
+                for filename, content in members
+            ):
+                raise OperatorLedgerError(conflict_message)
+        finally:
+            os.close(generation_descriptor)
+        return generation_name, False
+
+    temporary_descriptor, temporary_name = create_temporary_directory(
+        generations_descriptor,
+        prefix=f".{generation_name}.",
+        suffix=".tmp",
+    )
+    try:
+        for filename, content in members:
+            _write_generation_file(
+                temporary_descriptor,
+                filename,
+                content,
+            )
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        os.rename(
+            temporary_name,
+            generation_name,
+            src_dir_fd=generations_descriptor,
+            dst_dir_fd=generations_descriptor,
+        )
+        temporary_name = ""
+        try:
+            os.fsync(generations_descriptor)
+        except OSError:
+            _remove_generation_directory(
+                generations_descriptor,
+                generation_name,
+            )
+            raise
+        return generation_name, True
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if temporary_name:
+            _remove_generation_directory(
+                generations_descriptor,
+                temporary_name,
+            )
+
+
+def _materialize_compatibility_generation(
+    generations_descriptor: int,
+    json_bytes: bytes,
+    markdown_bytes: bytes,
+) -> tuple[str, bool]:
+    generation_name = _compatibility_generation_name(
+        json_bytes,
+        markdown_bytes,
+    )
+    return _materialize_immutable_generation(
+        generations_descriptor,
+        generation_name,
+        (
+            (CALIBRATION_JSON_FILENAME, json_bytes),
+            (CALIBRATION_MARKDOWN_FILENAME, markdown_bytes),
+            (
+                COMPATIBILITY_MIGRATION_MARKER_FILENAME,
+                _COMPATIBILITY_MIGRATION_MARKER_BYTES,
+            ),
+        ),
+        conflict_message=(
+            "legacy calibration compatibility generation conflicts with "
+            "its content hash"
+        ),
+    )
+
+
 def _materialize_generation(
-    generations_dir: Path,
     generations_descriptor: int,
     generation_name: str,
     json_bytes: bytes,
     markdown_bytes: bytes,
-) -> tuple[Path, bool]:
-    generation_dir = generations_dir / generation_name
-    if _path_exists(generation_dir):
-        if generation_dir.is_symlink() or not generation_dir.is_dir():
-            raise OperatorIOError(
-                f"calibration generation path is unsafe: {generation_dir}"
-            )
-        if (
-            _read_regular_file(generation_dir / CALIBRATION_JSON_FILENAME)
-            != json_bytes
-            or _read_regular_file(
-                generation_dir / CALIBRATION_MARKDOWN_FILENAME
-            )
-            != markdown_bytes
-        ):
-            raise OperatorLedgerError(
-                "calibration generation content conflicts with its ledger "
-                "revision"
-            )
-        return generation_dir.resolve(strict=True), False
-
-    temporary_dir: Path | None = Path(
-        tempfile.mkdtemp(
-            prefix=f".{generation_name}.",
-            suffix=".tmp",
-            dir=generations_dir,
-        )
+) -> tuple[str, bool]:
+    return _materialize_immutable_generation(
+        generations_descriptor,
+        generation_name,
+        (
+            (CALIBRATION_JSON_FILENAME, json_bytes),
+            (CALIBRATION_MARKDOWN_FILENAME, markdown_bytes),
+        ),
+        conflict_message=(
+            "calibration generation content conflicts with its ledger "
+            "revision"
+        ),
     )
-    try:
-        _write_generation_file(
-            temporary_dir / CALIBRATION_JSON_FILENAME,
-            json_bytes,
-        )
-        _write_generation_file(
-            temporary_dir / CALIBRATION_MARKDOWN_FILENAME,
-            markdown_bytes,
-        )
-        temporary_descriptor = _open_directory_without_following_links(
-            temporary_dir
-        )
-        try:
-            os.fsync(temporary_descriptor)
-        finally:
-            os.close(temporary_descriptor)
-        os.replace(temporary_dir, generation_dir)
-        temporary_dir = None
-        try:
-            os.fsync(generations_descriptor)
-        except OSError:
-            _remove_generation_directory(generation_dir)
-            try:
-                os.fsync(generations_descriptor)
-            except OSError:
-                pass
-            raise
-        return generation_dir.resolve(strict=True), True
-    finally:
-        if temporary_dir is not None:
-            _remove_generation_directory(temporary_dir)
 
 
 def _swap_current_pointer(
-    report_dir: Path,
+    report_descriptor: int,
     generation_name: str,
 ) -> None:
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=".current.",
-            suffix=".tmp",
-            dir=report_dir,
-        )
+    target = str(Path(GENERATIONS_DIRNAME) / generation_name)
+    staged_name = create_temporary_symlink(
+        report_descriptor,
+        target,
+        prefix=".current.",
+        suffix=".tmp",
+        target_is_directory=True,
     )
-    staged_path = staging_dir / CURRENT_GENERATION_NAME
     try:
-        target = str(Path(GENERATIONS_DIRNAME) / generation_name)
-        os.symlink(target, staged_path, target_is_directory=True)
-        staging_descriptor = _open_directory_without_following_links(staging_dir)
-        try:
-            os.fsync(staging_descriptor)
-        finally:
-            os.close(staging_descriptor)
-        os.replace(staged_path, report_dir / CURRENT_GENERATION_NAME)
+        os.replace(
+            staged_name,
+            CURRENT_GENERATION_NAME,
+            src_dir_fd=report_descriptor,
+            dst_dir_fd=report_descriptor,
+        )
     finally:
-        _remove_staging_directory(staging_dir, CURRENT_GENERATION_NAME)
+        try:
+            os.unlink(staged_name, dir_fd=report_descriptor)
+        except FileNotFoundError:
+            pass
+
+
+def _restore_current_pointer(
+    report_descriptor: int,
+    generation_name: str | None,
+) -> None:
+    if generation_name is None:
+        try:
+            os.unlink(
+                CURRENT_GENERATION_NAME,
+                dir_fd=report_descriptor,
+            )
+        except FileNotFoundError:
+            pass
+    else:
+        _swap_current_pointer(report_descriptor, generation_name)
+    os.fsync(report_descriptor)
+
+
+def _publish_current_pointer(
+    report_path: Path,
+    report_descriptor: int,
+    generations_descriptor: int,
+    generation_name: str,
+    previous_generation_name: str | None,
+) -> None:
+    pointer_replaced = False
+    try:
+        _verify_report_directories(
+            report_path,
+            report_descriptor,
+            generations_descriptor,
+        )
+        _swap_current_pointer(report_descriptor, generation_name)
+        pointer_replaced = True
+        os.fsync(report_descriptor)
+        _verify_report_directories(
+            report_path,
+            report_descriptor,
+            generations_descriptor,
+        )
+    except BaseException:
+        if pointer_replaced:
+            try:
+                _restore_current_pointer(
+                    report_descriptor,
+                    previous_generation_name,
+                )
+            except OSError as rollback_error:
+                raise OperatorIOError(
+                    "unable to restore calibration current generation after "
+                    f"publication failure: {rollback_error}"
+                ) from rollback_error
+        raise
 
 
 def _artifacts(
     report_dir: Path,
-    generation_dir: Path,
+    generation_name: str,
     *,
     replayed: bool,
 ) -> CalibrationReportArtifacts:
+    generation_dir = report_dir / GENERATIONS_DIRNAME / generation_name
     return CalibrationReportArtifacts(
         json_path=report_dir / CALIBRATION_JSON_FILENAME,
         markdown_path=report_dir / CALIBRATION_MARKDOWN_FILENAME,
@@ -1012,7 +1192,7 @@ def write_calibration_reports(
     directory_descriptor = -1
     generations_descriptor = -1
     locked = False
-    generation_dir: Path | None = None
+    generation_name: str | None = None
     generation_created = False
     pointer_replaced = False
     try:
@@ -1029,33 +1209,32 @@ def write_calibration_reports(
         )
         fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
         locked = True
-        generations_dir = resolved_dir / GENERATIONS_DIRNAME
-        if generations_dir.is_symlink():
-            raise OperatorIOError(
-                f"calibration generations directory cannot be a symbolic link: "
-                f"{generations_dir}"
-            )
-        generations_dir.mkdir(exist_ok=True)
-        if not generations_dir.is_dir():
-            raise OperatorIOError(
-                f"calibration generations path must be a directory: "
-                f"{generations_dir}"
-            )
-        generations_descriptor = _open_directory_without_following_links(
-            generations_dir
+        generations_descriptor = _open_generations_directory(
+            directory_descriptor
+        )
+        _verify_report_directories(
+            resolved_dir,
+            directory_descriptor,
+            generations_descriptor,
         )
         os.fsync(directory_descriptor)
 
-        current = _current_generation(resolved_dir, generations_dir)
+        current = _current_generation(
+            directory_descriptor,
+            generations_descriptor,
+        )
         current = _prepare_compatibility_links(
             resolved_dir,
             directory_descriptor,
-            generations_dir,
             generations_descriptor,
             current,
         )
+        _verify_report_directories(
+            resolved_dir,
+            directory_descriptor,
+            generations_descriptor,
+        )
         if current is not None and current.mapping is not None:
-            current_generation_dir = current.generation_dir
             current_mapping = current.mapping
             current_count, current_hash = _report_revision(
                 current_mapping,
@@ -1078,21 +1257,21 @@ def write_calibration_reports(
                             "counts have different state hashes"
                         )
                     _require_equal_revision_content(
-                        current_generation_dir,
+                        generations_descriptor,
+                        current.generation_name,
                         json_bytes,
                         markdown_bytes,
                     )
+                    _verify_report_directories(
+                        resolved_dir,
+                        directory_descriptor,
+                        generations_descriptor,
+                    )
                     artifacts = _artifacts(
                         resolved_dir,
-                        current_generation_dir,
+                        current.generation_name,
                         replayed=True,
                     )
-                    fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
-                    locked = False
-                    os.close(generations_descriptor)
-                    generations_descriptor = -1
-                    os.close(directory_descriptor)
-                    directory_descriptor = -1
                     return artifacts
 
         ledger_path_hash = hashlib.sha256(
@@ -1102,27 +1281,25 @@ def write_calibration_reports(
             f"generation-v{REPORT_SCHEMA_VERSION}-"
             f"{ledger_path_hash}-{incoming_count:020d}-{incoming_hash}"
         )
-        generation_dir, generation_created = _materialize_generation(
-            generations_dir,
+        _, generation_created = _materialize_generation(
             generations_descriptor,
             generation_name,
             json_bytes,
             markdown_bytes,
         )
-        _swap_current_pointer(resolved_dir, generation_name)
+        _publish_current_pointer(
+            resolved_dir,
+            directory_descriptor,
+            generations_descriptor,
+            generation_name,
+            None if current is None else current.generation_name,
+        )
         pointer_replaced = True
-        os.fsync(directory_descriptor)
         artifacts = _artifacts(
             resolved_dir,
-            generation_dir,
+            generation_name,
             replayed=False,
         )
-        fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
-        locked = False
-        os.close(generations_descriptor)
-        generations_descriptor = -1
-        os.close(directory_descriptor)
-        directory_descriptor = -1
         return artifacts
     except (
         _StaleCalibrationPublicationError,
@@ -1138,14 +1315,13 @@ def write_calibration_reports(
         if (
             generation_created
             and not pointer_replaced
-            and generation_dir is not None
+            and generation_name is not None
+            and generations_descriptor >= 0
         ):
-            _remove_generation_directory(generation_dir)
-            if generations_descriptor >= 0:
-                try:
-                    os.fsync(generations_descriptor)
-                except OSError:
-                    pass
+            _remove_generation_directory(
+                generations_descriptor,
+                generation_name,
+            )
         if generations_descriptor >= 0:
             try:
                 os.close(generations_descriptor)

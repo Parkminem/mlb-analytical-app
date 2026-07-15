@@ -6,7 +6,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
-import tempfile
+import stat
 
 from pydantic import TypeAdapter
 
@@ -14,6 +14,14 @@ from analysis.forecasting.identity import canonical_json
 from analysis.ledger import CaptureCommand
 
 from .errors import OperatorIOError
+from .fdio import (
+    create_exclusive_file,
+    open_directory,
+    read_regular_file,
+    stat_at,
+    verify_child_directory,
+    verify_public_directory,
+)
 from .schemas import (
     ConfirmedBundle,
     ProjectedBundle,
@@ -142,30 +150,85 @@ def intrinsic_capture_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _existing_bundle_replays(path: Path, expected: bytes) -> bool:
-    if path.is_symlink():
-        raise OperatorIOError(
-            f"managed bundle path cannot be a symbolic link: {path}"
-        )
-    if not path.exists():
+def _existing_bundle_replays(
+    directory_descriptor: int,
+    filename: str,
+    expected: bytes,
+    display_path: Path,
+) -> bool:
+    metadata = stat_at(directory_descriptor, filename)
+    if metadata is None:
         return False
-    if not path.is_file():
+    if stat.S_ISLNK(metadata.st_mode):
         raise OperatorIOError(
-            f"managed bundle path must be a regular file: {path}"
+            f"managed bundle path cannot be a symbolic link: {display_path}"
         )
-    existing = path.read_bytes()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OperatorIOError(
+            f"managed bundle path must be a regular file: {display_path}"
+        )
+    existing = read_regular_file(
+        directory_descriptor,
+        filename,
+        label=f"managed bundle path {display_path}",
+    )
     if existing != expected:
         raise OperatorIOError(
-            f"conflicting managed bundle bytes at existing path: {path}"
+            "conflicting managed bundle bytes at existing path: "
+            f"{display_path}"
         )
     return True
 
 
-def _open_directory_without_following_links(path: Path) -> int:
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    return os.open(path, flags)
+def _open_directory_without_following_links(
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    return open_directory(path, dir_fd=dir_fd)
+
+
+def _open_game_directory(
+    root_descriptor: int,
+    game_name: str,
+    display_path: Path,
+) -> int:
+    metadata = stat_at(root_descriptor, game_name)
+    if metadata is None:
+        os.mkdir(game_name, mode=0o700, dir_fd=root_descriptor)
+        os.fsync(root_descriptor)
+    elif stat.S_ISLNK(metadata.st_mode):
+        raise OperatorIOError(
+            "managed bundle game directory cannot be a symbolic link: "
+            f"{display_path}"
+        )
+    elif not stat.S_ISDIR(metadata.st_mode):
+        raise OperatorIOError(
+            f"managed bundle game path must be a directory: {display_path}"
+        )
+    return _open_directory_without_following_links(
+        game_name,
+        dir_fd=root_descriptor,
+    )
+
+
+def _verify_bundle_directories(
+    root_path: Path,
+    root_descriptor: int,
+    game_name: str,
+    game_descriptor: int,
+) -> None:
+    verify_public_directory(
+        root_path,
+        root_descriptor,
+        label="managed bundle root",
+    )
+    verify_child_directory(
+        root_descriptor,
+        game_name,
+        game_descriptor,
+        label="managed bundle game directory",
+    )
 
 
 def persist_managed_bundle(
@@ -177,8 +240,10 @@ def persist_managed_bundle(
 
     canonical_bytes = bundle_canonical_bytes(bundle)
     bundle_hash = hashlib.sha256(canonical_bytes).hexdigest()
-    temp_path: Path | None = None
-    directory_descriptor = -1
+    temp_name: str | None = None
+    root_descriptor = -1
+    game_descriptor = -1
+    locked = False
     try:
         supplied_root = Path(root).expanduser()
         if supplied_root.is_symlink():
@@ -187,59 +252,83 @@ def persist_managed_bundle(
             )
         resolved_root = supplied_root.resolve(strict=False)
         resolved_root.mkdir(parents=True, exist_ok=True)
-        game_dir = resolved_root / str(bundle.game_pk)
-        if game_dir.is_symlink():
-            raise OperatorIOError(
-                "managed bundle game directory cannot be a symbolic link: "
-                f"{game_dir}"
-            )
-        game_dir.mkdir(exist_ok=True)
-        resolved_game_dir = game_dir.resolve(strict=True)
-        if (
-            resolved_game_dir.parent != resolved_root
-            or resolved_game_dir.name != str(bundle.game_pk)
-        ):
-            raise OperatorIOError(
-                f"managed bundle game directory escaped root: {game_dir}"
-            )
+        root_descriptor = _open_directory_without_following_links(resolved_root)
+        game_name = str(bundle.game_pk)
+        game_dir = resolved_root / game_name
+        game_descriptor = _open_game_directory(
+            root_descriptor,
+            game_name,
+            game_dir,
+        )
 
         filename = (
             f"{bundle.stage}-v{bundle.schema_version}-{bundle_hash[:16]}.json"
         )
-        destination = resolved_game_dir / filename
-        directory_descriptor = _open_directory_without_following_links(
-            resolved_game_dir
-        )
-        fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
-        if _existing_bundle_replays(destination, canonical_bytes):
+        destination = game_dir / filename
+        fcntl.flock(game_descriptor, fcntl.LOCK_EX)
+        locked = True
+        if _existing_bundle_replays(
+            game_descriptor,
+            filename,
+            canonical_bytes,
+            destination,
+        ):
+            _verify_bundle_directories(
+                resolved_root,
+                root_descriptor,
+                game_name,
+                game_descriptor,
+            )
             return ManagedBundleCopy(
                 path=destination,
                 bundle_hash=bundle_hash,
                 replayed=True,
             )
 
-        descriptor, temp_name = tempfile.mkstemp(
+        descriptor, temp_name = create_exclusive_file(
+            game_descriptor,
             prefix=f".{filename}.",
             suffix=".tmp",
-            dir=resolved_game_dir,
         )
-        temp_path = Path(temp_name)
         with os.fdopen(descriptor, "wb") as temporary:
             temporary.write(canonical_bytes)
             temporary.flush()
             os.fsync(temporary.fileno())
 
-        if _existing_bundle_replays(destination, canonical_bytes):
-            temp_path.unlink()
-            temp_path = None
+        if _existing_bundle_replays(
+            game_descriptor,
+            filename,
+            canonical_bytes,
+            destination,
+        ):
+            os.unlink(temp_name, dir_fd=game_descriptor)
+            temp_name = None
+            os.fsync(game_descriptor)
+            _verify_bundle_directories(
+                resolved_root,
+                root_descriptor,
+                game_name,
+                game_descriptor,
+            )
             return ManagedBundleCopy(
                 path=destination,
                 bundle_hash=bundle_hash,
                 replayed=True,
             )
-        os.replace(temp_path, destination)
-        temp_path = None
-        os.fsync(directory_descriptor)
+        os.replace(
+            temp_name,
+            filename,
+            src_dir_fd=game_descriptor,
+            dst_dir_fd=game_descriptor,
+        )
+        temp_name = None
+        os.fsync(game_descriptor)
+        _verify_bundle_directories(
+            resolved_root,
+            root_descriptor,
+            game_name,
+            game_descriptor,
+        )
         return ManagedBundleCopy(
             path=destination,
             bundle_hash=bundle_hash,
@@ -252,16 +341,20 @@ def persist_managed_bundle(
             f"unable to persist managed bundle: {error}"
         ) from error
     finally:
-        if temp_path is not None:
+        if temp_name is not None and game_descriptor >= 0:
             try:
-                temp_path.unlink(missing_ok=True)
+                os.unlink(temp_name, dir_fd=game_descriptor)
+                os.fsync(game_descriptor)
             except OSError:
                 pass
-        if directory_descriptor >= 0:
+        if game_descriptor >= 0:
             try:
-                fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
+                if locked:
+                    fcntl.flock(game_descriptor, fcntl.LOCK_UN)
             finally:
-                os.close(directory_descriptor)
+                os.close(game_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
 
 
 __all__ = (

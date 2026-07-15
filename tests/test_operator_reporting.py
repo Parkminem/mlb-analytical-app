@@ -717,12 +717,12 @@ def test_one_pointer_swap_publishes_consistent_pair_and_compatibility_links(
     pointer_swaps: list[Path] = []
     real_replace = os.replace
 
-    def recording_replace(source, destination):
+    def recording_replace(source, destination, **kwargs):
         if Path(destination).name == "current":
             assert (report_dir / CALIBRATION_JSON_FILENAME).is_symlink()
             assert (report_dir / CALIBRATION_MARKDOWN_FILENAME).is_symlink()
             pointer_swaps.append(Path(destination))
-        return real_replace(source, destination)
+        return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(
         "analysis.operator.reporting.os.replace",
@@ -765,15 +765,15 @@ def test_partial_legacy_compatibility_conversion_never_exposes_mixed_pair(
     real_replace = os.replace
     failed = False
 
-    def fail_markdown_conversion_once(source, destination):
+    def fail_markdown_conversion_once(source, destination, **kwargs):
         nonlocal failed
         if (
-            Path(destination) == markdown_path
+            Path(destination).name == markdown_path.name
             and not failed
         ):
             failed = True
             raise OSError("legacy markdown conversion failed")
-        return real_replace(source, destination)
+        return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(
         "analysis.operator.reporting.os.replace",
@@ -934,10 +934,10 @@ def test_pointer_swap_failure_leaves_old_pair_current_and_cleans_generation(
     old_markdown = old.markdown_path.read_bytes()
     real_replace = os.replace
 
-    def fail_pointer_swap(source, destination):
+    def fail_pointer_swap(source, destination, **kwargs):
         if Path(destination).name == "current":
             raise OSError("current pointer swap failed")
-        return real_replace(source, destination)
+        return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(
         "analysis.operator.reporting.os.replace",
@@ -979,12 +979,12 @@ def test_generation_construction_failure_leaves_old_pair_current(
     real_write = reporting_module._write_generation_file
     calls = 0
 
-    def fail_second_generation_file(path, content):
+    def fail_second_generation_file(descriptor, filename, content):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("generation file write failed")
-        return real_write(path, content)
+        return real_write(descriptor, filename, content)
 
     monkeypatch.setattr(
         reporting_module,
