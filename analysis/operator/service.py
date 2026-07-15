@@ -56,7 +56,9 @@ from .errors import (
     OperatorPreconditionError,
 )
 from .reporting import (
+    CalibrationReportArtifacts,
     DEFAULT_REPORT_DIR,
+    _StaleCalibrationPublicationError,
     build_report_mapping,
     write_calibration_reports,
 )
@@ -70,6 +72,7 @@ DEFAULT_LEDGER_PATH = (
 _Bundle = ProjectedBundle | ConfirmedBundle
 _T = TypeVar("_T")
 _HEAD_CAS_MAX_ATTEMPTS = 3
+_REPORT_PUBLICATION_MAX_ATTEMPTS = 3
 _LEDGER_ERRORS = (
     IdempotencyConflict,
     LedgerCorruptionError,
@@ -112,6 +115,9 @@ class ReviewRunResult:
     classification_counts: Mapping[str, int]
     calibration_json_path: Path
     calibration_markdown_path: Path
+    calibration_generation_dir: Path
+    calibration_current_generation_path: Path
+    calibration_report_replayed: bool
     calibration_sample_size: int
     confirmed_game_count: int
     confirmed_decision_count: int
@@ -979,6 +985,39 @@ def _calibration_report_state(
     )
 
 
+def _publish_calibration_report(
+    store: LedgerStore,
+    ledger_path: str | Path,
+    report_dir: str | Path,
+) -> tuple[CalibrationReportArtifacts, int, int, Mapping[str, int]]:
+    stale_error: _StaleCalibrationPublicationError | None = None
+    for _ in range(_REPORT_PUBLICATION_MAX_ATTEMPTS):
+        (
+            mapping,
+            sample_size,
+            confirmed_game_count,
+            confirmed_decision_counts,
+        ) = _calibration_report_state(store, ledger_path)
+        try:
+            artifacts = write_calibration_reports(
+                mapping,
+                report_dir=report_dir,
+            )
+        except _StaleCalibrationPublicationError as error:
+            stale_error = error
+            continue
+        return (
+            artifacts,
+            sample_size,
+            confirmed_game_count,
+            confirmed_decision_counts,
+        )
+    raise OperatorLedgerError(
+        "unable to publish calibration report after rebuilding the current "
+        f"ledger {_REPORT_PUBLICATION_MAX_ATTEMPTS} times"
+    ) from stale_error
+
+
 def run_review(
     bundle: ReviewBundle,
     *,
@@ -1065,15 +1104,11 @@ def run_review(
     frozen_reviews = tuple(review_records)
     managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
     (
-        calibration_mapping,
+        report_artifacts,
         calibration_sample_size,
         confirmed_game_count,
         confirmed_decision_counts,
-    ) = _calibration_report_state(store, ledger_path)
-    report_artifacts = write_calibration_reports(
-        calibration_mapping,
-        report_dir=report_dir,
-    )
+    ) = _publish_calibration_report(store, ledger_path, report_dir)
     return ReviewRunResult(
         stage="review",
         game_pk=bundle.game_pk,
@@ -1090,6 +1125,11 @@ def run_review(
         classification_counts=_classification_count_mapping(frozen_reviews),
         calibration_json_path=report_artifacts.json_path,
         calibration_markdown_path=report_artifacts.markdown_path,
+        calibration_generation_dir=report_artifacts.generation_dir,
+        calibration_current_generation_path=(
+            report_artifacts.current_generation_path
+        ),
+        calibration_report_replayed=report_artifacts.replayed,
         calibration_sample_size=calibration_sample_size,
         confirmed_game_count=confirmed_game_count,
         confirmed_decision_count=sum(confirmed_decision_counts.values()),

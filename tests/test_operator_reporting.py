@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
 
+import analysis.operator.reporting as reporting_module
 import analysis.operator.service as service_module
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
@@ -42,9 +44,18 @@ from tests.test_operator_review import (
 )
 
 
-def _ledger_record(appended_at):
+def _ledger_record(appended_at, *, sequence: int = 0, record_kind: str = "review"):
+    identity = hashlib.sha256(
+        f"{record_kind}:{sequence}:{appended_at.isoformat()}".encode("utf-8")
+    ).hexdigest()
     return SimpleNamespace(
-        envelope=SimpleNamespace(appended_at=appended_at),
+        envelope=SimpleNamespace(
+            record_kind=record_kind,
+            record_id=identity[:32],
+            idempotency_key=f"report-test:{identity[:16]}",
+            payload_hash=identity,
+            appended_at=appended_at,
+        ),
     )
 
 
@@ -503,6 +514,8 @@ def test_report_mapping_is_versioned_complete_and_uses_latest_ledger_append(
         (tmp_path / "ledger" / "shadow.jsonl").resolve()
     )
     assert mapping["ledger_as_of"] == latest.isoformat().replace("+00:00", "Z")
+    assert mapping["ledger_revision"]["record_count"] == 2
+    assert len(mapping["ledger_revision"]["state_hash"]) == 64
     assert "generated_at" not in mapping
     assert mapping["group_by"] == list(GROUPING_DIMENSIONS)
     assert mapping["overall"]["sample_size"] == 2
@@ -515,6 +528,50 @@ def test_report_mapping_is_versioned_complete_and_uses_latest_ledger_append(
         for group in mapping["groups"]
     )
     assert mapping["overall"]["priced_stake_count"] == 1
+
+
+def test_ledger_revision_hashes_ordered_immutable_envelope_identity(
+    tmp_path: Path,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first = _ledger_record(appended_at, sequence=1)
+    second = _ledger_record(appended_at, sequence=2)
+
+    forward = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first, second),
+    )["ledger_revision"]
+    replay = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first, second),
+    )["ledger_revision"]
+    reversed_revision = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(second, first),
+    )["ledger_revision"]
+
+    assert forward == replay
+    assert forward["record_count"] == 2
+    assert forward["state_hash"] != reversed_revision["state_hash"]
+    expected_identities = [
+        {
+            "record_kind": record.envelope.record_kind,
+            "record_id": record.envelope.record_id,
+            "idempotency_key": record.envelope.idempotency_key,
+            "payload_hash": record.envelope.payload_hash,
+            "appended_at": record.envelope.appended_at.isoformat().replace(
+                "+00:00",
+                "Z",
+            ),
+        }
+        for record in (first, second)
+    ]
+    assert forward["state_hash"] == hashlib.sha256(
+        canonical_json(expected_identities).encode("utf-8")
+    ).hexdigest()
 
 
 def test_empty_ledger_has_null_as_of_and_unavailable_metrics(tmp_path: Path) -> None:
@@ -633,11 +690,203 @@ def test_json_and_markdown_are_byte_identical_for_unchanged_mapping(
     )
     assert second.json_path.read_bytes() == first_json
     assert second.markdown_path.read_bytes() == first_markdown
+    assert first.generation_dir == second.generation_dir
+    assert first.replayed is False
+    assert second.replayed is True
+    assert first.generation_json_path.read_bytes() == first_json
+    assert first.generation_markdown_path.read_bytes() == first_markdown
     assert first_json == (canonical_json(mapping) + "\n").encode("utf-8")
     assert first_json.endswith(b"\n")
     assert first_markdown.endswith(b"\n")
     assert json.loads(first_json) == mapping
     assert "generated_at" not in first_json.decode("utf-8")
+
+
+def test_one_pointer_swap_publishes_consistent_pair_and_compatibility_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+        ledger_records=(_ledger_record(appended_at),),
+    )
+    report_dir = tmp_path / "reports"
+    pointer_swaps: list[Path] = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination):
+        if Path(destination).name == "current":
+            pointer_swaps.append(Path(destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "analysis.operator.reporting.os.replace",
+        recording_replace,
+    )
+
+    artifacts = write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert len(pointer_swaps) == 1
+    assert artifacts.generation_dir.is_dir()
+    assert artifacts.current_generation_path.is_symlink()
+    assert artifacts.current_generation_path.resolve() == artifacts.generation_dir
+    assert artifacts.json_path.is_symlink()
+    assert artifacts.markdown_path.is_symlink()
+    assert artifacts.json_path.resolve() == artifacts.generation_json_path
+    assert artifacts.markdown_path.resolve() == artifacts.generation_markdown_path
+    payload = json.loads(artifacts.generation_json_path.read_bytes())
+    revision = payload["ledger_revision"]
+    markdown = artifacts.generation_markdown_path.read_text(encoding="utf-8")
+    assert str(revision["record_count"]) in markdown
+    assert revision["state_hash"] in markdown
+
+
+def test_stale_writer_cannot_regress_current_generation(tmp_path: Path) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    older = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+        ledger_records=(first_record,),
+    )
+    newer = _mapping(
+        tmp_path,
+        (
+            _unique_row(1, lineup_state="projected"),
+            _unique_row(2, lineup_state="projected"),
+        ),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    published = write_calibration_reports(newer, report_dir=report_dir)
+    published_json = published.json_path.read_bytes()
+    published_markdown = published.markdown_path.read_bytes()
+
+    with pytest.raises(reporting_module._StaleCalibrationPublicationError):
+        write_calibration_reports(older, report_dir=report_dir)
+
+    assert published.current_generation_path.resolve() == published.generation_dir
+    assert published.json_path.read_bytes() == published_json
+    assert published.markdown_path.read_bytes() == published_markdown
+
+
+def test_equal_count_different_revision_is_ledger_conflict(tmp_path: Path) -> None:
+    appended_at = _complete_game().captured_at
+    first = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(_ledger_record(appended_at, sequence=1),),
+    )
+    conflict = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(_ledger_record(appended_at, sequence=2),),
+    )
+    report_dir = tmp_path / "reports"
+    published = write_calibration_reports(first, report_dir=report_dir)
+
+    with pytest.raises(OperatorLedgerError, match="revision conflict"):
+        write_calibration_reports(conflict, report_dir=report_dir)
+
+    assert json.loads(published.json_path.read_bytes()) == first
+
+
+def test_pointer_swap_failure_leaves_old_pair_current_and_cleans_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    old_mapping = _mapping(tmp_path, (), ledger_records=(first_record,))
+    new_mapping = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    old = write_calibration_reports(old_mapping, report_dir=report_dir)
+    old_json = old.json_path.read_bytes()
+    old_markdown = old.markdown_path.read_bytes()
+    real_replace = os.replace
+
+    def fail_pointer_swap(source, destination):
+        if Path(destination).name == "current":
+            raise OSError("current pointer swap failed")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "analysis.operator.reporting.os.replace",
+        fail_pointer_swap,
+    )
+
+    with pytest.raises(OperatorIOError, match="pointer swap failed"):
+        write_calibration_reports(new_mapping, report_dir=report_dir)
+
+    assert old.current_generation_path.resolve() == old.generation_dir
+    assert old.json_path.read_bytes() == old_json
+    assert old.markdown_path.read_bytes() == old_markdown
+    assert {path.name for path in (report_dir / "generations").iterdir()} == {
+        old.generation_dir.name
+    }
+    assert not tuple(report_dir.rglob("*.tmp"))
+
+
+def test_generation_construction_failure_leaves_old_pair_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    old_mapping = _mapping(tmp_path, (), ledger_records=(first_record,))
+    new_mapping = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    old = write_calibration_reports(old_mapping, report_dir=report_dir)
+    old_json = old.json_path.read_bytes()
+    old_markdown = old.markdown_path.read_bytes()
+    real_write = reporting_module._write_generation_file
+    calls = 0
+
+    def fail_second_generation_file(path, content):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("generation file write failed")
+        return real_write(path, content)
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_write_generation_file",
+        fail_second_generation_file,
+    )
+
+    with pytest.raises(OperatorIOError, match="generation file write failed"):
+        write_calibration_reports(new_mapping, report_dir=report_dir)
+
+    assert old.current_generation_path.resolve() == old.generation_dir
+    assert old.json_path.read_bytes() == old_json
+    assert old.markdown_path.read_bytes() == old_markdown
+    assert {path.name for path in (report_dir / "generations").iterdir()} == {
+        old.generation_dir.name
+    }
+    assert not tuple(report_dir.rglob("*.tmp"))
 
 
 def test_atomic_writer_fsyncs_files_and_directory(
@@ -648,18 +897,19 @@ def test_atomic_writer_fsyncs_files_and_directory(
         tmp_path,
         (_unique_row(1, lineup_state="projected"),),
     )
-    calls: list[int] = []
+    modes: list[int] = []
     real_fsync = os.fsync
 
     def recording_fsync(descriptor: int) -> None:
-        calls.append(descriptor)
+        modes.append(os.fstat(descriptor).st_mode)
         real_fsync(descriptor)
 
     monkeypatch.setattr("analysis.operator.reporting.os.fsync", recording_fsync)
 
     write_calibration_reports(mapping, report_dir=tmp_path / "reports")
 
-    assert len(calls) == 4
+    assert sum(stat.S_ISREG(mode) for mode in modes) == 2
+    assert sum(stat.S_ISDIR(mode) for mode in modes) >= 3
 
 
 @pytest.mark.parametrize("failure", ("replace", "fsync"))
@@ -762,6 +1012,92 @@ def test_run_review_rebuilds_full_ledger_and_returns_report_counts_and_paths(
     assert payload["migration"]["market_types"]["full_total"]["count"] == 2
     assert sum(second.classification_counts.values()) == 2
     assert len(tuple(LedgerStore(ledger_path).iter_records("review"))) == 4
+
+
+def test_run_review_rebuilds_and_retries_after_stale_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    stale = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+        ledger_records=(first_record,),
+    )
+    current = _mapping(
+        tmp_path,
+        (
+            _unique_row(1, lineup_state="projected"),
+            _unique_row(2, lineup_state="projected"),
+        ),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    write_calibration_reports(current, report_dir=report_dir)
+    states = iter(
+        (
+            (stale, 1, 0, {market_type.value: 0 for market_type in MarketType}),
+            (current, 2, 0, {market_type.value: 0 for market_type in MarketType}),
+        )
+    )
+    calls = 0
+
+    def changing_report_state(store, ledger_path):
+        nonlocal calls
+        calls += 1
+        return next(states)
+
+    monkeypatch.setattr(
+        service_module,
+        "_calibration_report_state",
+        changing_report_state,
+    )
+
+    result = _run_review_for_game(
+        ledger_path=tmp_path / "ledger.jsonl",
+        bundle_root=tmp_path / "bundles",
+        report_dir=report_dir,
+        game_pk=930101,
+    )
+
+    assert calls == 2
+    assert result.calibration_sample_size == 2
+    assert result.calibration_generation_dir.resolve() == (
+        result.calibration_current_generation_path.resolve()
+    )
+    assert json.loads(result.calibration_json_path.read_bytes()) == current
+
+
+def test_report_publication_stale_retry_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def report_state(store, ledger_path):
+        nonlocal calls
+        calls += 1
+        return ({}, 0, 0, {})
+
+    def always_stale(mapping, *, report_dir):
+        raise reporting_module._StaleCalibrationPublicationError("stale")
+
+    monkeypatch.setattr(service_module, "_calibration_report_state", report_state)
+    monkeypatch.setattr(service_module, "write_calibration_reports", always_stale)
+
+    with pytest.raises(OperatorLedgerError, match="rebuilding the current ledger"):
+        service_module._publish_calibration_report(
+            object(),
+            tmp_path / "ledger.jsonl",
+            tmp_path / "reports",
+        )
+
+    assert calls == service_module._REPORT_PUBLICATION_MAX_ATTEMPTS == 3
 
 
 def test_service_builds_rows_and_ledger_as_of_from_one_immutable_snapshot(

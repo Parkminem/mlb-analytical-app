@@ -4,8 +4,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 import fcntl
+import hashlib
+import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 
 from analysis.forecasting.identity import canonical_json
@@ -19,7 +22,7 @@ from analysis.review.calibration import (
 )
 from analysis.shadow import deserialize_shadow_comparison
 
-from .errors import OperatorIOError
+from .errors import OperatorIOError, OperatorLedgerError
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -27,6 +30,8 @@ CONFIRMED_GAME_THRESHOLD = 100
 DECISIONS_PER_MARKET_TYPE_THRESHOLD = 300
 CALIBRATION_JSON_FILENAME = "calibration-latest.json"
 CALIBRATION_MARKDOWN_FILENAME = "calibration-latest.md"
+GENERATIONS_DIRNAME = "generations"
+CURRENT_GENERATION_NAME = "current"
 DEFAULT_REPORT_DIR = (
     Path(__file__).resolve().parents[2] / "reports" / "private" / "shadow"
 )
@@ -59,6 +64,21 @@ class CalibrationReportArtifacts:
 
     json_path: Path
     markdown_path: Path
+    generation_dir: Path
+    current_generation_path: Path
+    replayed: bool
+
+    @property
+    def generation_json_path(self) -> Path:
+        return self.generation_dir / CALIBRATION_JSON_FILENAME
+
+    @property
+    def generation_markdown_path(self) -> Path:
+        return self.generation_dir / CALIBRATION_MARKDOWN_FILENAME
+
+
+class _StaleCalibrationPublicationError(Exception):
+    """A newer ledger revision was published before this writer acquired lock."""
 
 
 def _utc_iso(value: datetime) -> str:
@@ -85,6 +105,58 @@ def _progress_mapping(count: int, threshold: int) -> dict[str, object]:
         "progress": completed / threshold,
         "threshold_met": count >= threshold,
     }
+
+
+def _ledger_revision_mapping(
+    ledger_records: tuple[object, ...],
+) -> tuple[dict[str, object], list[datetime]]:
+    identities: list[dict[str, str]] = []
+    appended_at_values: list[datetime] = []
+    for record in ledger_records:
+        try:
+            envelope = record.envelope
+            record_kind = envelope.record_kind
+            record_id = envelope.record_id
+            idempotency_key = envelope.idempotency_key
+            payload_hash = envelope.payload_hash
+            appended_at = envelope.appended_at
+        except AttributeError as error:
+            raise ValueError(
+                "ledger records must expose immutable envelope identity"
+            ) from error
+        identity_values = {
+            "record_kind": record_kind,
+            "record_id": record_id,
+            "idempotency_key": idempotency_key,
+            "payload_hash": payload_hash,
+        }
+        if any(
+            not isinstance(value, str) or not value
+            for value in identity_values.values()
+        ):
+            raise ValueError(
+                "ledger envelope identity values must be non-empty strings"
+            )
+        if not isinstance(appended_at, datetime):
+            raise ValueError("ledger appended_at must be a datetime")
+        appended_at_text = _utc_iso(appended_at)
+        identities.append(
+            {
+                **identity_values,
+                "appended_at": appended_at_text,
+            }
+        )
+        appended_at_values.append(appended_at)
+    state_hash = hashlib.sha256(
+        canonical_json(identities).encode("utf-8")
+    ).hexdigest()
+    return (
+        {
+            "record_count": len(identities),
+            "state_hash": state_hash,
+        },
+        appended_at_values,
+    )
 
 
 def _migration_eligible_rows(
@@ -209,19 +281,9 @@ def build_report_mapping(
     if report.group_by != GROUPING_DIMENSIONS:
         raise ValueError("report must use the fixed calibration group dimensions")
 
-    appended_at_values: list[datetime] = []
-    for record in ledger_records:
-        try:
-            appended_at = record.envelope.appended_at
-        except AttributeError as error:
-            raise ValueError(
-                "ledger records must expose envelope.appended_at"
-            ) from error
-        if not isinstance(appended_at, datetime):
-            raise ValueError("ledger appended_at must be a datetime")
-        if appended_at.tzinfo is None or appended_at.utcoffset() is None:
-            raise ValueError("ledger appended_at must be timezone-aware")
-        appended_at_values.append(appended_at)
+    ledger_revision, appended_at_values = _ledger_revision_mapping(
+        ledger_records
+    )
     ledger_as_of = (
         None
         if not appended_at_values
@@ -232,6 +294,7 @@ def build_report_mapping(
         "schema_version": REPORT_SCHEMA_VERSION,
         "ledger_path": str(Path(ledger_path).expanduser().resolve(strict=False)),
         "ledger_as_of": ledger_as_of,
+        "ledger_revision": ledger_revision,
         "group_by": list(report.group_by),
         "overall": _metrics_mapping(report.overall),
         "groups": [
@@ -271,12 +334,15 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
     overall = mapping["overall"]
     groups = mapping["groups"]
     migration = mapping["migration"]
+    ledger_revision = mapping["ledger_revision"]
     if not isinstance(overall, Mapping):
         raise TypeError("overall must be a mapping")
     if not isinstance(groups, list):
         raise TypeError("groups must be a list")
     if not isinstance(migration, Mapping):
         raise TypeError("migration must be a mapping")
+    if not isinstance(ledger_revision, Mapping):
+        raise TypeError("ledger_revision must be a mapping")
 
     ledger_as_of = mapping["ledger_as_of"]
     lines = [
@@ -285,6 +351,10 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
         f"- 스키마 버전: {_markdown_value(mapping['schema_version'])}",
         f"- 원장 경로: `{mapping['ledger_path']}`",
         f"- 원장 기준 시각: {_markdown_value(ledger_as_of)}",
+        "- 원장 레코드 수: "
+        f"{_markdown_value(ledger_revision['record_count'])}",
+        "- 원장 상태 해시: "
+        f"`{_markdown_value(ledger_revision['state_hash'])}`",
         "- 고정 그룹 차원: "
         + ", ".join(str(value) for value in mapping["group_by"]),
         "",
@@ -357,45 +427,343 @@ def _open_directory_without_following_links(path: Path) -> int:
     return os.open(path, flags)
 
 
-def _require_safe_destination(path: Path) -> None:
-    if path.is_symlink():
-        raise OperatorIOError(
-            f"calibration report path cannot be a symbolic link: {path}"
-        )
-    if path.exists() and not path.is_file():
-        raise OperatorIOError(
-            f"calibration report path must be a regular file: {path}"
-        )
+def _path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
 
 
-def _atomic_replace(
-    destination: Path,
-    content: bytes,
-    directory_descriptor: int,
-) -> None:
-    temp_path: Path | None = None
+def _report_revision(
+    mapping: Mapping[str, object],
+    *,
+    source: str,
+) -> tuple[int, str]:
+    revision = mapping.get("ledger_revision")
+    if not isinstance(revision, Mapping):
+        raise OperatorLedgerError(
+            f"{source} ledger_revision must be a mapping"
+        )
+    record_count = revision.get("record_count")
+    state_hash = revision.get("state_hash")
+    if (
+        isinstance(record_count, bool)
+        or not isinstance(record_count, int)
+        or record_count < 0
+    ):
+        raise OperatorLedgerError(
+            f"{source} ledger_revision record_count must be non-negative"
+        )
+    if (
+        not isinstance(state_hash, str)
+        or len(state_hash) != 64
+        or any(character not in "0123456789abcdef" for character in state_hash)
+    ):
+        raise OperatorLedgerError(
+            f"{source} ledger_revision state_hash must be lowercase SHA-256"
+        )
+    return record_count, state_hash
+
+
+def _report_ledger_path(
+    mapping: Mapping[str, object],
+    *,
+    source: str,
+) -> str:
+    ledger_path = mapping.get("ledger_path")
+    if not isinstance(ledger_path, str) or not ledger_path:
+        raise OperatorLedgerError(
+            f"{source} ledger_path must be a non-empty string"
+        )
+    return ledger_path
+
+
+def _read_regular_file(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
-        _require_safe_destination(destination)
-        descriptor, temp_name = tempfile.mkstemp(
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OperatorIOError(
+                f"calibration generation path must be a regular file: {path}"
+            )
+        with os.fdopen(descriptor, "rb") as report_file:
+            descriptor = -1
+            return report_file.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_generation_mapping(generation_dir: Path) -> Mapping[str, object]:
+    json_path = generation_dir / CALIBRATION_JSON_FILENAME
+    markdown_path = generation_dir / CALIBRATION_MARKDOWN_FILENAME
+    for path in (json_path, markdown_path):
+        if path.is_symlink() or not path.is_file():
+            raise OperatorIOError(
+                f"calibration generation file is missing or unsafe: {path}"
+            )
+    raw_json = _read_regular_file(json_path)
+    try:
+        mapping = json.loads(raw_json)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OperatorLedgerError(
+            f"published calibration report JSON is invalid: {error}"
+        ) from error
+    if not isinstance(mapping, Mapping):
+        raise OperatorLedgerError(
+            "published calibration report JSON must contain a mapping"
+        )
+    return mapping
+
+
+def _current_generation(
+    report_dir: Path,
+    generations_dir: Path,
+) -> tuple[Path, Mapping[str, object]] | None:
+    current_path = report_dir / CURRENT_GENERATION_NAME
+    if not _path_exists(current_path):
+        return None
+    if not current_path.is_symlink():
+        raise OperatorIOError(
+            f"calibration current generation must be a symbolic link: "
+            f"{current_path}"
+        )
+    target = Path(os.readlink(current_path))
+    if (
+        target.is_absolute()
+        or len(target.parts) != 2
+        or target.parts[0] != GENERATIONS_DIRNAME
+        or target.parts[1] in ("", ".", "..")
+    ):
+        raise OperatorIOError(
+            f"calibration current generation target is unsafe: {target}"
+        )
+    generation_path = report_dir / target
+    if generation_path.is_symlink() or not generation_path.is_dir():
+        raise OperatorIOError(
+            f"calibration current generation is missing or unsafe: "
+            f"{generation_path}"
+        )
+    resolved_generation = generation_path.resolve(strict=True)
+    if resolved_generation.parent != generations_dir.resolve(strict=True):
+        raise OperatorIOError(
+            "calibration current generation escapes the generations directory"
+        )
+    return resolved_generation, _read_generation_mapping(resolved_generation)
+
+
+def _compatibility_target(filename: str) -> str:
+    return f"{CURRENT_GENERATION_NAME}/{filename}"
+
+
+def _validate_compatibility_path(path: Path, target: str) -> None:
+    if not _path_exists(path):
+        return
+    if path.is_symlink():
+        if os.readlink(path) != target:
+            raise OperatorIOError(
+                f"calibration report path has an unsafe symbolic link: {path}"
+            )
+        return
+    if not path.is_file():
+        raise OperatorIOError(
+            f"calibration report path must be a regular file or managed link: "
+            f"{path}"
+        )
+
+
+def _remove_staging_directory(
+    staging_dir: Path,
+    staged_name: str,
+) -> None:
+    staged_path = staging_dir / staged_name
+    try:
+        staged_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        staging_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _replace_with_symlink(
+    destination: Path,
+    target: str,
+) -> None:
+    staging_dir = Path(
+        tempfile.mkdtemp(
             prefix=f".{destination.name}.",
             suffix=".tmp",
             dir=destination.parent,
         )
-        temp_path = Path(temp_name)
-        with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        _require_safe_destination(destination)
-        os.replace(temp_path, destination)
-        temp_path = None
-        os.fsync(directory_descriptor)
+    )
+    staged_path = staging_dir / destination.name
+    try:
+        os.symlink(target, staged_path, target_is_directory=False)
+        staging_descriptor = _open_directory_without_following_links(staging_dir)
+        try:
+            os.fsync(staging_descriptor)
+        finally:
+            os.close(staging_descriptor)
+        os.replace(staged_path, destination)
     finally:
-        if temp_path is not None:
+        _remove_staging_directory(staging_dir, destination.name)
+
+
+def _ensure_compatibility_links(
+    report_dir: Path,
+    directory_descriptor: int,
+) -> None:
+    destinations = (
+        (report_dir / CALIBRATION_JSON_FILENAME, CALIBRATION_JSON_FILENAME),
+        (
+            report_dir / CALIBRATION_MARKDOWN_FILENAME,
+            CALIBRATION_MARKDOWN_FILENAME,
+        ),
+    )
+    for path, filename in destinations:
+        _validate_compatibility_path(path, _compatibility_target(filename))
+    changed = False
+    for path, filename in destinations:
+        target = _compatibility_target(filename)
+        if path.is_symlink() and os.readlink(path) == target:
+            continue
+        _replace_with_symlink(path, target)
+        changed = True
+    if changed:
+        os.fsync(directory_descriptor)
+
+
+def _write_generation_file(path: Path, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as report_file:
+        report_file.write(content)
+        report_file.flush()
+        os.fsync(report_file.fileno())
+
+
+def _remove_generation_directory(path: Path) -> None:
+    if not _path_exists(path) or path.is_symlink() or not path.is_dir():
+        return
+    for filename in (
+        CALIBRATION_JSON_FILENAME,
+        CALIBRATION_MARKDOWN_FILENAME,
+    ):
+        try:
+            (path / filename).unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _materialize_generation(
+    generations_dir: Path,
+    generations_descriptor: int,
+    generation_name: str,
+    json_bytes: bytes,
+    markdown_bytes: bytes,
+) -> tuple[Path, bool]:
+    generation_dir = generations_dir / generation_name
+    if _path_exists(generation_dir):
+        if generation_dir.is_symlink() or not generation_dir.is_dir():
+            raise OperatorIOError(
+                f"calibration generation path is unsafe: {generation_dir}"
+            )
+        if (
+            _read_regular_file(generation_dir / CALIBRATION_JSON_FILENAME)
+            != json_bytes
+            or _read_regular_file(
+                generation_dir / CALIBRATION_MARKDOWN_FILENAME
+            )
+            != markdown_bytes
+        ):
+            raise OperatorLedgerError(
+                "calibration generation content conflicts with its ledger "
+                "revision"
+            )
+        return generation_dir.resolve(strict=True), False
+
+    temporary_dir: Path | None = Path(
+        tempfile.mkdtemp(
+            prefix=f".{generation_name}.",
+            suffix=".tmp",
+            dir=generations_dir,
+        )
+    )
+    try:
+        _write_generation_file(
+            temporary_dir / CALIBRATION_JSON_FILENAME,
+            json_bytes,
+        )
+        _write_generation_file(
+            temporary_dir / CALIBRATION_MARKDOWN_FILENAME,
+            markdown_bytes,
+        )
+        temporary_descriptor = _open_directory_without_following_links(
+            temporary_dir
+        )
+        try:
+            os.fsync(temporary_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+        os.replace(temporary_dir, generation_dir)
+        temporary_dir = None
+        try:
+            os.fsync(generations_descriptor)
+        except OSError:
+            _remove_generation_directory(generation_dir)
             try:
-                temp_path.unlink(missing_ok=True)
+                os.fsync(generations_descriptor)
             except OSError:
                 pass
+            raise
+        return generation_dir.resolve(strict=True), True
+    finally:
+        if temporary_dir is not None:
+            _remove_generation_directory(temporary_dir)
+
+
+def _swap_current_pointer(
+    report_dir: Path,
+    generation_name: str,
+) -> None:
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=".current.",
+            suffix=".tmp",
+            dir=report_dir,
+        )
+    )
+    staged_path = staging_dir / CURRENT_GENERATION_NAME
+    try:
+        target = str(Path(GENERATIONS_DIRNAME) / generation_name)
+        os.symlink(target, staged_path, target_is_directory=True)
+        staging_descriptor = _open_directory_without_following_links(staging_dir)
+        try:
+            os.fsync(staging_descriptor)
+        finally:
+            os.close(staging_descriptor)
+        os.replace(staged_path, report_dir / CURRENT_GENERATION_NAME)
+    finally:
+        _remove_staging_directory(staging_dir, CURRENT_GENERATION_NAME)
+
+
+def _artifacts(
+    report_dir: Path,
+    generation_dir: Path,
+    *,
+    replayed: bool,
+) -> CalibrationReportArtifacts:
+    return CalibrationReportArtifacts(
+        json_path=report_dir / CALIBRATION_JSON_FILENAME,
+        markdown_path=report_dir / CALIBRATION_MARKDOWN_FILENAME,
+        generation_dir=generation_dir,
+        current_generation_path=report_dir / CURRENT_GENERATION_NAME,
+        replayed=replayed,
+    )
 
 
 def write_calibration_reports(
@@ -403,12 +771,24 @@ def write_calibration_reports(
     *,
     report_dir: str | os.PathLike[str] = DEFAULT_REPORT_DIR,
 ) -> CalibrationReportArtifacts:
-    """Atomically replace deterministic JSON and Markdown report files."""
+    """Publish one immutable report generation through an atomic pointer."""
 
     json_bytes = (canonical_json(mapping) + "\n").encode("utf-8")
     markdown_bytes = (render_report_markdown(mapping) + "\n").encode("utf-8")
+    incoming_count, incoming_hash = _report_revision(
+        mapping,
+        source="incoming calibration report",
+    )
+    incoming_ledger_path = _report_ledger_path(
+        mapping,
+        source="incoming calibration report",
+    )
     directory_descriptor = -1
+    generations_descriptor = -1
     locked = False
+    generation_dir: Path | None = None
+    generation_created = False
+    pointer_replaced = False
     try:
         supplied_dir = Path(report_dir).expanduser()
         if supplied_dir.is_symlink():
@@ -423,26 +803,120 @@ def write_calibration_reports(
         )
         fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
         locked = True
-        json_path = resolved_dir / CALIBRATION_JSON_FILENAME
-        markdown_path = resolved_dir / CALIBRATION_MARKDOWN_FILENAME
-        _atomic_replace(json_path, json_bytes, directory_descriptor)
-        _atomic_replace(markdown_path, markdown_bytes, directory_descriptor)
-        artifacts = CalibrationReportArtifacts(
-            json_path=json_path,
-            markdown_path=markdown_path,
+        generations_dir = resolved_dir / GENERATIONS_DIRNAME
+        if generations_dir.is_symlink():
+            raise OperatorIOError(
+                f"calibration generations directory cannot be a symbolic link: "
+                f"{generations_dir}"
+            )
+        generations_dir.mkdir(exist_ok=True)
+        if not generations_dir.is_dir():
+            raise OperatorIOError(
+                f"calibration generations path must be a directory: "
+                f"{generations_dir}"
+            )
+        generations_descriptor = _open_directory_without_following_links(
+            generations_dir
+        )
+        os.fsync(directory_descriptor)
+
+        current = _current_generation(resolved_dir, generations_dir)
+        if current is not None:
+            current_generation_dir, current_mapping = current
+            current_count, current_hash = _report_revision(
+                current_mapping,
+                source="published calibration report",
+            )
+            current_ledger_path = _report_ledger_path(
+                current_mapping,
+                source="published calibration report",
+            )
+            if incoming_ledger_path == current_ledger_path:
+                if incoming_count < current_count:
+                    raise _StaleCalibrationPublicationError(
+                        "incoming calibration ledger revision is stale: "
+                        f"{incoming_count} < {current_count} records"
+                    )
+                if incoming_count == current_count:
+                    if incoming_hash != current_hash:
+                        raise OperatorLedgerError(
+                            "calibration ledger revision conflict: equal record "
+                            "counts have different state hashes"
+                        )
+                    _ensure_compatibility_links(
+                        resolved_dir,
+                        directory_descriptor,
+                    )
+                    artifacts = _artifacts(
+                        resolved_dir,
+                        current_generation_dir,
+                        replayed=True,
+                    )
+                    fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
+                    locked = False
+                    os.close(generations_descriptor)
+                    generations_descriptor = -1
+                    os.close(directory_descriptor)
+                    directory_descriptor = -1
+                    return artifacts
+
+        ledger_path_hash = hashlib.sha256(
+            incoming_ledger_path.encode("utf-8")
+        ).hexdigest()[:16]
+        generation_name = (
+            f"generation-v{REPORT_SCHEMA_VERSION}-"
+            f"{ledger_path_hash}-{incoming_count:020d}-{incoming_hash}"
+        )
+        generation_dir, generation_created = _materialize_generation(
+            generations_dir,
+            generations_descriptor,
+            generation_name,
+            json_bytes,
+            markdown_bytes,
+        )
+        _swap_current_pointer(resolved_dir, generation_name)
+        pointer_replaced = True
+        os.fsync(directory_descriptor)
+        _ensure_compatibility_links(resolved_dir, directory_descriptor)
+        artifacts = _artifacts(
+            resolved_dir,
+            generation_dir,
+            replayed=False,
         )
         fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
         locked = False
+        os.close(generations_descriptor)
+        generations_descriptor = -1
         os.close(directory_descriptor)
         directory_descriptor = -1
         return artifacts
-    except OperatorIOError:
+    except (
+        _StaleCalibrationPublicationError,
+        OperatorIOError,
+        OperatorLedgerError,
+    ):
         raise
     except OSError as error:
         raise OperatorIOError(
             f"unable to write calibration reports: {error}"
         ) from error
     finally:
+        if (
+            generation_created
+            and not pointer_replaced
+            and generation_dir is not None
+        ):
+            _remove_generation_directory(generation_dir)
+            if generations_descriptor >= 0:
+                try:
+                    os.fsync(generations_descriptor)
+                except OSError:
+                    pass
+        if generations_descriptor >= 0:
+            try:
+                os.close(generations_descriptor)
+            except OSError:
+                pass
         if directory_descriptor >= 0:
             try:
                 if locked:
