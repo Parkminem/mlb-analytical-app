@@ -582,10 +582,7 @@ def _compatibility_generation_name(
     return f"compatibility-v1-{digest}"
 
 
-def _current_generation(
-    report_descriptor: int,
-    generations_descriptor: int,
-) -> _CurrentGeneration | None:
+def _current_generation_name(report_descriptor: int) -> str | None:
     current_metadata = stat_at(report_descriptor, CURRENT_GENERATION_NAME)
     if current_metadata is None:
         return None
@@ -605,7 +602,23 @@ def _current_generation(
         raise OperatorIOError(
             f"calibration current generation target is unsafe: {target}"
         )
-    generation_name = target.parts[1]
+    return target.parts[1]
+
+
+def _current_references_generation(
+    report_descriptor: int,
+    generation_name: str,
+) -> bool:
+    return _current_generation_name(report_descriptor) == generation_name
+
+
+def _current_generation(
+    report_descriptor: int,
+    generations_descriptor: int,
+) -> _CurrentGeneration | None:
+    generation_name = _current_generation_name(report_descriptor)
+    if generation_name is None:
+        return None
     raw_json, raw_markdown = _read_generation_bytes(
         generations_descriptor,
         generation_name,
@@ -775,6 +788,7 @@ def _prepare_compatibility_links(
         # Convert each path through a current generation with identical bytes.
         migration_name, migration_created = (
             _materialize_compatibility_generation(
+                report_descriptor,
                 generations_descriptor,
                 legacy_json,
                 legacy_markdown,
@@ -792,7 +806,8 @@ def _prepare_compatibility_links(
             migration_pointer_replaced = True
         finally:
             if migration_created and not migration_pointer_replaced:
-                _remove_generation_directory(
+                _remove_generation_if_unreferenced(
+                    report_descriptor,
                     generations_descriptor,
                     migration_name,
                 )
@@ -953,7 +968,28 @@ def _remove_generation_directory(
         pass
 
 
+def _remove_generation_if_unreferenced(
+    report_descriptor: int,
+    generations_descriptor: int,
+    generation_name: str,
+) -> None:
+    try:
+        if _current_references_generation(
+            report_descriptor,
+            generation_name,
+        ):
+            return
+    except (OSError, OperatorIOError):
+        # Cleanup is conservative when current cannot be inspected safely.
+        return
+    _remove_generation_directory(
+        generations_descriptor,
+        generation_name,
+    )
+
+
 def _materialize_immutable_generation(
+    report_descriptor: int,
     generations_descriptor: int,
     generation_name: str,
     members: tuple[tuple[str, bytes], ...],
@@ -1013,7 +1049,8 @@ def _materialize_immutable_generation(
         try:
             os.fsync(generations_descriptor)
         except OSError:
-            _remove_generation_directory(
+            _remove_generation_if_unreferenced(
+                report_descriptor,
                 generations_descriptor,
                 generation_name,
             )
@@ -1023,13 +1060,15 @@ def _materialize_immutable_generation(
         if temporary_descriptor >= 0:
             os.close(temporary_descriptor)
         if temporary_name:
-            _remove_generation_directory(
+            _remove_generation_if_unreferenced(
+                report_descriptor,
                 generations_descriptor,
                 temporary_name,
             )
 
 
 def _materialize_compatibility_generation(
+    report_descriptor: int,
     generations_descriptor: int,
     json_bytes: bytes,
     markdown_bytes: bytes,
@@ -1039,6 +1078,7 @@ def _materialize_compatibility_generation(
         markdown_bytes,
     )
     return _materialize_immutable_generation(
+        report_descriptor,
         generations_descriptor,
         generation_name,
         (
@@ -1057,12 +1097,14 @@ def _materialize_compatibility_generation(
 
 
 def _materialize_generation(
+    report_descriptor: int,
     generations_descriptor: int,
     generation_name: str,
     json_bytes: bytes,
     markdown_bytes: bytes,
 ) -> tuple[str, bool]:
     return _materialize_immutable_generation(
+        report_descriptor,
         generations_descriptor,
         generation_name,
         (
@@ -1141,14 +1183,18 @@ def _publish_current_pointer(
             report_descriptor,
             generations_descriptor,
         )
-    except BaseException:
-        if pointer_replaced:
+    except BaseException as error:
+        if pointer_replaced and isinstance(error, OperatorIOError):
             try:
-                _restore_current_pointer(
+                if _current_references_generation(
                     report_descriptor,
-                    previous_generation_name,
-                )
-            except OSError as rollback_error:
+                    generation_name,
+                ):
+                    _restore_current_pointer(
+                        report_descriptor,
+                        previous_generation_name,
+                    )
+            except (OSError, OperatorIOError) as rollback_error:
                 raise OperatorIOError(
                     "unable to restore calibration current generation after "
                     f"publication failure: {rollback_error}"
@@ -1282,6 +1328,7 @@ def write_calibration_reports(
             f"{ledger_path_hash}-{incoming_count:020d}-{incoming_hash}"
         )
         _, generation_created = _materialize_generation(
+            directory_descriptor,
             generations_descriptor,
             generation_name,
             json_bytes,
@@ -1318,7 +1365,8 @@ def write_calibration_reports(
             and generation_name is not None
             and generations_descriptor >= 0
         ):
-            _remove_generation_directory(
+            _remove_generation_if_unreferenced(
+                directory_descriptor,
                 generations_descriptor,
                 generation_name,
             )

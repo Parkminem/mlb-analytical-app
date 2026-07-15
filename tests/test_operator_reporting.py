@@ -956,6 +956,197 @@ def test_pointer_swap_failure_leaves_old_pair_current_and_cleans_generation(
     assert not tuple(report_dir.rglob("*.tmp"))
 
 
+def test_post_commit_interrupt_preserves_normal_generation_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    report_dir = tmp_path / "reports"
+    real_publish = reporting_module._publish_current_pointer
+
+    def publish_then_interrupt(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted after current commit")
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_publish_current_pointer",
+        publish_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after current commit"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    current_path = report_dir / "current"
+    generation_dir = report_dir / os.readlink(current_path)
+    assert generation_dir.is_dir()
+    assert (generation_dir / CALIBRATION_JSON_FILENAME).read_bytes() == (
+        canonical_json(mapping) + "\n"
+    ).encode("utf-8")
+    assert (generation_dir / CALIBRATION_MARKDOWN_FILENAME).is_file()
+    assert (report_dir / CALIBRATION_JSON_FILENAME).resolve() == (
+        generation_dir / CALIBRATION_JSON_FILENAME
+    )
+    assert (report_dir / CALIBRATION_MARKDOWN_FILENAME).resolve() == (
+        generation_dir / CALIBRATION_MARKDOWN_FILENAME
+    )
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_publish_current_pointer",
+        real_publish,
+    )
+    replay = write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert replay.replayed is True
+    assert replay.generation_dir == generation_dir
+
+
+def test_interrupt_after_pointer_durability_preserves_committed_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = _mapping(tmp_path, ())
+    report_dir = tmp_path / "reports"
+    real_verify = reporting_module._verify_report_directories
+    verification_count = 0
+
+    def verify_then_interrupt(*args, **kwargs):
+        nonlocal verification_count
+        result = real_verify(*args, **kwargs)
+        verification_count += 1
+        if verification_count == 4:
+            raise KeyboardInterrupt("interrupted after durable pointer")
+        return result
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_verify_report_directories",
+        verify_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after durable pointer"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    current_path = report_dir / "current"
+    generation_dir = report_dir / os.readlink(current_path)
+    assert generation_dir.is_dir()
+    assert (generation_dir / CALIBRATION_JSON_FILENAME).is_file()
+    assert (generation_dir / CALIBRATION_MARKDOWN_FILENAME).is_file()
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_verify_report_directories",
+        real_verify,
+    )
+    replay = write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert replay.replayed is True
+    assert replay.generation_dir == generation_dir
+
+
+def test_post_commit_interrupt_preserves_legacy_migration_and_rerun_heals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    legacy_json = b'{"legacy":"json"}\n'
+    legacy_markdown = b"# legacy markdown\n"
+    json_path = report_dir / CALIBRATION_JSON_FILENAME
+    markdown_path = report_dir / CALIBRATION_MARKDOWN_FILENAME
+    json_path.write_bytes(legacy_json)
+    markdown_path.write_bytes(legacy_markdown)
+    real_publish = reporting_module._publish_current_pointer
+
+    def publish_then_interrupt(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted after migration commit")
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_publish_current_pointer",
+        publish_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after migration commit"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    migration_dir = report_dir / os.readlink(report_dir / "current")
+    assert migration_dir.is_dir()
+    assert (migration_dir / CALIBRATION_JSON_FILENAME).read_bytes() == legacy_json
+    assert (
+        migration_dir / CALIBRATION_MARKDOWN_FILENAME
+    ).read_bytes() == legacy_markdown
+    assert json_path.read_bytes() == legacy_json
+    assert markdown_path.read_bytes() == legacy_markdown
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_publish_current_pointer",
+        real_publish,
+    )
+    healed = write_calibration_reports(mapping, report_dir=report_dir)
+    replay = write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert healed.replayed is False
+    assert replay.replayed is True
+    assert replay.generation_dir == healed.generation_dir
+    assert json_path.is_symlink()
+    assert markdown_path.is_symlink()
+    assert json_path.resolve() == healed.generation_json_path
+    assert markdown_path.resolve() == healed.generation_markdown_path
+
+
+def test_pre_commit_interrupt_keeps_old_current_and_removes_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    old_mapping = _mapping(tmp_path, (), ledger_records=(first_record,))
+    new_mapping = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    old = write_calibration_reports(old_mapping, report_dir=report_dir)
+    old_target = os.readlink(old.current_generation_path)
+    old_generation_names = {
+        path.name for path in (report_dir / "generations").iterdir()
+    }
+
+    def interrupt_before_publish(*args, **kwargs):
+        raise KeyboardInterrupt("interrupted before current commit")
+
+    monkeypatch.setattr(
+        reporting_module,
+        "_publish_current_pointer",
+        interrupt_before_publish,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="before current commit"):
+        write_calibration_reports(new_mapping, report_dir=report_dir)
+
+    assert os.readlink(old.current_generation_path) == old_target
+    assert old.current_generation_path.resolve() == old.generation_dir
+    assert {
+        path.name for path in (report_dir / "generations").iterdir()
+    } == old_generation_names
+
+
 def test_generation_construction_failure_leaves_old_pair_current(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
