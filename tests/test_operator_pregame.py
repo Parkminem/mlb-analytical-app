@@ -1,9 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 from pathlib import Path
+import threading
 
 import pytest
 
+import analysis.operator.service as service_module
 from analysis.operator.bundles import (
     ManagedBundleCopy,
     bundle_canonical_bytes,
@@ -603,7 +606,9 @@ def test_active_capture_selection_uses_latest_capture_order(tmp_path: Path) -> N
     assert result.capture.supersedes_capture_id != first.capture_id
 
 
-def test_supersession_target_ignores_non_pregame_capture(tmp_path: Path) -> None:
+def test_postgame_successor_deactivates_pregame_supersession_target(
+    tmp_path: Path,
+) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
     store = LedgerStore(ledger_path)
     game = _projected_game()
@@ -614,8 +619,9 @@ def test_supersession_target_ignores_non_pregame_capture(tmp_path: Path) -> None
     postgame_command = replace(
         build_shadow_capture_command(game),
         captured_at=game.identity.first_pitch + timedelta(seconds=1),
+        supersedes_capture_id=pregame.capture_id,
     )
-    postgame = store.append_capture("manual:postgame", postgame_command)
+    store.append_capture("manual:postgame", postgame_command)
     updated_game = replace(
         game,
         captured_at=game.captured_at + timedelta(minutes=5),
@@ -627,8 +633,62 @@ def test_supersession_target_ignores_non_pregame_capture(tmp_path: Path) -> None
         bundle_root=bundle_root,
     )
 
-    assert result.capture.supersedes_capture_id == pregame.capture_id
-    assert result.capture.supersedes_capture_id != postgame.capture_id
+    assert result.capture.supersedes_capture_id is None
+
+
+def test_concurrent_projected_runs_serialize_head_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    base_game = _projected_game()
+    bundles = tuple(
+        _pregame_bundle(
+            "projected",
+            replace(
+                base_game,
+                captured_at=base_game.captured_at + timedelta(minutes=offset),
+            ),
+        )
+        for offset in (1, 2)
+    )
+    original_forecast = service_module.run_forecast
+    forecast_barrier = threading.Barrier(2)
+
+    def synchronized_forecast(*args, **kwargs):
+        forecast = original_forecast(*args, **kwargs)
+        forecast_barrier.wait(timeout=5)
+        return forecast
+
+    monkeypatch.setattr(service_module, "run_forecast", synchronized_forecast)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(
+            executor.submit(
+                run_projected,
+                bundle,
+                ledger_path=ledger_path,
+                bundle_root=bundle_root,
+            )
+            for bundle in bundles
+        )
+        results = tuple(future.result(timeout=10) for future in futures)
+
+    captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
+    superseded_ids = frozenset(
+        capture.supersedes_capture_id
+        for capture in captures
+        if capture.supersedes_capture_id is not None
+    )
+    active = tuple(
+        capture
+        for capture in captures
+        if capture.capture_id not in superseded_ids
+    )
+    assert len(results) == 2
+    assert len(captures) == 2
+    assert len(active) == 1
+    assert sum(capture.supersedes_capture_id is None for capture in captures) == 1
 
 
 @pytest.mark.parametrize(
@@ -658,6 +718,68 @@ def test_ledger_failures_are_mapped_at_service_boundary(
             ledger_path=ledger_path,
             bundle_root=bundle_root,
         )
+
+
+def test_ledger_filesystem_error_maps_to_operator_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+
+    def fail_open(path):
+        raise OSError("ledger filesystem unavailable")
+
+    monkeypatch.setattr(service_module, "LedgerStore", fail_open)
+
+    with pytest.raises(OperatorIOError, match="filesystem unavailable"):
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
+def test_ledger_append_filesystem_error_maps_to_operator_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+
+    def fail_record(*args, **kwargs):
+        raise OSError("ledger append failed")
+
+    monkeypatch.setattr(service_module, "record_shadow_run", fail_record)
+
+    with pytest.raises(OperatorIOError, match="append failed"):
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
+def test_operator_lock_rejects_symlink_without_following_it(
+    tmp_path: Path,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    ledger_path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.lock"
+    outside.write_text("outside", encoding="utf-8")
+    operator_lock = ledger_path.with_name(
+        f"{ledger_path.name}.operator.lock"
+    )
+    operator_lock.symlink_to(outside)
+
+    with pytest.raises(OperatorIOError, match="operator lock"):
+        run_projected(
+            _pregame_bundle("projected", _projected_game()),
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 @pytest.mark.parametrize(
