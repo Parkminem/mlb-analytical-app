@@ -32,6 +32,7 @@ CALIBRATION_JSON_FILENAME = "calibration-latest.json"
 CALIBRATION_MARKDOWN_FILENAME = "calibration-latest.md"
 GENERATIONS_DIRNAME = "generations"
 CURRENT_GENERATION_NAME = "current"
+COMPATIBILITY_MIGRATION_MARKER_FILENAME = ".compatibility-migration-v1"
 DEFAULT_REPORT_DIR = (
     Path(__file__).resolve().parents[2] / "reports" / "private" / "shadow"
 )
@@ -56,6 +57,9 @@ _METRIC_LABELS = {
     "mean_probability_clv": "평균 확률 CLV",
     "mean_price_clv": "평균 가격 CLV",
 }
+_COMPATIBILITY_MIGRATION_MARKER_BYTES = (
+    b"calibration-compatibility-migration-v1\n"
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,16 @@ class CalibrationReportArtifacts:
 
 class _StaleCalibrationPublicationError(Exception):
     """A newer ledger revision was published before this writer acquired lock."""
+
+
+@dataclass(frozen=True)
+class _CurrentGeneration:
+    generation_dir: Path
+    mapping: Mapping[str, object] | None
+
+    @property
+    def is_compatibility_migration(self) -> bool:
+        return self.mapping is None
 
 
 def _utc_iso(value: datetime) -> str:
@@ -491,7 +505,7 @@ def _read_regular_file(path: Path) -> bytes:
             os.close(descriptor)
 
 
-def _read_generation_mapping(generation_dir: Path) -> Mapping[str, object]:
+def _read_generation_bytes(generation_dir: Path) -> tuple[bytes, bytes]:
     json_path = generation_dir / CALIBRATION_JSON_FILENAME
     markdown_path = generation_dir / CALIBRATION_MARKDOWN_FILENAME
     for path in (json_path, markdown_path):
@@ -499,7 +513,13 @@ def _read_generation_mapping(generation_dir: Path) -> Mapping[str, object]:
             raise OperatorIOError(
                 f"calibration generation file is missing or unsafe: {path}"
             )
-    raw_json = _read_regular_file(json_path)
+    return _read_regular_file(json_path), _read_regular_file(markdown_path)
+
+
+def _read_generation_mapping(
+    generation_dir: Path,
+    raw_json: bytes,
+) -> Mapping[str, object]:
     try:
         mapping = json.loads(raw_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -513,10 +533,20 @@ def _read_generation_mapping(generation_dir: Path) -> Mapping[str, object]:
     return mapping
 
 
+def _compatibility_generation_name(
+    json_bytes: bytes,
+    markdown_bytes: bytes,
+) -> str:
+    digest = hashlib.sha256(
+        b"json\0" + json_bytes + b"\0markdown\0" + markdown_bytes
+    ).hexdigest()
+    return f"compatibility-v1-{digest}"
+
+
 def _current_generation(
     report_dir: Path,
     generations_dir: Path,
-) -> tuple[Path, Mapping[str, object]] | None:
+) -> _CurrentGeneration | None:
     current_path = report_dir / CURRENT_GENERATION_NAME
     if not _path_exists(current_path):
         return None
@@ -546,27 +576,50 @@ def _current_generation(
         raise OperatorIOError(
             "calibration current generation escapes the generations directory"
         )
-    return resolved_generation, _read_generation_mapping(resolved_generation)
+    raw_json, raw_markdown = _read_generation_bytes(resolved_generation)
+    marker_path = (
+        resolved_generation / COMPATIBILITY_MIGRATION_MARKER_FILENAME
+    )
+    if _path_exists(marker_path):
+        if marker_path.is_symlink() or not marker_path.is_file():
+            raise OperatorIOError(
+                "calibration compatibility migration marker is unsafe"
+            )
+        if (
+            _read_regular_file(marker_path)
+            != _COMPATIBILITY_MIGRATION_MARKER_BYTES
+            or resolved_generation.name
+            != _compatibility_generation_name(raw_json, raw_markdown)
+        ):
+            raise OperatorLedgerError(
+                "calibration compatibility migration generation is corrupt"
+            )
+        return _CurrentGeneration(resolved_generation, None)
+    return _CurrentGeneration(
+        resolved_generation,
+        _read_generation_mapping(resolved_generation, raw_json),
+    )
 
 
 def _compatibility_target(filename: str) -> str:
     return f"{CURRENT_GENERATION_NAME}/{filename}"
 
 
-def _validate_compatibility_path(path: Path, target: str) -> None:
+def _compatibility_path_status(path: Path, target: str) -> str:
     if not _path_exists(path):
-        return
+        return "missing"
     if path.is_symlink():
         if os.readlink(path) != target:
             raise OperatorIOError(
                 f"calibration report path has an unsafe symbolic link: {path}"
             )
-        return
+        return "link"
     if not path.is_file():
         raise OperatorIOError(
             f"calibration report path must be a regular file or managed link: "
             f"{path}"
         )
+    return "regular"
 
 
 def _remove_staging_directory(
@@ -608,28 +661,126 @@ def _replace_with_symlink(
         _remove_staging_directory(staging_dir, destination.name)
 
 
-def _ensure_compatibility_links(
+def _compatibility_entries(
+    report_dir: Path,
+) -> tuple[tuple[str, Path, str], ...]:
+    return tuple(
+        (
+            filename,
+            report_dir / filename,
+            _compatibility_target(filename),
+        )
+        for filename in (
+            CALIBRATION_JSON_FILENAME,
+            CALIBRATION_MARKDOWN_FILENAME,
+        )
+    )
+
+
+def _prepare_compatibility_links(
     report_dir: Path,
     directory_descriptor: int,
-) -> None:
-    destinations = (
-        (report_dir / CALIBRATION_JSON_FILENAME, CALIBRATION_JSON_FILENAME),
-        (
-            report_dir / CALIBRATION_MARKDOWN_FILENAME,
-            CALIBRATION_MARKDOWN_FILENAME,
-        ),
+    generations_dir: Path,
+    generations_descriptor: int,
+    current: _CurrentGeneration | None,
+) -> _CurrentGeneration | None:
+    entries = _compatibility_entries(report_dir)
+    statuses = {
+        filename: _compatibility_path_status(path, target)
+        for filename, path, target in entries
+    }
+    regular_entries = tuple(
+        entry for entry in entries if statuses[entry[0]] == "regular"
     )
-    for path, filename in destinations:
-        _validate_compatibility_path(path, _compatibility_target(filename))
-    changed = False
-    for path, filename in destinations:
-        target = _compatibility_target(filename)
-        if path.is_symlink() and os.readlink(path) == target:
-            continue
+
+    if not regular_entries:
+        changed = False
+        for filename, path, target in entries:
+            if statuses[filename] != "missing":
+                continue
+            _replace_with_symlink(path, target)
+            changed = True
+        if changed:
+            os.fsync(directory_descriptor)
+        return current
+
+    if any(status == "missing" for status in statuses.values()):
+        raise OperatorIOError(
+            "cannot atomically migrate an incomplete legacy calibration pair"
+        )
+
+    if current is None:
+        if len(regular_entries) != len(entries):
+            raise OperatorIOError(
+                "cannot resume a partial legacy calibration conversion "
+                "without its migration generation"
+            )
+        legacy_json = _read_regular_file(
+            report_dir / CALIBRATION_JSON_FILENAME
+        )
+        legacy_markdown = _read_regular_file(
+            report_dir / CALIBRATION_MARKDOWN_FILENAME
+        )
+        # Convert each path through a current generation with identical bytes.
+        migration_dir, migration_created = (
+            _materialize_compatibility_generation(
+                generations_dir,
+                generations_descriptor,
+                legacy_json,
+                legacy_markdown,
+            )
+        )
+        migration_pointer_replaced = False
+        try:
+            _swap_current_pointer(report_dir, migration_dir.name)
+            migration_pointer_replaced = True
+            os.fsync(directory_descriptor)
+        finally:
+            if migration_created and not migration_pointer_replaced:
+                _remove_generation_directory(migration_dir)
+                try:
+                    os.fsync(generations_descriptor)
+                except OSError:
+                    pass
+        current = _CurrentGeneration(migration_dir, None)
+    elif not current.is_compatibility_migration:
+        raise OperatorIOError(
+            "cannot atomically convert legacy calibration files while a "
+            "published current generation exists"
+        )
+
+    for filename, path, _ in regular_entries:
+        expected = _read_regular_file(current.generation_dir / filename)
+        if _read_regular_file(path) != expected:
+            raise OperatorLedgerError(
+                "legacy calibration compatibility content changed during "
+                "migration"
+            )
+
+    for filename, path, target in regular_entries:
         _replace_with_symlink(path, target)
-        changed = True
-    if changed:
+    if regular_entries:
         os.fsync(directory_descriptor)
+    return current
+
+
+def _require_equal_revision_content(
+    generation_dir: Path,
+    json_bytes: bytes,
+    markdown_bytes: bytes,
+) -> None:
+    published_json, published_markdown = _read_generation_bytes(generation_dir)
+    mismatches: list[str] = []
+    if published_json != json_bytes:
+        mismatches.append("JSON")
+    if published_markdown != markdown_bytes:
+        mismatches.append("Markdown")
+    if mismatches:
+        raise OperatorLedgerError(
+            "calibration report replay content conflict: "
+            + " and ".join(mismatches)
+            + " bytes differ from the published generation"
+        )
 
 
 def _write_generation_file(path: Path, content: bytes) -> None:
@@ -642,12 +793,87 @@ def _write_generation_file(path: Path, content: bytes) -> None:
         os.fsync(report_file.fileno())
 
 
+def _materialize_compatibility_generation(
+    generations_dir: Path,
+    generations_descriptor: int,
+    json_bytes: bytes,
+    markdown_bytes: bytes,
+) -> tuple[Path, bool]:
+    generation_dir = generations_dir / _compatibility_generation_name(
+        json_bytes,
+        markdown_bytes,
+    )
+    if _path_exists(generation_dir):
+        marker_path = (
+            generation_dir / COMPATIBILITY_MIGRATION_MARKER_FILENAME
+        )
+        if (
+            generation_dir.is_symlink()
+            or not generation_dir.is_dir()
+            or marker_path.is_symlink()
+            or not marker_path.is_file()
+            or _read_regular_file(marker_path)
+            != _COMPATIBILITY_MIGRATION_MARKER_BYTES
+            or _read_generation_bytes(generation_dir)
+            != (json_bytes, markdown_bytes)
+        ):
+            raise OperatorLedgerError(
+                "legacy calibration compatibility generation conflicts with "
+                "its content hash"
+            )
+        return generation_dir.resolve(strict=True), False
+
+    temporary_dir: Path | None = Path(
+        tempfile.mkdtemp(
+            prefix=f".{generation_dir.name}.",
+            suffix=".tmp",
+            dir=generations_dir,
+        )
+    )
+    try:
+        _write_generation_file(
+            temporary_dir / CALIBRATION_JSON_FILENAME,
+            json_bytes,
+        )
+        _write_generation_file(
+            temporary_dir / CALIBRATION_MARKDOWN_FILENAME,
+            markdown_bytes,
+        )
+        _write_generation_file(
+            temporary_dir / COMPATIBILITY_MIGRATION_MARKER_FILENAME,
+            _COMPATIBILITY_MIGRATION_MARKER_BYTES,
+        )
+        temporary_descriptor = _open_directory_without_following_links(
+            temporary_dir
+        )
+        try:
+            os.fsync(temporary_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+        os.replace(temporary_dir, generation_dir)
+        temporary_dir = None
+        try:
+            os.fsync(generations_descriptor)
+        except OSError:
+            _remove_generation_directory(generation_dir)
+            try:
+                os.fsync(generations_descriptor)
+            except OSError:
+                pass
+            raise
+        return generation_dir.resolve(strict=True), True
+    finally:
+        if temporary_dir is not None:
+            _remove_generation_directory(temporary_dir)
+
+
 def _remove_generation_directory(path: Path) -> None:
     if not _path_exists(path) or path.is_symlink() or not path.is_dir():
         return
     for filename in (
         CALIBRATION_JSON_FILENAME,
         CALIBRATION_MARKDOWN_FILENAME,
+        COMPATIBILITY_MIGRATION_MARKER_FILENAME,
     ):
         try:
             (path / filename).unlink(missing_ok=True)
@@ -821,8 +1047,16 @@ def write_calibration_reports(
         os.fsync(directory_descriptor)
 
         current = _current_generation(resolved_dir, generations_dir)
-        if current is not None:
-            current_generation_dir, current_mapping = current
+        current = _prepare_compatibility_links(
+            resolved_dir,
+            directory_descriptor,
+            generations_dir,
+            generations_descriptor,
+            current,
+        )
+        if current is not None and current.mapping is not None:
+            current_generation_dir = current.generation_dir
+            current_mapping = current.mapping
             current_count, current_hash = _report_revision(
                 current_mapping,
                 source="published calibration report",
@@ -843,9 +1077,10 @@ def write_calibration_reports(
                             "calibration ledger revision conflict: equal record "
                             "counts have different state hashes"
                         )
-                    _ensure_compatibility_links(
-                        resolved_dir,
-                        directory_descriptor,
+                    _require_equal_revision_content(
+                        current_generation_dir,
+                        json_bytes,
+                        markdown_bytes,
                     )
                     artifacts = _artifacts(
                         resolved_dir,
@@ -877,7 +1112,6 @@ def write_calibration_reports(
         _swap_current_pointer(resolved_dir, generation_name)
         pointer_replaced = True
         os.fsync(directory_descriptor)
-        _ensure_compatibility_links(resolved_dir, directory_descriptor)
         artifacts = _artifacts(
             resolved_dir,
             generation_dir,

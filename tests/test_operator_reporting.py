@@ -1,3 +1,4 @@
+import copy
 from dataclasses import fields, replace
 from datetime import timedelta
 import hashlib
@@ -718,6 +719,8 @@ def test_one_pointer_swap_publishes_consistent_pair_and_compatibility_links(
 
     def recording_replace(source, destination):
         if Path(destination).name == "current":
+            assert (report_dir / CALIBRATION_JSON_FILENAME).is_symlink()
+            assert (report_dir / CALIBRATION_MARKDOWN_FILENAME).is_symlink()
             pointer_swaps.append(Path(destination))
         return real_replace(source, destination)
 
@@ -741,6 +744,118 @@ def test_one_pointer_swap_publishes_consistent_pair_and_compatibility_links(
     markdown = artifacts.generation_markdown_path.read_text(encoding="utf-8")
     assert str(revision["record_count"]) in markdown
     assert revision["state_hash"] in markdown
+
+
+def test_partial_legacy_compatibility_conversion_never_exposes_mixed_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    legacy_json = b'{"legacy":"json"}\n'
+    legacy_markdown = b"# legacy markdown\n"
+    json_path = report_dir / CALIBRATION_JSON_FILENAME
+    markdown_path = report_dir / CALIBRATION_MARKDOWN_FILENAME
+    json_path.write_bytes(legacy_json)
+    markdown_path.write_bytes(legacy_markdown)
+    real_replace = os.replace
+    failed = False
+
+    def fail_markdown_conversion_once(source, destination):
+        nonlocal failed
+        if (
+            Path(destination) == markdown_path
+            and not failed
+        ):
+            failed = True
+            raise OSError("legacy markdown conversion failed")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "analysis.operator.reporting.os.replace",
+        fail_markdown_conversion_once,
+    )
+
+    with pytest.raises(OperatorIOError, match="conversion failed"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    current_generation = (report_dir / "current").resolve()
+    assert json_path.is_symlink()
+    assert markdown_path.is_file() and not markdown_path.is_symlink()
+    assert json_path.read_bytes() == legacy_json
+    assert markdown_path.read_bytes() == legacy_markdown
+    assert (
+        current_generation / CALIBRATION_JSON_FILENAME
+    ).read_bytes() == legacy_json
+    assert (
+        current_generation / CALIBRATION_MARKDOWN_FILENAME
+    ).read_bytes() == legacy_markdown
+
+    artifacts = write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert artifacts.json_path.is_symlink()
+    assert artifacts.markdown_path.is_symlink()
+    assert artifacts.json_path.resolve() == artifacts.generation_json_path
+    assert artifacts.markdown_path.resolve() == artifacts.generation_markdown_path
+    assert artifacts.json_path.read_bytes() == (
+        canonical_json(mapping) + "\n"
+    ).encode("utf-8")
+
+
+def test_equal_revision_rejects_divergent_json_bytes(tmp_path: Path) -> None:
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    report_dir = tmp_path / "reports"
+    published = write_calibration_reports(mapping, report_dir=report_dir)
+    published_json = published.generation_json_path.read_bytes()
+    published_markdown = published.generation_markdown_path.read_bytes()
+    divergent = copy.deepcopy(mapping)
+    divergent["unrendered_conflict"] = "different JSON bytes"
+    assert render_report_markdown(divergent) == render_report_markdown(mapping)
+
+    with pytest.raises(OperatorLedgerError, match="replay content conflict"):
+        write_calibration_reports(divergent, report_dir=report_dir)
+
+    assert published.current_generation_path.resolve() == published.generation_dir
+    assert published.generation_json_path.read_bytes() == published_json
+    assert published.generation_markdown_path.read_bytes() == published_markdown
+
+
+def test_equal_revision_rejects_divergent_markdown_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    report_dir = tmp_path / "reports"
+    published = write_calibration_reports(mapping, report_dir=report_dir)
+    published_json = published.generation_json_path.read_bytes()
+    published_markdown = published.generation_markdown_path.read_bytes()
+    original_render = reporting_module.render_report_markdown
+
+    def divergent_markdown(value):
+        return original_render(value) + "\n충돌"
+
+    monkeypatch.setattr(
+        reporting_module,
+        "render_report_markdown",
+        divergent_markdown,
+    )
+
+    with pytest.raises(OperatorLedgerError, match="replay content conflict"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert published.current_generation_path.resolve() == published.generation_dir
+    assert published.generation_json_path.read_bytes() == published_json
+    assert published.generation_markdown_path.read_bytes() == published_markdown
 
 
 def test_stale_writer_cannot_regress_current_generation(tmp_path: Path) -> None:
