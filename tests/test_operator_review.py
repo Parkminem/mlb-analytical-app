@@ -944,13 +944,26 @@ def test_partial_retry_after_close_append_completes_without_duplicates(
         raise OSError("interrupted after close")
 
     monkeypatch.setattr(LedgerStore, "append_official_result", interrupt)
-    with pytest.raises(OperatorIOError, match="official result"):
+    with pytest.raises(OperatorIOError, match="official result") as raised:
         _run(review_context)
     monkeypatch.setattr(LedgerStore, "append_official_result", original)
 
-    assert len(_records(review_context, "market_observation")) == 1
+    closing_records = _records(review_context, "market_observation")
+    assert len(closing_records) == 1
     assert not _records(review_context, "official_result")
     assert not _records(review_context, "review")
+    progress = raised.value.partial_progress
+    assert progress.capture_id == review_context.confirmed.capture.capture_id
+    assert progress.forecast_run_id == review_context.confirmed.forecast.forecast_run_id
+    assert progress.capture_forecast_link_record_id == (
+        review_context.confirmed.link.envelope.record_id
+    )
+    assert progress.closing_observation_record_ids == (
+        closing_records[0].envelope.record_id,
+    )
+    assert progress.official_result_record_id is None
+    assert progress.review_record_ids == ()
+    assert progress.rerun_safe is True
     assert not tuple(
         (review_context.bundle_root / str(review_context.bundle.game_pk)).glob(
             "review-*.json"
@@ -993,14 +1006,20 @@ def test_partial_retry_after_result_and_one_review_completes_all_sorted_reviews(
         "build_and_record_review",
         interrupt_second,
     )
-    with pytest.raises(OperatorIOError, match="review"):
+    with pytest.raises(OperatorIOError, match="review") as raised:
         _run(review_context)
 
     assert calls == ["full_under", "sea_ml"]
-    assert len(_records(review_context, "official_result")) == 1
-    assert tuple(
-        review.market_key for review in _records(review_context, "review")
-    ) == ("full_under",)
+    result_records = _records(review_context, "official_result")
+    review_records = _records(review_context, "review")
+    assert len(result_records) == 1
+    assert tuple(review.market_key for review in review_records) == ("full_under",)
+    progress = raised.value.partial_progress
+    assert progress.official_result_record_id == (
+        result_records[0].envelope.record_id
+    )
+    assert progress.review_record_ids == (review_records[0].review_id,)
+    assert progress.rerun_safe is True
     assert not tuple(
         (review_context.bundle_root / str(review_context.bundle.game_pk)).glob(
             "review-*.json"
@@ -1020,6 +1039,59 @@ def test_partial_retry_after_result_and_one_review_completes_all_sorted_reviews(
         "sea_ml",
     )
     assert len(_records(review_context, "review")) == 2
+
+
+def test_report_failure_reports_all_progress_and_exact_retry_replays(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_publish = service_module._publish_calibration_report
+    interrupted = False
+
+    def interrupt_once(*args, **kwargs):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise OperatorIOError("calibration publication interrupted")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        interrupt_once,
+    )
+
+    with pytest.raises(OperatorIOError, match="publication") as raised:
+        _run(review_context)
+
+    closing_records = _records(review_context, "market_observation")
+    result_records = _records(review_context, "official_result")
+    review_records = _records(review_context, "review")
+    progress = raised.value.partial_progress
+    assert progress.closing_observation_record_ids == tuple(
+        record.envelope.record_id for record in closing_records
+    )
+    assert progress.official_result_record_id == (
+        result_records[0].envelope.record_id
+    )
+    assert progress.review_record_ids == tuple(
+        record.review_id for record in review_records
+    )
+    assert progress.managed_bundle_path is not None
+    assert progress.managed_bundle_path.is_file()
+    assert progress.rerun_safe is True
+
+    completed = _run(review_context)
+
+    assert completed.closing_replay_count == len(closing_records)
+    assert completed.official_result_replayed is True
+    assert completed.review_replay_count == len(review_records)
+    assert completed.managed_bundle.replayed is True
+    assert len(_records(review_context, "market_observation")) == len(
+        closing_records
+    )
+    assert len(_records(review_context, "official_result")) == 1
+    assert len(_records(review_context, "review")) == len(review_records)
 
 
 def test_review_bundle_is_persisted_only_after_all_ledger_operations_succeed(

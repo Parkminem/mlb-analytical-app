@@ -45,14 +45,18 @@ from analysis.shadow import (
 from .bundles import (
     DEFAULT_BUNDLE_ROOT,
     ManagedBundleCopy,
+    bundle_canonical_bytes,
+    bundle_sha256,
     intrinsic_capture_key,
     persist_managed_bundle,
 )
 from .config import load_forecast_config
 from .errors import (
     BundleValidationError,
+    OperatorError,
     OperatorIOError,
     OperatorLedgerError,
+    OperatorPartialProgress,
     OperatorPreconditionError,
 )
 from .reporting import (
@@ -70,6 +74,7 @@ DEFAULT_LEDGER_PATH = (
 )
 
 _Bundle = ProjectedBundle | ConfirmedBundle
+_AnyBundle = ProjectedBundle | ConfirmedBundle | ReviewBundle
 _T = TypeVar("_T")
 _HEAD_CAS_MAX_ATTEMPTS = 3
 _REPORT_PUBLICATION_MAX_ATTEMPTS = 3
@@ -136,6 +141,66 @@ class _LedgerSnapshot:
 
     def iter_records(self):
         return iter(self.records)
+
+
+def _partial_progress_records(store: LedgerStore) -> tuple[object, ...]:
+    """Best-effort authoritative reread that never masks the original error."""
+
+    try:
+        return _review_ledger_records(store)
+    except OperatorError:
+        return ()
+
+
+def _single_record(
+    records: tuple[object, ...],
+    record_type: type[_T],
+    predicate: Callable[[_T], bool],
+) -> _T | None:
+    matches = tuple(
+        record
+        for record in records
+        if isinstance(record, record_type) and predicate(record)
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _committed_managed_bundle_path(
+    bundle: _AnyBundle,
+    bundle_root: str | Path,
+    managed_bundle: ManagedBundleCopy | None,
+) -> Path | None:
+    if managed_bundle is not None:
+        return managed_bundle.path
+    try:
+        supplied_root = Path(bundle_root).expanduser()
+        if supplied_root.is_symlink():
+            return None
+        resolved_root = supplied_root.resolve(strict=False)
+        digest = bundle_sha256(bundle)
+        game_dir = resolved_root / str(bundle.game_pk)
+        if game_dir.is_symlink() or not game_dir.is_dir():
+            return None
+        resolved_game_dir = game_dir.resolve(strict=True)
+        if (
+            resolved_game_dir.parent != resolved_root
+            or resolved_game_dir.name != str(bundle.game_pk)
+        ):
+            return None
+        candidate = (
+            resolved_game_dir
+            / (
+                f"{bundle.stage}-v{bundle.schema_version}-"
+                f"{digest[:16]}.json"
+            )
+        )
+        if candidate.is_symlink() or not candidate.is_file():
+            return None
+        if candidate.read_bytes() != bundle_canonical_bytes(bundle):
+            return None
+        return candidate.resolve(strict=True)
+    except OSError:
+        return None
 
 
 def _ledger_operation(label: str, operation: Callable[[], _T]) -> _T:
@@ -316,6 +381,70 @@ def _record_replay_state(
     return forecast_replayed, link_replayed
 
 
+def _pregame_partial_progress(
+    store: LedgerStore,
+    bundle: _Bundle,
+    *,
+    capture_key: str,
+    forecast_run_id: str,
+    bundle_root: str | Path,
+    managed_bundle: ManagedBundleCopy | None,
+    capture_replayed: bool | None,
+    forecast_replayed: bool | None,
+    link_replayed: bool | None,
+) -> OperatorPartialProgress:
+    records = _partial_progress_records(store)
+    capture = _single_record(
+        records,
+        CaptureRecord,
+        lambda record: record.envelope.idempotency_key == capture_key,
+    )
+    committed_forecast = _single_record(
+        records,
+        ForecastRecord,
+        lambda record: record.forecast_run_id == forecast_run_id,
+    )
+    link = None
+    if capture is not None and committed_forecast is not None:
+        link = _single_record(
+            records,
+            CaptureForecastLink,
+            lambda record: (
+                record.capture_id == capture.capture_id
+                and record.forecast_run_id
+                == committed_forecast.forecast_run_id
+            ),
+        )
+    return OperatorPartialProgress(
+        stage=bundle.stage,
+        game_pk=bundle.game_pk,
+        capture_id=None if capture is None else capture.capture_id,
+        forecast_run_id=(
+            None
+            if committed_forecast is None
+            else committed_forecast.forecast_run_id
+        ),
+        capture_forecast_link_record_id=(
+            None if link is None else link.envelope.record_id
+        ),
+        managed_bundle_path=_committed_managed_bundle_path(
+            bundle,
+            bundle_root,
+            managed_bundle,
+        ),
+        capture_replayed=(
+            capture_replayed if capture is not None else None
+        ),
+        forecast_replayed=(
+            forecast_replayed if committed_forecast is not None else None
+        ),
+        link_replayed=link_replayed if link is not None else None,
+        managed_bundle_replayed=(
+            None if managed_bundle is None else managed_bundle.replayed
+        ),
+    )
+
+
 def _run_pregame(
     bundle: _Bundle,
     *,
@@ -342,64 +471,85 @@ def _run_pregame(
     )
 
     store = _open_ledger(ledger_path)
-    for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
-        captures = _captures(store)
-        existing_capture = _existing_keyed_capture(captures, capture_key)
-        active_head = _latest_active_capture(captures, bundle.game_pk)
-        supersedes_capture_id = _resolve_supersession_target(
-            stage=expected_stage,
-            captures=captures,
-            existing_capture=existing_capture,
-            game_pk=bundle.game_pk,
-        )
-        forecast_replayed, link_replayed = _record_replay_state(
-            store,
-            existing_capture=existing_capture,
-            forecast_run_id=forecast.forecast_run_id,
-        )
-        try:
-            records = _pregame_operation(
-                lambda: _ledger_operation(
-                    "unable to record shadow pregame run",
-                    lambda: record_shadow_run(
-                        store,
-                        bundle.payload.game_input,
-                        bundle.payload.legacy_decision,
-                        forecast,
-                        ShadowRunIdempotencyKeys(capture=capture_key),
-                        supersedes_capture_id=supersedes_capture_id,
-                        expected_active_capture_id=(
-                            None
-                            if active_head is None
-                            else active_head.capture_id
-                        ),
-                    ),
-                )
+    capture_replayed: bool | None = None
+    forecast_replayed: bool | None = None
+    link_replayed: bool | None = None
+    managed_bundle: ManagedBundleCopy | None = None
+    try:
+        for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
+            captures = _captures(store)
+            existing_capture = _existing_keyed_capture(captures, capture_key)
+            active_head = _latest_active_capture(captures, bundle.game_pk)
+            supersedes_capture_id = _resolve_supersession_target(
+                stage=expected_stage,
+                captures=captures,
+                existing_capture=existing_capture,
+                game_pk=bundle.game_pk,
             )
-        except LedgerHeadChangedError as error:
-            if attempt + 1 == _HEAD_CAS_MAX_ATTEMPTS:
-                raise OperatorLedgerError(
-                    "unable to record shadow pregame run: active capture "
-                    f"head changed after {_HEAD_CAS_MAX_ATTEMPTS} attempts: "
-                    f"{error}"
-                ) from error
-            continue
-        break
-    else:
-        raise RuntimeError("pregame head CAS retry loop exited unexpectedly")
-    managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
-    return PregameRunResult(
-        stage=expected_stage,
-        game_pk=bundle.game_pk,
-        lineup_state=records.capture.lineup_state,
-        capture=records.capture,
-        forecast=records.forecast,
-        link=records.link,
-        managed_bundle=managed_bundle,
-        capture_replayed=existing_capture is not None,
-        forecast_replayed=forecast_replayed,
-        link_replayed=link_replayed,
-    )
+            forecast_replayed, link_replayed = _record_replay_state(
+                store,
+                existing_capture=existing_capture,
+                forecast_run_id=forecast.forecast_run_id,
+            )
+            capture_replayed = existing_capture is not None
+            try:
+                records = _pregame_operation(
+                    lambda: _ledger_operation(
+                        "unable to record shadow pregame run",
+                        lambda: record_shadow_run(
+                            store,
+                            bundle.payload.game_input,
+                            bundle.payload.legacy_decision,
+                            forecast,
+                            ShadowRunIdempotencyKeys(capture=capture_key),
+                            supersedes_capture_id=supersedes_capture_id,
+                            expected_active_capture_id=(
+                                None
+                                if active_head is None
+                                else active_head.capture_id
+                            ),
+                        ),
+                    )
+                )
+            except LedgerHeadChangedError as error:
+                if attempt + 1 == _HEAD_CAS_MAX_ATTEMPTS:
+                    raise OperatorLedgerError(
+                        "unable to record shadow pregame run: active capture "
+                        f"head changed after {_HEAD_CAS_MAX_ATTEMPTS} attempts: "
+                        f"{error}"
+                    ) from error
+                continue
+            break
+        else:
+            raise RuntimeError(
+                "pregame head CAS retry loop exited unexpectedly"
+            )
+        managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+        return PregameRunResult(
+            stage=expected_stage,
+            game_pk=bundle.game_pk,
+            lineup_state=records.capture.lineup_state,
+            capture=records.capture,
+            forecast=records.forecast,
+            link=records.link,
+            managed_bundle=managed_bundle,
+            capture_replayed=bool(capture_replayed),
+            forecast_replayed=bool(forecast_replayed),
+            link_replayed=bool(link_replayed),
+        )
+    except OperatorError as error:
+        progress = _pregame_partial_progress(
+            store,
+            bundle,
+            capture_key=capture_key,
+            forecast_run_id=forecast.forecast_run_id,
+            bundle_root=bundle_root,
+            managed_bundle=managed_bundle,
+            capture_replayed=capture_replayed,
+            forecast_replayed=forecast_replayed,
+            link_replayed=link_replayed,
+        )
+        raise error.with_partial_progress(progress) from error
 
 
 def run_projected(
@@ -891,6 +1041,95 @@ def _review_idempotency_key(
     )
 
 
+def _review_partial_progress(
+    store: LedgerStore,
+    bundle: ReviewBundle,
+    *,
+    capture: CaptureRecord,
+    forecast: ForecastRecord,
+    link: CaptureForecastLink,
+    market_keys: tuple[str, ...],
+    baseline_record_ids: frozenset[str],
+    bundle_root: str | Path,
+    managed_bundle: ManagedBundleCopy | None,
+) -> OperatorPartialProgress:
+    records = _partial_progress_records(store)
+    closing_records: list[MarketObservationRecord] = []
+    for command in bundle.payload.closing_observations:
+        record = _single_record(
+            records,
+            MarketObservationRecord,
+            lambda candidate, key=_market_observation_key(command): (
+                candidate.envelope.idempotency_key == key
+            ),
+        )
+        if record is not None:
+            closing_records.append(record)
+
+    result = _single_record(
+        records,
+        OfficialResultRecord,
+        lambda record: (
+            record.envelope.idempotency_key
+            == _official_result_key(bundle.payload.official_result)
+        ),
+    )
+    review_records: list[ReviewRecord] = []
+    if result is not None:
+        for market_key in market_keys:
+            record = _single_record(
+                records,
+                ReviewRecord,
+                lambda candidate, key=_review_idempotency_key(
+                    capture,
+                    forecast,
+                    result,
+                    market_key,
+                ): candidate.envelope.idempotency_key == key,
+            )
+            if record is not None:
+                review_records.append(record)
+
+    managed_path = _committed_managed_bundle_path(
+        bundle,
+        bundle_root,
+        managed_bundle,
+    )
+    return OperatorPartialProgress(
+        stage=bundle.stage,
+        game_pk=bundle.game_pk,
+        capture_id=capture.capture_id,
+        forecast_run_id=forecast.forecast_run_id,
+        capture_forecast_link_record_id=link.envelope.record_id,
+        closing_observation_record_ids=tuple(
+            record.envelope.record_id for record in closing_records
+        ),
+        official_result_record_id=(
+            None if result is None else result.envelope.record_id
+        ),
+        review_record_ids=tuple(
+            record.review_id for record in review_records
+        ),
+        managed_bundle_path=managed_path,
+        closing_replay_count=sum(
+            record.envelope.record_id in baseline_record_ids
+            for record in closing_records
+        ),
+        official_result_replayed=(
+            None
+            if result is None
+            else result.envelope.record_id in baseline_record_ids
+        ),
+        review_replay_count=sum(
+            record.envelope.record_id in baseline_record_ids
+            for record in review_records
+        ),
+        managed_bundle_replayed=(
+            None if managed_bundle is None else managed_bundle.replayed
+        ),
+    )
+
+
 def _build_exact_review(
     store: LedgerStore,
     link: CaptureForecastLink,
@@ -1058,83 +1297,107 @@ def run_review(
         for command in close_commands
     )
     existing_result = _preflight_result_lineage(records, result_command)
-
-    closing_outcomes = tuple(
-        _append_closing_observation(store, command, preflight)
-        for command, preflight in zip(
-            close_commands,
-            closing_preflights,
-            strict=True,
-        )
+    baseline_record_ids = frozenset(
+        record.envelope.record_id for record in records
     )
-    closing_records = tuple(record for record, _ in closing_outcomes)
-    result_record = _append_official_result(
-        store,
-        result_command,
-        capture.capture_id,
-    )
+    managed_bundle: ManagedBundleCopy | None = None
 
-    review_records: list[ReviewRecord] = []
-    review_replay_count = 0
-    for market_key in market_keys:
-        current_records = _review_ledger_records(store)
-        existing_review = _record_with_key(
-            current_records,
-            ReviewRecord,
-            _review_idempotency_key(
-                capture,
-                forecast,
-                result_record,
-                market_key,
-            ),
+    try:
+        closing_outcomes = tuple(
+            _append_closing_observation(store, command, preflight)
+            for command, preflight in zip(
+                close_commands,
+                closing_preflights,
+                strict=True,
+            )
         )
-        if existing_review is not None:
-            review_records.append(existing_review)
-            review_replay_count += 1
-            continue
-        recorded = _build_exact_review(
+        closing_records = tuple(record for record, _ in closing_outcomes)
+        result_record = _append_official_result(
             store,
-            link,
-            result_record,
-            market_key,
+            result_command,
             capture.capture_id,
         )
-        review_records.append(recorded.record)
 
-    frozen_reviews = tuple(review_records)
-    managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
-    (
-        report_artifacts,
-        calibration_sample_size,
-        confirmed_game_count,
-        confirmed_decision_counts,
-    ) = _publish_calibration_report(store, ledger_path, report_dir)
-    return ReviewRunResult(
-        stage="review",
-        game_pk=bundle.game_pk,
-        capture=capture,
-        forecast=forecast,
-        link=link,
-        closing_observations=closing_records,
-        official_result=result_record,
-        reviews=frozen_reviews,
-        managed_bundle=managed_bundle,
-        closing_replay_count=sum(replayed for _, replayed in closing_outcomes),
-        official_result_replayed=existing_result is not None,
-        review_replay_count=review_replay_count,
-        classification_counts=_classification_count_mapping(frozen_reviews),
-        calibration_json_path=report_artifacts.json_path,
-        calibration_markdown_path=report_artifacts.markdown_path,
-        calibration_generation_dir=report_artifacts.generation_dir,
-        calibration_current_generation_path=(
-            report_artifacts.current_generation_path
-        ),
-        calibration_report_replayed=report_artifacts.replayed,
-        calibration_sample_size=calibration_sample_size,
-        confirmed_game_count=confirmed_game_count,
-        confirmed_decision_count=sum(confirmed_decision_counts.values()),
-        confirmed_decision_counts=confirmed_decision_counts,
-    )
+        review_records: list[ReviewRecord] = []
+        review_replay_count = 0
+        for market_key in market_keys:
+            current_records = _review_ledger_records(store)
+            existing_review = _record_with_key(
+                current_records,
+                ReviewRecord,
+                _review_idempotency_key(
+                    capture,
+                    forecast,
+                    result_record,
+                    market_key,
+                ),
+            )
+            if existing_review is not None:
+                review_records.append(existing_review)
+                review_replay_count += 1
+                continue
+            recorded = _build_exact_review(
+                store,
+                link,
+                result_record,
+                market_key,
+                capture.capture_id,
+            )
+            review_records.append(recorded.record)
+
+        frozen_reviews = tuple(review_records)
+        managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+        (
+            report_artifacts,
+            calibration_sample_size,
+            confirmed_game_count,
+            confirmed_decision_counts,
+        ) = _publish_calibration_report(store, ledger_path, report_dir)
+        return ReviewRunResult(
+            stage="review",
+            game_pk=bundle.game_pk,
+            capture=capture,
+            forecast=forecast,
+            link=link,
+            closing_observations=closing_records,
+            official_result=result_record,
+            reviews=frozen_reviews,
+            managed_bundle=managed_bundle,
+            closing_replay_count=sum(
+                replayed for _, replayed in closing_outcomes
+            ),
+            official_result_replayed=existing_result is not None,
+            review_replay_count=review_replay_count,
+            classification_counts=_classification_count_mapping(
+                frozen_reviews
+            ),
+            calibration_json_path=report_artifacts.json_path,
+            calibration_markdown_path=report_artifacts.markdown_path,
+            calibration_generation_dir=report_artifacts.generation_dir,
+            calibration_current_generation_path=(
+                report_artifacts.current_generation_path
+            ),
+            calibration_report_replayed=report_artifacts.replayed,
+            calibration_sample_size=calibration_sample_size,
+            confirmed_game_count=confirmed_game_count,
+            confirmed_decision_count=sum(
+                confirmed_decision_counts.values()
+            ),
+            confirmed_decision_counts=confirmed_decision_counts,
+        )
+    except OperatorError as error:
+        progress = _review_partial_progress(
+            store,
+            bundle,
+            capture=capture,
+            forecast=forecast,
+            link=link,
+            market_keys=market_keys,
+            baseline_record_ids=baseline_record_ids,
+            bundle_root=bundle_root,
+            managed_bundle=managed_bundle,
+        )
+        raise error.with_partial_progress(progress) from error
 
 
 __all__ = (

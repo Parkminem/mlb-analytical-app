@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 import subprocess
@@ -8,6 +8,11 @@ import pytest
 from typer.testing import CliRunner
 
 import analysis.operator.cli as cli_module
+import analysis.operator.service as service_module
+from analysis.forecasting import LineupState
+from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.identity import capture_payload
+from analysis.ledger import LedgerStore
 from analysis.operator.bundles import ManagedBundleCopy
 from analysis.operator.errors import (
     BundleValidationError,
@@ -23,6 +28,7 @@ from analysis.operator.schemas import (
     parse_projected_bundle_json,
     parse_review_bundle_json,
 )
+from tests.test_forecasting_engine import _complete_game
 from tests.test_operator_schemas import (
     _raw,
     confirmed_bundle_mapping,
@@ -403,7 +409,9 @@ def test_unexpected_exception_exits_one_without_traceback(
     monkeypatch.setattr(cli_module, "load_bundle", lambda path: _bundle("projected"))
 
     def fail(bundle, **kwargs):
-        raise RuntimeError("injected failure")
+        raise RuntimeError(
+            "api_token=top-secret https://private.example/token /private/path"
+        )
 
     monkeypatch.setattr(cli_module, "run_projected", fail)
 
@@ -413,8 +421,179 @@ def test_unexpected_exception_exits_one_without_traceback(
     )
 
     assert result.exit_code == 1
-    assert "internal error: injected failure" in result.output
+    assert "internal error: RuntimeError" in result.output
+    assert "top-secret" not in result.output
+    assert "private.example" not in result.output
+    assert "/private/path" not in result.output
     assert "Traceback" not in result.output
+
+
+def test_malicious_unknown_bundle_value_is_never_printed(
+    tmp_path: Path,
+) -> None:
+    secret = "api-token-secret-value"
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["api_token"] = secret
+    bundle_path = tmp_path / "projected-secret.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        ["projected", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert "payload.api_token" in result.output
+    assert "extra_forbidden" in result.output
+    assert secret not in result.output
+    assert "input_value" not in result.output
+    assert "errors.pydantic.dev" not in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("command", "mapping_factory", "missing_path"),
+    (
+        (
+            "projected",
+            projected_bundle_mapping,
+            "payload.forecast_config_version",
+        ),
+        (
+            "confirmed",
+            confirmed_bundle_mapping,
+            "payload.forecast_config_version",
+        ),
+        ("review", review_bundle_mapping, "payload.capture_id"),
+    ),
+)
+def test_malformed_bundle_reports_its_own_stage_schema_location(
+    tmp_path: Path,
+    command: str,
+    mapping_factory,
+    missing_path: str,
+) -> None:
+    mapping = mapping_factory()
+    section, field = missing_path.split(".")
+    del mapping[section][field]
+    bundle_path = tmp_path / f"{command}-malformed.json"
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        [command, "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 3
+    assert missing_path in result.output
+    assert "literal_error" not in result.output
+    assert "input_value" not in result.output
+    assert "errors.pydantic.dev" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_valid_wrong_stage_bundle_is_a_cli_precondition(
+    tmp_path: Path,
+) -> None:
+    bundle_path = tmp_path / "confirmed.json"
+    bundle_path.write_text(
+        _raw(confirmed_bundle_mapping()),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        ["projected", "--bundle", str(bundle_path)],
+    )
+
+    assert result.exit_code == 4
+    assert "bundle stage/type mismatch" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_prints_authoritative_partial_progress_and_reruns_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_path = tmp_path / "projected.json"
+    mapping = projected_bundle_mapping()
+    game = _complete_game()
+    game = replace(
+        game,
+        away_lineup=replace(game.away_lineup, state=LineupState.PROJECTED),
+    )
+    mapping["payload"]["game_input"] = capture_payload(game)
+    bundle_path.write_text(_raw(mapping), encoding="utf-8")
+    ledger_path = tmp_path / "ledger" / "shadow.jsonl"
+    bundle_root = tmp_path / "managed"
+    original_persist = service_module.persist_managed_bundle
+    interrupted = False
+    monkeypatch.setattr(
+        service_module,
+        "load_forecast_config",
+        lambda version, *, registry_root=None: SimulationConfig(
+            version="shadow-forecast-2026-07-14.1",
+            simulations=12,
+        ),
+    )
+
+    def interrupt_once(bundle, *, root):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise OperatorIOError("managed bundle persistence interrupted")
+        return original_persist(bundle, root=root)
+
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        interrupt_once,
+    )
+    arguments = [
+        "projected",
+        "--bundle",
+        str(bundle_path),
+        "--ledger",
+        str(ledger_path),
+        "--bundle-root",
+        str(bundle_root),
+    ]
+
+    failed = runner.invoke(cli_module.app, arguments)
+
+    assert failed.exit_code == 6, failed.output
+    records = tuple(LedgerStore(ledger_path).iter_records())
+    capture = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture"
+    )
+    forecast = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "forecast"
+    )
+    link = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture_forecast_link"
+    )
+    assert f"partial.capture_id: {capture.capture_id}" in failed.output
+    assert f"partial.forecast_run_id: {forecast.forecast_run_id}" in failed.output
+    assert (
+        "partial.capture_forecast_link_record_id: "
+        f"{link.envelope.record_id}"
+    ) in failed.output
+    assert "partial.rerun_safe: true" in failed.output
+    assert "Traceback" not in failed.output
+
+    completed = runner.invoke(cli_module.app, arguments)
+
+    assert completed.exit_code == 0, completed.output
+    assert "capture_replayed: true" in completed.output
+    assert "forecast_replayed: true" in completed.output
+    assert "link_replayed: true" in completed.output
+    assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
 
 
 @pytest.mark.parametrize("command", ("projected", "confirmed", "review"))

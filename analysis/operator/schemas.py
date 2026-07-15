@@ -157,6 +157,7 @@ _CONFIRMED_ADAPTER = TypeAdapter(ConfirmedBundle)
 _REVIEW_ADAPTER = TypeAdapter(ReviewBundle)
 _BundleType = TypeVar("_BundleType", bound=BaseModel)
 _AuditPresenceCheck = Callable[[object], None]
+_KNOWN_BUNDLE_STAGES = frozenset(("projected", "confirmed", "review"))
 _LEGACY_SNAPSHOT_FIELDS = tuple(
     field.name for field in fields(LegacyDecisionSnapshot)
 )
@@ -292,11 +293,9 @@ def _raw_json_bytes(raw: str | bytes | bytearray) -> tuple[bytes, str]:
     raise BundleValidationError("bundle JSON must be raw UTF-8 text or bytes")
 
 
-def _parse_bundle_json(
+def _decode_bundle_json(
     raw: str | bytes | bytearray,
-    adapter: TypeAdapter[_BundleType],
-    audit_presence_check: _AuditPresenceCheck,
-) -> _BundleType:
+) -> tuple[bytes, object]:
     raw_bytes, decoded = _raw_json_bytes(raw)
     try:
         decoded_value = json.loads(
@@ -306,12 +305,51 @@ def _parse_bundle_json(
         )
     except (json.JSONDecodeError, ValueError) as error:
         raise BundleValidationError(f"invalid bundle JSON: {error}") from error
+    return raw_bytes, decoded_value
+
+
+def bundle_stage_from_json(raw: str | bytes | bytearray) -> str | None:
+    """Return a recognized envelope stage without validating its payload."""
+
+    _, decoded_value = _decode_bundle_json(raw)
+    if not isinstance(decoded_value, dict):
+        return None
+    stage = decoded_value.get("stage")
+    return stage if stage in _KNOWN_BUNDLE_STAGES else None
+
+
+def _validation_location(location: tuple[object, ...]) -> str:
+    return ".".join(str(part) for part in location) or "bundle"
+
+
+def _safe_validation_diagnostics(error: ValidationError) -> str:
+    diagnostics: list[str] = []
+    for detail in error.errors(include_input=False, include_url=False):
+        location = _validation_location(tuple(detail.get("loc", ())))
+        message = str(detail.get("msg", "validation failed"))
+        error_type = str(detail.get("type", "validation_error"))
+        diagnostics.append(f"{location}: {message} [type={error_type}]")
+    return "; ".join(diagnostics) or "bundle validation failed"
+
+
+def _parse_bundle_json(
+    raw: str | bytes | bytearray,
+    adapter: TypeAdapter[_BundleType],
+    audit_presence_check: _AuditPresenceCheck,
+) -> _BundleType:
+    raw_bytes, decoded_value = _decode_bundle_json(raw)
     audit_presence_check(decoded_value)
 
     try:
         return adapter.validate_json(raw_bytes, strict=True)
-    except (ValidationError, TypeError, ValueError) as error:
-        raise BundleValidationError(f"invalid bundle: {error}") from error
+    except ValidationError as error:
+        raise BundleValidationError(
+            f"invalid bundle: {_safe_validation_diagnostics(error)}"
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise BundleValidationError(
+            f"invalid bundle: {error.__class__.__name__}"
+        ) from error
 
 
 def parse_projected_bundle_json(

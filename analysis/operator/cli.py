@@ -9,7 +9,11 @@ from rich.console import Console
 from rich.text import Text
 
 from .bundles import DEFAULT_BUNDLE_ROOT, load_bundle
-from .errors import OperatorError, OperatorPreconditionError
+from .errors import (
+    OperatorError,
+    OperatorPartialProgress,
+    OperatorPreconditionError,
+)
 from .schemas import ConfirmedBundle, ProjectedBundle, ReviewBundle
 from .service import (
     DEFAULT_LEDGER_PATH,
@@ -54,6 +58,61 @@ def _print_summary(title: str, rows: _SummaryRows) -> None:
         _OUTPUT.print(line, soft_wrap=True)
 
 
+def _partial_progress_rows(
+    progress: OperatorPartialProgress,
+) -> tuple[tuple[str, object], ...]:
+    rows: list[tuple[str, object]] = [
+        ("partial.stage", progress.stage),
+        ("partial.game_pk", progress.game_pk),
+    ]
+    optional_rows = (
+        ("partial.capture_id", progress.capture_id),
+        ("partial.forecast_run_id", progress.forecast_run_id),
+        (
+            "partial.capture_forecast_link_record_id",
+            progress.capture_forecast_link_record_id,
+        ),
+        ("partial.official_result_record_id", progress.official_result_record_id),
+        ("partial.managed_bundle_path", progress.managed_bundle_path),
+        ("partial.capture_replayed", progress.capture_replayed),
+        ("partial.forecast_replayed", progress.forecast_replayed),
+        ("partial.link_replayed", progress.link_replayed),
+        ("partial.closing_replay_count", progress.closing_replay_count),
+        (
+            "partial.official_result_replayed",
+            progress.official_result_replayed,
+        ),
+        ("partial.review_replay_count", progress.review_replay_count),
+        (
+            "partial.managed_bundle_replayed",
+            progress.managed_bundle_replayed,
+        ),
+    )
+    rows.extend((label, value) for label, value in optional_rows if value is not None)
+    rows.extend(
+        (f"partial.closing_observation_record_id.{index}", record_id)
+        for index, record_id in enumerate(
+            progress.closing_observation_record_ids,
+            start=1,
+        )
+    )
+    rows.extend(
+        (f"partial.review_record_id.{index}", record_id)
+        for index, record_id in enumerate(progress.review_record_ids, start=1)
+    )
+    rows.append(("partial.rerun_safe", progress.rerun_safe))
+    return tuple(rows)
+
+
+def _print_partial_progress(progress: OperatorPartialProgress) -> None:
+    _ERROR_OUTPUT.print(Text("Partial progress", style="bold"), soft_wrap=True)
+    for label, value in _partial_progress_rows(progress):
+        line = Text()
+        line.append(f"{label}: ", style="bold cyan")
+        line.append(_scalar_text(value))
+        _ERROR_OUTPUT.print(line, soft_wrap=True)
+
+
 def _concise_error(error: Exception) -> str:
     message = " ".join(str(error).split())
     return message or error.__class__.__name__
@@ -67,11 +126,13 @@ def _run_at_cli_boundary(operation: Callable[[], None]) -> None:
             Text(f"error: {_concise_error(error)}", style="bold red"),
             soft_wrap=True,
         )
+        if error.partial_progress is not None:
+            _print_partial_progress(error.partial_progress)
         raise typer.Exit(code=error.exit_code) from None
     except Exception as error:
         _ERROR_OUTPUT.print(
             Text(
-                f"internal error: {_concise_error(error)}",
+                f"internal error: {error.__class__.__name__}",
                 style="bold red",
             ),
             soft_wrap=True,

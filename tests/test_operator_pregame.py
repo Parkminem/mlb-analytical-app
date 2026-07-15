@@ -375,6 +375,105 @@ def test_exact_projected_retry_replays_every_record_and_original_lineage(
     assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
 
 
+def test_pregame_artifact_failure_reports_committed_progress_and_reruns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+    original_persist = service_module.persist_managed_bundle
+    interrupted = False
+
+    def interrupt_once(bundle, *, root):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise OperatorIOError("managed bundle persistence interrupted")
+        return original_persist(bundle, root=root)
+
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        interrupt_once,
+    )
+
+    with pytest.raises(OperatorIOError) as raised:
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    records = tuple(LedgerStore(ledger_path).iter_records())
+    capture = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture"
+    )
+    forecast = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "forecast"
+    )
+    link = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture_forecast_link"
+    )
+    progress = raised.value.partial_progress
+    assert progress.stage == "projected"
+    assert progress.game_pk == bundle.game_pk
+    assert progress.capture_id == capture.capture_id
+    assert progress.forecast_run_id == forecast.forecast_run_id
+    assert progress.capture_forecast_link_record_id == link.envelope.record_id
+    assert progress.capture_replayed is False
+    assert progress.forecast_replayed is False
+    assert progress.link_replayed is False
+    assert progress.rerun_safe is True
+    with pytest.raises(FrozenInstanceError):
+        progress.capture_id = "changed"
+
+    completed = run_projected(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert completed.capture_replayed is True
+    assert completed.forecast_replayed is True
+    assert completed.link_replayed is True
+    assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
+
+
+def test_partial_progress_never_claims_symlinked_managed_bundle(
+    tmp_path: Path,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+    bundle_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (bundle_root / str(bundle.game_pk)).symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+    digest = bundle_sha256(bundle)
+    unsafe_target = (
+        outside / f"projected-v1-{digest[:16]}.json"
+    )
+    unsafe_target.write_bytes(bundle_canonical_bytes(bundle))
+
+    with pytest.raises(OperatorIOError, match="symbolic link") as raised:
+        run_projected(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    assert raised.value.partial_progress.capture_id is not None
+    assert raised.value.partial_progress.managed_bundle_path is None
+
+
 def test_later_capture_reuses_forecast_but_supersedes_projected_capture(
     tmp_path: Path,
 ) -> None:

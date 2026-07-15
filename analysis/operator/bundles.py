@@ -18,6 +18,7 @@ from .schemas import (
     ConfirmedBundle,
     ProjectedBundle,
     ReviewBundle,
+    bundle_stage_from_json,
     parse_confirmed_bundle_json,
     parse_projected_bundle_json,
     parse_review_bundle_json,
@@ -30,11 +31,11 @@ _BUNDLE_ADAPTERS = {
     ConfirmedBundle: TypeAdapter(ConfirmedBundle),
     ReviewBundle: TypeAdapter(ReviewBundle),
 }
-_BUNDLE_PARSERS = (
-    parse_projected_bundle_json,
-    parse_confirmed_bundle_json,
-    parse_review_bundle_json,
-)
+_BUNDLE_PARSERS = {
+    "projected": parse_projected_bundle_json,
+    "confirmed": parse_confirmed_bundle_json,
+    "review": parse_review_bundle_json,
+}
 DEFAULT_BUNDLE_ROOT = (
     Path(__file__).resolve().parents[2] / "data" / "shadow" / "bundles"
 )
@@ -61,8 +62,11 @@ def load_bundle(path: str | os.PathLike[str]) -> _Bundle:
         raise OperatorIOError(
             f"unable to read bundle {bundle_path}: {error}"
         ) from error
+    stage = bundle_stage_from_json(raw)
+    if stage is not None:
+        return _BUNDLE_PARSERS[stage](raw)
     parse_errors: list[BundleValidationError] = []
-    for candidate in _BUNDLE_PARSERS:
+    for candidate in _BUNDLE_PARSERS.values():
         try:
             return candidate(raw)
         except BundleValidationError as error:
