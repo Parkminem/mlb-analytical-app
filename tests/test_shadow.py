@@ -29,6 +29,7 @@ from analysis.forecasting.identity import (
 from analysis.ledger import (
     CaptureForecastLink,
     CaptureRecord,
+    ForecastCommand,
     ForecastRecord,
     LedgerHeadChangedError,
     LedgerStore,
@@ -921,6 +922,50 @@ class ShadowRecordingTests(unittest.TestCase):
             second.link.envelope.record_id,
         )
         self.assertEqual(len(tuple(self.store.iter_records("capture"))), 1)
+        self.assertEqual(len(tuple(self.store.iter_records("forecast"))), 1)
+        self.assertEqual(
+            len(tuple(self.store.iter_records("capture_forecast_link"))),
+            1,
+        )
+
+    def test_historical_forecast_replays_with_compact_ledger_output(self) -> None:
+        comparison = compare_shadow_forecast(self.legacy, self.forecast)
+        compact_outputs = shadow_module._forecast_outputs(
+            self.forecast,
+            comparison,
+        )
+        historical_outputs = json.loads(canonical_json(compact_outputs))
+        historical_outputs["component_distributions"] = (
+            expand_component_distributions(
+                historical_outputs["component_distributions"]
+            )
+        )
+        historical = self.store.append_forecast(
+            ForecastCommand(
+                forecast_run_id=self.forecast.forecast_run_id,
+                model_version=self.forecast.model_version,
+                simulation_config_hash=hashlib.sha256(
+                    canonical_json(self.forecast.simulation_config).encode("utf-8")
+                ).hexdigest(),
+                normalized_input_hash=normalized_input_hash(self.game),
+                outputs=historical_outputs,
+            )
+        )
+
+        replay = self.record(keys=self.keys("historical-compact-replay"))
+
+        self.assertEqual(replay.forecast, historical)
+        self.assertIn(
+            "values",
+            replay.forecast.outputs["component_distributions"][
+                "away_full_runs"
+            ],
+        )
+        self.assertEqual(replay.link.capture_id, replay.capture.capture_id)
+        self.assertEqual(
+            replay.link.forecast_run_id,
+            historical.forecast_run_id,
+        )
         self.assertEqual(len(tuple(self.store.iter_records("forecast"))), 1)
         self.assertEqual(
             len(tuple(self.store.iter_records("capture_forecast_link"))),

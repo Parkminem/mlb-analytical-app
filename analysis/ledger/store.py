@@ -15,6 +15,7 @@ import weakref
 
 from analysis.forecasting.identity import canonical_json
 
+from .forecast_codec import expand_component_distributions
 from .records import (
     CaptureCommand,
     CaptureForecastLink,
@@ -291,6 +292,36 @@ def _command_for_forecast(record: ForecastRecord) -> ForecastCommand:
         normalized_input_hash=record.normalized_input_hash,
         outputs=record.outputs,
     )
+
+
+def _forecast_semantic_payload(command: ForecastCommand) -> dict[str, object]:
+    outputs = dict(command.outputs)
+    distributions = outputs.get("component_distributions")
+    if distributions is not None:
+        outputs["component_distributions"] = expand_component_distributions(
+            distributions
+        )
+    return {
+        "forecast_run_id": command.forecast_run_id,
+        "model_version": command.model_version,
+        "simulation_config_hash": command.simulation_config_hash,
+        "normalized_input_hash": command.normalized_input_hash,
+        "outputs": outputs,
+    }
+
+
+def _forecast_replay_is_semantically_equal(
+    existing: object,
+    incoming: object,
+) -> bool:
+    if not isinstance(existing, ForecastRecord) or not isinstance(
+        incoming,
+        ForecastCommand,
+    ):
+        return False
+    return canonical_json(
+        _forecast_semantic_payload(_command_for_forecast(existing))
+    ) == canonical_json(_forecast_semantic_payload(incoming))
 
 
 def _command_for_market(
@@ -1017,6 +1048,9 @@ class LedgerStore:
         validate: Callable[[tuple[_RecordT, ...]], None],
         build: Callable[[RecordEnvelope], _RecordT],
         prevalidate: Callable[[tuple[_RecordT, ...]], None] | None = None,
+        replay_is_semantically_equal: (
+            Callable[[object, object], bool] | None
+        ) = None,
     ) -> _RecordT:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("idempotency_key must be a non-empty string")
@@ -1056,6 +1090,18 @@ class LedgerStore:
                         ):
                             continue
                         if existing.envelope.payload_hash == logical_hash:
+                            self._validate_open_descriptor(
+                                descriptor,
+                                self._ledger_name,
+                                "ledger",
+                            )
+                            return existing
+                        if replay_is_semantically_equal is not None and (
+                            replay_is_semantically_equal(
+                                existing,
+                                logical_payload,
+                            )
+                        ):
                             self._validate_open_descriptor(
                                 descriptor,
                                 self._ledger_name,
@@ -1224,6 +1270,7 @@ class LedgerStore:
             command,
             lambda records: None,
             build,
+            replay_is_semantically_equal=_forecast_replay_is_semantically_equal,
         )
         if not isinstance(record, ForecastRecord):
             raise LedgerCorruptionError("forecast idempotency resolved to wrong kind")
