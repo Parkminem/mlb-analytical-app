@@ -52,7 +52,7 @@ Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`
 - 공식 결과가 선발 체인 실점과 불펜 실점을 모두 제공하면 각 투수진의 두 값은 음이 아닌 정수여야 하며 상대 최종 득점과 정확히 일치해야 합니다. 보존되지 않는 구성요소는 review 또는 calibration에 들어가기 전에 거부됩니다.
 - Pregame 조회는 ledger 옆의 rebuildable `checkpoint-v1` 파생 파일을 사용합니다. JSONL만 권위가 있으며 checkpoint는 삭제하거나 손상돼도 strict ledger scan으로 복구됩니다.
 - Historical 평문 forecast 배열은 계속 읽히고, 신규 20,000개 component 배열은 canonical JSON 기반으로 결정론적·무손실 압축됩니다. Decode 결과, review, calibration report mapping은 동일합니다.
-- 완전한 exact projected/confirmed replay만 시뮬레이션을 건너뜁니다. 입력, config, legacy snapshot, market 또는 frozen output 검증이 하나라도 다르면 기존 20,000회 forecast를 그대로 실행합니다.
+- 완전한 exact projected/confirmed replay만 시뮬레이션을 건너뜁니다. 동일 forecast의 legacy note/candidate/review binding 정정은 forecast를 바꾸지 않고 최신 exact link에 append-only로 기록합니다. 입력, config, 최신 link의 legacy snapshot, 저장된 score path에서 재계산한 market output 또는 frozen output 검증이 하나라도 다르면 기존 20,000회 forecast를 그대로 실행합니다.
 
 ## Documentation
 

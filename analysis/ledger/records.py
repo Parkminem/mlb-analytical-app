@@ -617,6 +617,8 @@ class CaptureForecastLink:
     envelope: RecordEnvelope
     capture_id: str
     forecast_run_id: str
+    shadow_comparison: Mapping[str, object] | None = None
+    supersedes_link_record_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.envelope, RecordEnvelope):
@@ -628,6 +630,43 @@ class CaptureForecastLink:
             )
         _require_nonempty(self.capture_id, "capture_id")
         _require_nonempty(self.forecast_run_id, "forecast_run_id")
+        if self.shadow_comparison is not None:
+            object.__setattr__(
+                self,
+                "shadow_comparison",
+                freeze_mapping(
+                    self.shadow_comparison,
+                    "shadow_comparison",
+                ),
+            )
+        if self.supersedes_link_record_id is not None:
+            _require_generated_id(
+                self.supersedes_link_record_id,
+                "supersedes_link_record_id",
+            )
+            if self.shadow_comparison is None:
+                raise ValueError(
+                    "a superseding link requires shadow_comparison"
+                )
+            if self.supersedes_link_record_id == self.envelope.record_id:
+                raise ValueError("capture-forecast link cannot supersede itself")
+
+
+def linked_shadow_comparison(
+    link: CaptureForecastLink,
+    forecast: ForecastRecord,
+) -> object:
+    """Resolve the immutable comparison bound by one exact relationship."""
+
+    if not isinstance(link, CaptureForecastLink):
+        raise TypeError("link must be CaptureForecastLink")
+    if not isinstance(forecast, ForecastRecord):
+        raise TypeError("forecast must be ForecastRecord")
+    if link.forecast_run_id != forecast.forecast_run_id:
+        raise ValueError("link and forecast_run_id must match")
+    if link.shadow_comparison is not None:
+        return link.shadow_comparison
+    return forecast.outputs.get("shadow_comparison")
 
 
 @dataclass(frozen=True)
@@ -1040,4 +1079,5 @@ __all__ = (
     "RecordEnvelope",
     "ReviewCommand",
     "ReviewRecord",
+    "linked_shadow_comparison",
 )

@@ -5,6 +5,7 @@ import hashlib
 import math
 import re
 import sys
+from collections.abc import Sequence
 
 from .identity import canonical_json
 from .inputs import MarketInput, MarketType, SettlementFormat
@@ -514,25 +515,12 @@ def settle_observed_market(
     return _outcome(value, market_input.market_type)
 
 
-def evaluate_market(
-    simulation: SimulationResult,
-    market_input: MarketInput,
+def _evaluate_market_score_rows(
+    score_rows: object,
+    denominator: int,
+    market_input: object,
 ) -> MarketEvaluation:
-    """Settle a verified normalized market over every shared simulation path."""
-
-    if not isinstance(simulation, SimulationResult):
-        raise TypeError("simulation must be SimulationResult")
-    if not isinstance(market_input, MarketInput):
-        raise TypeError("market_input must be MarketInput")
-    if (
-        not isinstance(simulation.games, tuple)
-        or not simulation.games
-        or len(simulation.games) != simulation.simulation_count
-    ):
-        raise ValueError("simulation games must match a positive simulation_count")
-    if any(not isinstance(game, SimulatedGame) for game in simulation.games):
-        raise TypeError("simulation games must contain SimulatedGame values")
-
+    _require_settlement_market_input(market_input)
     _require_market_contract(market_input)
     semantic_fingerprint = market_semantic_fingerprint(
         market_key=market_input.market_key,
@@ -560,10 +548,24 @@ def evaluate_market(
         )
 
     counts = {"win": 0, "push": 0, "loss": 0}
-    for game in simulation.games:
-        value = _settlement_value(game, market_input)
+    observed = 0
+    for (
+        away_f5_runs,
+        home_f5_runs,
+        away_full_runs,
+        home_full_runs,
+    ) in score_rows:
+        value = _settlement_value_from_scores(
+            market_input,
+            away_f5_runs=away_f5_runs,
+            home_f5_runs=home_f5_runs,
+            away_full_runs=away_full_runs,
+            home_full_runs=home_full_runs,
+        )
         counts[_outcome(value, market_input.market_type)] += 1
-    denominator = len(simulation.games)
+        observed += 1
+    if observed != denominator:
+        raise ValueError("score rows must match denominator")
     probabilities = OutcomeProbabilities(
         win=counts["win"] / denominator,
         push=counts["push"] / denominator,
@@ -579,6 +581,81 @@ def evaluate_market(
     )
 
 
+def evaluate_market_from_score_distributions(
+    market_input: object,
+    *,
+    away_f5_runs: Sequence[int],
+    home_f5_runs: Sequence[int],
+    away_full_runs: Sequence[int],
+    home_full_runs: Sequence[int],
+) -> MarketEvaluation:
+    """Rebuild one market from the four canonical shared score paths."""
+
+    score_distributions = (
+        away_f5_runs,
+        home_f5_runs,
+        away_full_runs,
+        home_full_runs,
+    )
+    if any(
+        isinstance(values, (str, bytes)) or not isinstance(values, Sequence)
+        for values in score_distributions
+    ):
+        raise TypeError("score distributions must be sequences")
+    lengths = {len(values) for values in score_distributions}
+    if len(lengths) != 1 or not lengths or next(iter(lengths)) <= 0:
+        raise ValueError(
+            "score distributions must have one shared positive length"
+        )
+    if any(
+        type(value) is not int or value < 0
+        for values in score_distributions
+        for value in values
+    ):
+        raise ValueError(
+            "score distributions must contain nonnegative integers"
+        )
+    denominator = next(iter(lengths))
+    return _evaluate_market_score_rows(
+        zip(*score_distributions, strict=True),
+        denominator,
+        market_input,
+    )
+
+
+def evaluate_market(
+    simulation: SimulationResult,
+    market_input: MarketInput,
+) -> MarketEvaluation:
+    """Settle a verified normalized market over every shared simulation path."""
+
+    if not isinstance(simulation, SimulationResult):
+        raise TypeError("simulation must be SimulationResult")
+    if not isinstance(market_input, MarketInput):
+        raise TypeError("market_input must be MarketInput")
+    if (
+        not isinstance(simulation.games, tuple)
+        or not simulation.games
+        or len(simulation.games) != simulation.simulation_count
+    ):
+        raise ValueError("simulation games must match a positive simulation_count")
+    if any(not isinstance(game, SimulatedGame) for game in simulation.games):
+        raise TypeError("simulation games must contain SimulatedGame values")
+    return _evaluate_market_score_rows(
+        (
+            (
+                game.away_f5_runs,
+                game.home_f5_runs,
+                game.away_full_runs,
+                game.home_full_runs,
+            )
+            for game in simulation.games
+        ),
+        simulation.simulation_count,
+        market_input,
+    )
+
+
 __all__ = (
     "OutcomeProbabilities",
     "MarketEvaluation",
@@ -586,5 +663,6 @@ __all__ = (
     "market_is_push_capable",
     "price_market",
     "evaluate_market",
+    "evaluate_market_from_score_distributions",
     "settle_observed_market",
 )

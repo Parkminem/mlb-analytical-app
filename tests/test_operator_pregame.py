@@ -19,6 +19,7 @@ from analysis.operator.bundles import (
 from analysis.forecasting import LineupState
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import canonical_json, capture_payload
+from analysis.forecasting.simulation import _summarize
 from analysis.forecasting.validation import (
     PregameRelationshipError,
     PregameTimingError,
@@ -31,6 +32,10 @@ from analysis.ledger import (
     LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
+)
+from analysis.ledger.forecast_codec import (
+    compact_forecast_outputs,
+    expand_component_distributions,
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.operator.errors import (
@@ -59,6 +64,7 @@ from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
     build_shadow_capture_command,
+    canonical_legacy_decision_payload,
 )
 from tests.test_forecasting_engine import _complete_game
 from tests.test_forecasting_inputs import complete_forecast_game
@@ -585,6 +591,163 @@ def test_exact_confirmed_replay_returns_frozen_records_without_forecast(
     assert replay.forecast_replayed is True
     assert replay.link_replayed is True
     assert replay.managed_bundle.replayed is True
+
+
+@pytest.mark.parametrize(
+    "legacy_change",
+    ("note", "candidate", "binding"),
+)
+def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_change: str,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    base = _pregame_bundle("confirmed", _confirmed_game())
+    legacy = _ordered_legacy_decision()
+    bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    if legacy_change == "note":
+        corrected_legacy = replace(legacy, notes=("corrected operator note",))
+    elif legacy_change == "candidate":
+        corrected_legacy = replace(
+            legacy,
+            candidates=(
+                replace(legacy.candidates[0], score=77),
+                *legacy.candidates[1:],
+            ),
+        )
+    else:
+        first_binding = legacy.review_bindings[0]
+        starter_path = first_binding.principal_paths[0]
+        corrected_legacy = replace(
+            legacy,
+            review_bindings=(
+                replace(
+                    first_binding,
+                    principal_paths=(
+                        replace(
+                            starter_path,
+                            component_ids=(
+                                "home_pitcher_chain_workload_outs",
+                            ),
+                        ),
+                        *first_binding.principal_paths[1:],
+                    ),
+                ),
+                *legacy.review_bindings[1:],
+            ),
+        )
+    corrected_bundle = bundle.model_copy(
+        update={
+            "payload": bundle.payload.model_copy(
+                update={"legacy_decision": corrected_legacy}
+            )
+        }
+    )
+
+    corrected = run_confirmed(
+        corrected_bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert corrected.capture == first.capture
+    assert corrected.forecast == first.forecast
+    assert corrected.link.envelope.record_id != first.link.envelope.record_id
+    assert (
+        corrected.link.supersedes_link_record_id
+        == first.link.envelope.record_id
+    )
+    assert corrected.link.shadow_comparison is not None
+    assert corrected.link.shadow_comparison["legacy"] == (
+        canonical_legacy_decision_payload(corrected_legacy)
+    )
+    assert corrected.capture_replayed is True
+    assert corrected.forecast_replayed is True
+    assert corrected.link_replayed is False
+    assert len(tuple(LedgerStore(ledger_path).iter_records())) == 4
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("corrected exact replay must not run forecast")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+    replay = run_confirmed(
+        corrected_bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert replay.capture == corrected.capture
+    assert replay.forecast == corrected.forecast
+    assert replay.link == corrected.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+    assert len(tuple(LedgerStore(ledger_path).iter_records())) == 4
+
+
+def test_hash_valid_distribution_market_mismatch_replay_calls_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    outputs = json.loads(canonical_json(first.forecast.outputs))
+    distributions = expand_component_distributions(
+        outputs["component_distributions"]
+    )
+    assert isinstance(distributions, dict)
+    away_full = distributions["away_full_runs"]
+    home_full = distributions["home_full_runs"]
+    away_values = list(away_full["values"])
+    home_values = list(home_full["values"])
+    changed_index = next(
+        index
+        for index, (away_runs, home_runs) in enumerate(
+            zip(away_values, home_values, strict=True)
+        )
+        if away_runs < home_runs
+    )
+    away_values[changed_index] = home_values[changed_index] + 1
+    summary = json.loads(canonical_json(_summarize(tuple(away_values))))
+    away_full["values"] = away_values
+    away_full["summary"] = summary
+    outputs["intervals"]["away_full_runs"] = summary
+    outputs["component_distributions"] = distributions
+    outputs = compact_forecast_outputs(outputs)
+    _rewrite_forecast_outputs(ledger_path, first.forecast, outputs)
+
+    class ForecastCalled(RuntimeError):
+        pass
+
+    def fail_forecast(*args, **kwargs):
+        raise ForecastCalled("distribution-market mismatch")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(ForecastCalled, match="distribution-market mismatch"):
+        run_confirmed(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
 
 
 @pytest.mark.parametrize(

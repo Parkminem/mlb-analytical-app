@@ -26,6 +26,7 @@ from analysis.ledger.records import (
     OfficialResultRecord,
     ReviewCommand,
     ReviewRecord,
+    linked_shadow_comparison,
 )
 from analysis.model import PriorityEvidencePath
 
@@ -297,7 +298,7 @@ def _require_capture_forecast_market_binding(
 
 
 def _exact_shadow_comparison(
-    outputs: Mapping[str, object],
+    comparison_payload: object,
     forecast_context: object,
     forecast_run_id: str,
     market_key: str,
@@ -313,9 +314,7 @@ def _exact_shadow_comparison(
     if not isinstance(forecast_context, FrozenForecastContext):
         raise TypeError("forecast_context must be FrozenForecastContext")
 
-    shadow = deserialize_shadow_comparison(
-        outputs.get("shadow_comparison")
-    )
+    shadow = deserialize_shadow_comparison(comparison_payload)
     if shadow.forecast_run_id != forecast_run_id:
         raise ValueError(
             "shadow_comparison forecast_run_id must match ForecastRecord"
@@ -589,7 +588,7 @@ def build_review_candidate(
         home_team,
     )
     comparison, semantic_market_inputs = _exact_shadow_comparison(
-        outputs,
+        linked_shadow_comparison(link, forecast),
         forecast_context,
         forecast.forecast_run_id,
         market_key,

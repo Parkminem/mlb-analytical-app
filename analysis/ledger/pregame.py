@@ -1,8 +1,10 @@
 """Checkpoint-backed lookup and single-session shadow pregame persistence."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from types import TracebackType
@@ -35,7 +37,7 @@ from .store import (
     LedgerHeadChangedError,
     LedgerReferenceError,
     _deserialize_record,
-    _forecast_replay_is_semantically_equal,
+    _forecast_model_replay_is_semantically_equal,
     _logical_payload,
     _payload_hash,
     _reject_duplicate_keys,
@@ -309,21 +311,66 @@ class PregameLedgerSession:
             None,
         )
 
-    def _indexed_link(
+    def _indexed_links(
         self,
         capture_id: str,
         forecast_run_id: str,
-    ) -> IndexedRecord | None:
-        return next(
-            (
-                record
-                for record in self.checkpoint.records
-                if record.record_kind == "capture_forecast_link"
-                and record.capture_id == capture_id
-                and record.forecast_run_id == forecast_run_id
-            ),
-            None,
+    ) -> tuple[IndexedRecord, ...]:
+        return tuple(
+            record
+            for record in self.checkpoint.records
+            if record.record_kind == "capture_forecast_link"
+            and record.capture_id == capture_id
+            and record.forecast_run_id == forecast_run_id
         )
+
+    def _active_link(
+        self,
+        capture_id: str,
+        forecast_run_id: str,
+    ) -> CaptureForecastLink | None:
+        indexed_links = self._indexed_links(capture_id, forecast_run_id)
+        if not indexed_links:
+            return None
+        links = tuple(
+            self._load_indexed_record(indexed)
+            for indexed in indexed_links
+        )
+        if any(not isinstance(link, CaptureForecastLink) for link in links):
+            raise LedgerCorruptionError(
+                "link checkpoint resolved wrong kind"
+            )
+        links_by_id = {
+            link.envelope.record_id: link
+            for link in links
+            if isinstance(link, CaptureForecastLink)
+        }
+        superseded_ids: set[str] = set()
+        for link in links_by_id.values():
+            superseded_id = link.supersedes_link_record_id
+            if superseded_id is None:
+                continue
+            superseded = links_by_id.get(superseded_id)
+            if superseded is None:
+                raise LedgerCorruptionError(
+                    "capture-forecast link correction supersedes a missing "
+                    "relationship"
+                )
+            if superseded_id in superseded_ids:
+                raise LedgerCorruptionError(
+                    "capture-forecast link correction lineage branches"
+                )
+            superseded_ids.add(superseded_id)
+        active = tuple(
+            link
+            for record_id, link in links_by_id.items()
+            if record_id not in superseded_ids
+        )
+        if len(active) != 1:
+            raise LedgerCorruptionError(
+                "capture-forecast relationship must have exactly one active link"
+            )
+        return active[0]
 
     def _active_captures(
         self,
@@ -433,10 +480,10 @@ class PregameLedgerSession:
         active_index = self._latest_active_capture(game_pk)
         active_confirmed_capture = self._active_confirmed_capture(game_pk)
         forecast_index = self._indexed_forecast(forecast_run_id)
-        link_index = (
+        link = (
             None
             if capture_index is None or forecast_index is None
-            else self._indexed_link(
+            else self._active_link(
                 capture_index.capture_id or "",
                 forecast_run_id,
             )
@@ -455,11 +502,6 @@ class PregameLedgerSession:
             None
             if forecast_index is None
             else self._load_indexed_record(forecast_index)
-        )
-        link = (
-            None
-            if link_index is None
-            else self._load_indexed_record(link_index)
         )
         if capture is not None and not isinstance(capture, CaptureRecord):
             raise LedgerCorruptionError("capture checkpoint resolved wrong kind")
@@ -500,7 +542,11 @@ class PregameLedgerSession:
             raise LedgerReferenceError(
                 "capture and forecast normalized_input_hash must match"
             )
-        link, link_is_new = self._resolve_link(capture, forecast)
+        link, link_is_new = self._resolve_link(
+            capture,
+            forecast,
+            forecast_command,
+        )
         new_records = tuple(
             record
             for record, is_new in (
@@ -620,7 +666,10 @@ class PregameLedgerSession:
                 )
             if (
                 existing.envelope.payload_hash == logical_hash
-                or _forecast_replay_is_semantically_equal(existing, command)
+                or _forecast_model_replay_is_semantically_equal(
+                    existing,
+                    command,
+                )
             ):
                 return existing, False
             raise IdempotencyConflict(
@@ -648,33 +697,77 @@ class PregameLedgerSession:
         self,
         capture: CaptureRecord,
         forecast: ForecastRecord,
+        forecast_command: ForecastCommand,
     ) -> tuple[CaptureForecastLink, bool]:
-        logical_payload = {
-            "capture_id": capture.capture_id,
-            "forecast_run_id": forecast.forecast_run_id,
-        }
-        logical_hash = _payload_hash(logical_payload)
-        existing_index = self._indexed_link(
+        incoming_comparison = forecast_command.outputs.get(
+            "shadow_comparison"
+        )
+        if incoming_comparison is not None and not isinstance(
+            incoming_comparison,
+            Mapping,
+        ):
+            raise LedgerReferenceError(
+                "forecast command shadow_comparison must be a mapping"
+            )
+        existing = self._active_link(
             capture.capture_id,
             forecast.forecast_run_id,
         )
-        if existing_index is not None:
-            existing = self._load_indexed_record(existing_index)
-            if not isinstance(existing, CaptureForecastLink):
-                raise LedgerCorruptionError(
-                    "link idempotency resolved to wrong kind"
-                )
-            if existing.envelope.payload_hash != logical_hash:
-                raise IdempotencyConflict(
-                    "idempotency key already used for another logical "
-                    "capture_forecast_link payload: "
-                    f"{existing.envelope.idempotency_key}"
-                )
+        if incoming_comparison is None and existing is not None:
             return existing, False
-        idempotency_key = (
-            f"capture-forecast:{capture.capture_id}:"
-            f"{forecast.forecast_run_id}"
+        stored_comparison = (
+            forecast.outputs.get("shadow_comparison")
+            if existing is None or existing.shadow_comparison is None
+            else existing.shadow_comparison
         )
+        if existing is not None and canonical_json(
+            stored_comparison
+        ) == canonical_json(incoming_comparison):
+            return existing, False
+
+        comparison_override = (
+            None
+            if existing is None
+            and (
+                incoming_comparison is None
+                or canonical_json(stored_comparison)
+                == canonical_json(incoming_comparison)
+            )
+            else incoming_comparison
+        )
+        supersedes_link_record_id = (
+            None if existing is None else existing.envelope.record_id
+        )
+        if comparison_override is None:
+            idempotency_key = (
+                f"capture-forecast:{capture.capture_id}:"
+                f"{forecast.forecast_run_id}"
+            )
+        else:
+            comparison_hash = hashlib.sha256(
+                canonical_json(comparison_override).encode("utf-8")
+            ).hexdigest()
+            predecessor = (
+                "root"
+                if supersedes_link_record_id is None
+                else supersedes_link_record_id
+            )
+            idempotency_key = (
+                f"capture-forecast:{capture.capture_id}:"
+                f"{forecast.forecast_run_id}:shadow:"
+                f"{predecessor}:{comparison_hash}"
+            )
+        logical_payload: dict[str, object] = {
+            "capture_id": capture.capture_id,
+            "forecast_run_id": forecast.forecast_run_id,
+        }
+        if comparison_override is not None:
+            logical_payload["shadow_comparison"] = comparison_override
+        if supersedes_link_record_id is not None:
+            logical_payload["supersedes_link_record_id"] = (
+                supersedes_link_record_id
+            )
+        logical_hash = _payload_hash(logical_payload)
         return (
             CaptureForecastLink(
                 envelope=self._new_envelope(
@@ -684,6 +777,8 @@ class PregameLedgerSession:
                 ),
                 capture_id=capture.capture_id,
                 forecast_run_id=forecast.forecast_run_id,
+                shadow_comparison=comparison_override,
+                supersedes_link_record_id=supersedes_link_record_id,
             ),
             True,
         )

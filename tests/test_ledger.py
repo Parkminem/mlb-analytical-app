@@ -598,6 +598,33 @@ class LedgerStoreTests(unittest.TestCase):
                 )
             self.assertEqual(len(tuple(store.iter_records("forecast"))), 1)
 
+    def test_forecast_append_changed_shadow_comparison_still_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger.jsonl")
+            first = store.append_forecast(
+                forecast_command(
+                    outputs={
+                        "selected_probability": 0.55,
+                        "shadow_comparison": {"note": "original"},
+                    }
+                )
+            )
+
+            with self.assertRaises(IdempotencyConflict):
+                store.append_forecast(
+                    forecast_command(
+                        outputs={
+                            "selected_probability": 0.55,
+                            "shadow_comparison": {"note": "corrected"},
+                        }
+                    )
+                )
+
+            self.assertEqual(
+                tuple(store.iter_records("forecast")),
+                (first,),
+            )
+
     def test_forecast_outputs_reject_nested_capture_identity(self) -> None:
         invalid_outputs = (
             {"capture_id": "capture-1"},

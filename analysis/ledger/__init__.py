@@ -20,6 +20,7 @@ from .records import (
     RecordEnvelope,
     ReviewCommand,
     ReviewRecord,
+    linked_shadow_comparison,
 )
 from .store import (
     IdempotencyConflict,
@@ -58,4 +59,5 @@ __all__ = (
     "ReviewCommand",
     "ReviewRecord",
     "build_checkpoint",
+    "linked_shadow_comparison",
 )

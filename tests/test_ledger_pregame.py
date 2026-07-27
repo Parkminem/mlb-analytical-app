@@ -16,6 +16,7 @@ from analysis.ledger import (
     LedgerCorruptionError,
     LedgerHeadChangedError,
     LedgerStore,
+    RecordEnvelope,
 )
 
 
@@ -359,6 +360,46 @@ def test_atomic_exact_replay_returns_same_records_without_appending(
     assert replay.forecast_replayed is True
     assert replay.link_replayed is True
     assert store.path.read_bytes() == before
+
+
+def test_lookup_fails_closed_for_multiple_unsuperseded_link_roots(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    store = LedgerStore(ledger_path)
+    capture = store.append_capture("capture:roots", capture_command())
+    forecast = store.append_forecast(forecast_command())
+    store.link_capture_forecast(
+        capture.capture_id,
+        forecast.forecast_run_id,
+    )
+    logical_payload = {
+        "capture_id": capture.capture_id,
+        "forecast_run_id": forecast.forecast_run_id,
+    }
+    rogue = CaptureForecastLink(
+        envelope=RecordEnvelope(
+            record_id="f" * 32,
+            record_kind="capture_forecast_link",
+            idempotency_key="capture-forecast:rogue-root",
+            payload_hash=payload_hash(logical_payload),
+            appended_at=datetime.now(UTC),
+        ),
+        capture_id=capture.capture_id,
+        forecast_run_id=forecast.forecast_run_id,
+    )
+    with ledger_path.open("ab") as ledger:
+        ledger.write(canonical_json(rogue).encode("utf-8") + b"\n")
+
+    with pytest.raises(
+        LedgerCorruptionError,
+        match="exactly one active link",
+    ):
+        LedgerStore(ledger_path).lookup_shadow_pregame(
+            "capture:roots",
+            forecast.forecast_run_id,
+            capture.game_pk,
+        )
 
 
 def test_atomic_append_completes_partial_relationship_without_duplicates(

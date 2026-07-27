@@ -12,7 +12,11 @@ import stat
 
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
-from analysis.ledger import ForecastRecord
+from analysis.ledger import (
+    CaptureForecastLink,
+    ForecastRecord,
+    linked_shadow_comparison,
+)
 from analysis.review.calibration import (
     CalibrationMetrics,
     CalibrationReport,
@@ -210,52 +214,142 @@ def _migration_eligible_rows(
             f"migration rows reference missing frozen forecasts: {missing}"
         )
 
-    eligible_pairs: set[tuple[str, str]] = set()
-    comparison_pairs: set[tuple[str, str]] = set()
-    for forecast_run_id in sorted(required_forecast_ids):
-        forecast = forecasts_by_run_id[forecast_run_id]
-        try:
-            comparison = deserialize_shadow_comparison(
-                forecast.outputs.get("shadow_comparison")
-            )
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "invalid frozen shadow comparison required by migration row "
-                f"for forecast {forecast_run_id}: {error}"
-            ) from error
-        if comparison.forecast_run_id != forecast_run_id:
-            raise ValueError(
-                "frozen shadow comparison forecast_run_id does not match "
-                f"migration forecast {forecast_run_id}"
-            )
-        for market in comparison.market_comparisons:
-            pair = (forecast_run_id, market.market_key)
-            if pair in comparison_pairs:
-                raise ValueError(
-                    "duplicate exact market in frozen shadow comparison: "
-                    f"{forecast_run_id}, {market.market_key}"
-                )
-            comparison_pairs.add(pair)
-            if market.review_eligible:
-                eligible_pairs.add(pair)
-
-    required_pairs = {
-        (row.forecast_run_id, row.market_key) for row in confirmed_rows
+    links_by_pair: dict[
+        tuple[str, str],
+        list[CaptureForecastLink],
+    ] = {}
+    required_relationships = {
+        (row.capture_id, row.forecast_run_id)
+        for row in confirmed_rows
     }
-    missing_pairs = required_pairs - comparison_pairs
-    if missing_pairs:
+    for record in ledger_records:
+        if (
+            isinstance(record, CaptureForecastLink)
+            and (record.capture_id, record.forecast_run_id)
+            in required_relationships
+        ):
+            links_by_pair.setdefault(
+                (record.capture_id, record.forecast_run_id),
+                [],
+            ).append(record)
+    active_links: dict[tuple[str, str], CaptureForecastLink] = {}
+    for pair, links in links_by_pair.items():
+        links_by_id = {
+            link.envelope.record_id: link
+            for link in links
+        }
+        if len(links_by_id) != len(links):
+            raise ValueError(
+                "duplicate capture-forecast link required by migration rows"
+            )
+        superseded_ids: set[str] = set()
+        for link in links:
+            target_id = link.supersedes_link_record_id
+            if target_id is None:
+                continue
+            if target_id not in links_by_id:
+                raise ValueError(
+                    "corrected capture-forecast link required by migration "
+                    "references a missing relationship"
+                )
+            if target_id in superseded_ids:
+                raise ValueError(
+                    "corrected capture-forecast link required by migration "
+                    "branches"
+                )
+            superseded_ids.add(target_id)
+        active = tuple(
+            link
+            for link in links
+            if link.envelope.record_id not in superseded_ids
+        )
+        if len(active) != 1:
+            raise ValueError(
+                "capture-forecast links required by migration do not have "
+                "one active relationship"
+            )
+        active_links[pair] = active[0]
+
+    eligible_relationships: set[tuple[str, str, str]] = set()
+    comparison_markets: dict[
+        tuple[str, str],
+        Mapping[str, object],
+    ] = {}
+    missing_relationships: set[tuple[str, str, str]] = set()
+    for row in confirmed_rows:
+        relationship = (row.capture_id, row.forecast_run_id)
+        market_by_key = comparison_markets.get(relationship)
+        if market_by_key is None:
+            forecast = forecasts_by_run_id[row.forecast_run_id]
+            link = active_links.get(relationship)
+            comparison_payload = (
+                forecast.outputs.get("shadow_comparison")
+                if link is None
+                else linked_shadow_comparison(link, forecast)
+            )
+            try:
+                comparison = deserialize_shadow_comparison(
+                    comparison_payload
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "invalid frozen shadow comparison required by migration "
+                    f"row for forecast {row.forecast_run_id}: {error}"
+                ) from error
+            if comparison.forecast_run_id != row.forecast_run_id:
+                raise ValueError(
+                    "frozen shadow comparison forecast_run_id does not match "
+                    f"migration forecast {row.forecast_run_id}"
+                )
+            market_by_key = {}
+            for market in comparison.market_comparisons:
+                if market.market_key in market_by_key:
+                    raise ValueError(
+                        "duplicate exact market in frozen shadow comparison: "
+                        f"{row.forecast_run_id}, {market.market_key}"
+                    )
+                market_by_key[market.market_key] = market
+            comparison_markets[relationship] = market_by_key
+
+        market = market_by_key.get(row.market_key)
+        if market is None:
+            missing_relationships.add(
+                (
+                    row.capture_id,
+                    row.forecast_run_id,
+                    row.market_key,
+                )
+            )
+        elif market.review_eligible:
+            eligible_relationships.add(
+                (
+                    row.capture_id,
+                    row.forecast_run_id,
+                    row.market_key,
+                )
+            )
+
+    if missing_relationships:
         missing = ", ".join(
             f"({forecast_run_id}, {market_key})"
-            for forecast_run_id, market_key in sorted(missing_pairs)
+            for _, forecast_run_id, market_key in sorted(
+                missing_relationships
+            )
         )
         raise ValueError(
             "migration rows reference missing exact frozen market comparisons: "
             f"{missing}"
         )
+
     return tuple(
         row
         for row in confirmed_rows
-        if (row.forecast_run_id, row.market_key) in eligible_pairs
+        if (
+            row.capture_id,
+            row.forecast_run_id,
+            row.market_key,
+        )
+        in eligible_relationships
     )
 
 

@@ -14,7 +14,13 @@ import analysis.operator.reporting as reporting_module
 import analysis.operator.service as service_module
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
-from analysis.ledger import ForecastCommand, LedgerStore, ReviewCommand
+from analysis.ledger import (
+    CaptureForecastLink,
+    ForecastCommand,
+    LedgerStore,
+    RecordEnvelope,
+    ReviewCommand,
+)
 from analysis.operator.errors import OperatorIOError, OperatorLedgerError
 from analysis.operator.reporting import (
     CALIBRATION_JSON_FILENAME,
@@ -272,6 +278,69 @@ def test_ineligible_exact_reviewed_market_does_not_count_for_migration(
     assert mapping["overall"]["sample_size"] == 2
     assert mapping["migration"]["market_types"]["full_total"]["count"] == 1
     assert mapping["migration"]["market_types"]["ml"]["count"] == 0
+
+
+def test_migration_uses_latest_corrected_link_comparison(
+    tmp_path: Path,
+) -> None:
+    forecast = _frozen_forecast(tmp_path)
+    outputs = json.loads(canonical_json(forecast.outputs))
+    corrected_shadow = outputs["shadow_comparison"]
+    corrected_market = next(
+        market
+        for market in corrected_shadow["market_comparisons"]
+        if market["market_key"] == "full_under"
+    )
+    corrected_market["principal_paths"] = []
+    corrected_market["review_eligible"] = False
+    corrected_market["review_ineligibility_flags"] = [
+        "missing_component_distribution"
+    ]
+    deserialize_shadow_comparison(corrected_shadow)
+    capture_id = "a" * 32
+    first_link = CaptureForecastLink(
+        envelope=RecordEnvelope(
+            record_id="b" * 32,
+            record_kind="capture_forecast_link",
+            idempotency_key="report-link:original",
+            payload_hash="c" * 64,
+            appended_at=forecast.envelope.appended_at,
+        ),
+        capture_id=capture_id,
+        forecast_run_id=forecast.forecast_run_id,
+    )
+    corrected_link = CaptureForecastLink(
+        envelope=RecordEnvelope(
+            record_id="d" * 32,
+            record_kind="capture_forecast_link",
+            idempotency_key="report-link:corrected",
+            payload_hash="e" * 64,
+            appended_at=forecast.envelope.appended_at,
+        ),
+        capture_id=capture_id,
+        forecast_run_id=forecast.forecast_run_id,
+        shadow_comparison=corrected_shadow,
+        supersedes_link_record_id=first_link.envelope.record_id,
+    )
+    row = _exact_migration_row(
+        forecast,
+        game_pk=940005,
+        market_key="full_under",
+        market_type="full_total",
+        legacy_priority_score=60,
+    )
+    row = replace(row, capture_id=capture_id)
+
+    mapping = build_report_mapping(
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_records=(forecast, first_link, corrected_link),
+        rows=(row,),
+        report=build_calibration_report((row,)),
+    )
+
+    assert mapping["overall"]["sample_size"] == 1
+    assert mapping["migration"]["confirmed_games"]["count"] == 0
+    assert mapping["migration"]["market_types"]["full_total"]["count"] == 0
 
 
 def test_game_with_only_ineligible_row_does_not_count_as_confirmed_game(

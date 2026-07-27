@@ -82,6 +82,7 @@ Review는 이 세 ID가 같은 game의 active confirmed capture, 그 capture에 
 Operator capture key는 `(schema_version, stage, intrinsic CaptureCommand)`에서 자동 생성합니다. Intrinsic 내용에는 game, `captured_at`, first pitch, lineup state, eligibility, normalized input hash, canonical capture payload가 포함되고 `supersedes_capture_id`만 제외됩니다.
 
 - 같은 exact command는 기존 capture와 원래 supersession target을 먼저 찾고 capture, deterministic forecast, link를 replay하며, 관리 번들이 이미 저장되어 있으면 그 bytes도 replay합니다. 성공 또는 exact replay는 exit `0`입니다.
+- `forecast_run_id`가 같은 상태에서 운영자 note, legacy candidate 또는 review binding만 정정되면 immutable forecast record는 바꾸지 않습니다. 대신 정정된 `shadow_comparison`을 담은 새 capture-forecast link가 직전 exact link를 append-only로 supersede합니다. 이후 exact replay와 review에는 이 최신 관계 record ID를 사용합니다.
 - `captured_at`이나 audit provenance가 달라지면 forecast 의미가 같아도 새 capture가 생길 수 있고 같은 `forecast_run_id`를 재사용할 수 있습니다.
 - 새 projected/confirmed 상태는 최신 active pregame capture를 새 record로 supersede합니다. Active confirmed 이후 새 projected 상태는 거부되지만 이미 기록된 exact projected command의 역사적 replay는 허용됩니다.
 - Result idempotency는 game, 공식 source identity, source revision에서 도출합니다. Closing과 review도 exact source/revision 및 frozen record 관계로 재사용됩니다.
@@ -102,7 +103,7 @@ Pregame 명령은 ledger 옆의 `<ledger 파일명>.checkpoint-v1.json`을 재�
 - 한 pregame 명령 안에서는 immutable checkpoint가 full ledger fingerprint와 정확히 같을 때만 다음 lock-scoped session에서 재사용됩니다. Ledger가 바뀌면 재사용하지 않고 authoritative state를 다시 검증합니다.
 - 구형 forecast record의 평문 `values` 배열은 계속 읽을 수 있습니다. 신규 forecast는 각 component의 전체 20,000개 값을 canonical JSON, zlib level 6, base64 형식으로 결정론적·무손실 압축합니다. Decode 후 값과 정수/실수 타입은 구형 표현과 같습니다.
 - Review와 calibration은 압축 여부와 무관하게 같은 decoded forecast context와 report mapping을 사용합니다. 압축은 확률, interval, classification, migration count 또는 보고서 값을 바꾸지 않습니다.
-- 완전한 exact replay는 frozen capture, forecast output, legacy snapshot, market context와 exact link를 모두 검증한 뒤에만 20,000회 시뮬레이션을 생략합니다. 하나라도 없거나 다르거나 해석할 수 없으면 기존 전체 forecast 경로로 보수적으로 돌아갑니다.
+- 완전한 exact replay는 frozen capture, forecast output, 최신 exact link의 legacy snapshot, market context를 모두 검증한 뒤에만 20,000회 시뮬레이션을 생략합니다. 저장된 네 score path에서 각 시장의 win/push/loss 확률과 가격을 같은 settlement 로직으로 다시 계산해 frozen market output과 정확히 일치하는지도 확인합니다. 하나라도 없거나 다르거나 해석할 수 없으면 기존 전체 forecast 경로로 보수적으로 돌아갑니다.
 
 Checkpoint를 수동으로 지우는 것은 안전하지만 다음 pregame 명령에서 strict rebuild 비용이 다시 발생합니다. JSONL ledger나 기존 forecast row를 checkpoint 복구 목적으로 수정하거나 재작성하지 않습니다.
 
@@ -139,6 +140,7 @@ reports/private/shadow/generations/
 - `confirmed_game_count`: review가 존재하고 exact frozen comparison이 review-eligible인 confirmed primary row의 고유 `game_pk` 수, 기준 `100`
 - `confirmed_decision_count`: 아래 시장군별 confirmed decision count의 합계
 - `confirmed_decision_count.<market_type>`: confirmed eligible row의 고유 `(forecast_run_id, market_key)` 수, 시장군별 기준 `300`
+- Legacy comparison이 관계 link에서 정정된 경우 review와 migration eligibility는 forecast에 내장된 과거 값이 아니라 최신 active exact link를 사용합니다.
 - Review-eligible legacy `pass`는 migration count에 포함되지만 review-ineligible market은 제외됩니다.
 - 표본이나 필요한 가격이 없으면 JSON metric은 `null`, Markdown은 `사용 불가 (unavailable)`로 표시합니다. 이를 `0`으로 해석하지 않습니다.
 

@@ -17,6 +17,9 @@ from analysis.forecasting.identity import (
     build_forecast_run_id_for_input,
     canonical_json,
 )
+from analysis.forecasting.market import (
+    evaluate_market_from_score_distributions,
+)
 from analysis.forecasting.validation import (
     PregameRelationshipError,
     PregameTimingError,
@@ -40,6 +43,7 @@ from analysis.ledger import (
     OfficialResultRecord,
     PregameLookup,
     ReviewRecord,
+    linked_shadow_comparison,
 )
 from analysis.review import build_and_record_review
 from analysis.review.calibration import (
@@ -394,6 +398,7 @@ def _capture_matches_command(
 
 def _forecast_outputs_match(
     forecast: ForecastRecord,
+    link: CaptureForecastLink,
     bundle: _Bundle,
     config: SimulationConfig,
     forecast_run_id: str,
@@ -410,7 +415,7 @@ def _forecast_outputs_match(
             home_team=game.identity.home_team,
         )
         comparison = deserialize_shadow_comparison(
-            forecast.outputs.get("shadow_comparison")
+            linked_shadow_comparison(link, forecast)
         )
         validate_shadow_forecast_context(
             comparison,
@@ -420,6 +425,24 @@ def _forecast_outputs_match(
             away_team=game.identity.away_team,
             home_team=game.identity.home_team,
         )
+        score_distributions = {
+            component_id: context.component_distributions[
+                component_id
+            ].values
+            for component_id in (
+                "away_f5_runs",
+                "home_f5_runs",
+                "away_full_runs",
+                "home_full_runs",
+            )
+        }
+        reconstructed_markets = {
+            market_key: evaluate_market_from_score_distributions(
+                market_input,
+                **score_distributions,
+            )
+            for market_key, market_input in context.market_inputs.items()
+        }
     except (TypeError, ValueError):
         return False
     return (
@@ -431,6 +454,8 @@ def _forecast_outputs_match(
         and forecast.simulation_config_hash
         == _simulation_config_hash(context.simulation_config)
         and context.market_inputs == expected_market_inputs
+        and canonical_json(reconstructed_markets)
+        == canonical_json(context.markets)
         and comparison.forecast_run_id == forecast_run_id
         and canonical_json(
             canonical_legacy_decision_payload(comparison.legacy)
@@ -476,6 +501,7 @@ def _exact_pregame_replay(
         return None
     if not _forecast_outputs_match(
         forecast,
+        link,
         bundle,
         config,
         forecast_run_id,
@@ -846,6 +872,14 @@ def _require_frozen_review_relationships(
         raise OperatorPreconditionError(
             "frozen link forecast_run_id must match the exact review forecast"
         )
+    if any(
+        isinstance(record, CaptureForecastLink)
+        and record.supersedes_link_record_id == link.envelope.record_id
+        for record in records
+    ):
+        raise OperatorPreconditionError(
+            "review requires the latest corrected capture-forecast link"
+        )
     if capture.normalized_input_hash != forecast.normalized_input_hash:
         raise OperatorPreconditionError(
             "frozen capture and forecast normalized_input_hash must match"
@@ -863,10 +897,13 @@ def _require_frozen_review_relationships(
         )
 
 
-def _eligible_review_market_keys(forecast: ForecastRecord) -> tuple[str, ...]:
+def _eligible_review_market_keys(
+    forecast: ForecastRecord,
+    link: CaptureForecastLink,
+) -> tuple[str, ...]:
     try:
         comparison = deserialize_shadow_comparison(
-            forecast.outputs.get("shadow_comparison")
+            linked_shadow_comparison(link, forecast)
         )
     except (TypeError, ValueError) as error:
         raise OperatorLedgerError(
@@ -1540,7 +1577,7 @@ def run_review(
         forecast,
         link,
     )
-    market_keys = _eligible_review_market_keys(forecast)
+    market_keys = _eligible_review_market_keys(forecast, link)
     result_command = bundle.payload.official_result
     close_commands = bundle.payload.closing_observations
 

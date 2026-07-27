@@ -308,8 +308,14 @@ def _command_for_forecast(record: ForecastRecord) -> ForecastCommand:
     )
 
 
-def _forecast_semantic_payload(command: ForecastCommand) -> dict[str, object]:
+def _forecast_semantic_payload(
+    command: ForecastCommand,
+    *,
+    include_shadow_comparison: bool = True,
+) -> dict[str, object]:
     outputs = dict(command.outputs)
+    if not include_shadow_comparison:
+        outputs.pop("shadow_comparison", None)
     distributions = outputs.get("component_distributions")
     if distributions is not None:
         outputs["component_distributions"] = expand_component_distributions(
@@ -324,6 +330,20 @@ def _forecast_semantic_payload(command: ForecastCommand) -> dict[str, object]:
     }
 
 
+def _link_logical_payload(record: CaptureForecastLink) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "capture_id": record.capture_id,
+        "forecast_run_id": record.forecast_run_id,
+    }
+    if record.shadow_comparison is not None:
+        payload["shadow_comparison"] = record.shadow_comparison
+    if record.supersedes_link_record_id is not None:
+        payload["supersedes_link_record_id"] = (
+            record.supersedes_link_record_id
+        )
+    return payload
+
+
 def _forecast_replay_is_semantically_equal(
     existing: object,
     incoming: object,
@@ -336,6 +356,28 @@ def _forecast_replay_is_semantically_equal(
     return canonical_json(
         _forecast_semantic_payload(_command_for_forecast(existing))
     ) == canonical_json(_forecast_semantic_payload(incoming))
+
+
+def _forecast_model_replay_is_semantically_equal(
+    existing: object,
+    incoming: object,
+) -> bool:
+    if not isinstance(existing, ForecastRecord) or not isinstance(
+        incoming,
+        ForecastCommand,
+    ):
+        return False
+    return canonical_json(
+        _forecast_semantic_payload(
+            _command_for_forecast(existing),
+            include_shadow_comparison=False,
+        )
+    ) == canonical_json(
+        _forecast_semantic_payload(
+            incoming,
+            include_shadow_comparison=False,
+        )
+    )
 
 
 def _command_for_market(
@@ -403,10 +445,7 @@ def _logical_payload(record: _RecordT) -> object:
     if isinstance(record, ForecastRecord):
         return _command_for_forecast(record)
     if isinstance(record, CaptureForecastLink):
-        return {
-            "capture_id": record.capture_id,
-            "forecast_run_id": record.forecast_run_id,
-        }
+        return _link_logical_payload(record)
     if isinstance(record, MarketObservationRecord):
         return _command_for_market(record)
     if isinstance(record, OfficialResultRecord):
@@ -906,9 +945,11 @@ class LedgerStore:
         review_ids: set[str] = set()
         idempotency_keys: set[tuple[str, str]] = set()
         capture_supersession_targets: set[str] = set()
+        link_supersession_targets: set[str] = set()
         market_supersession_targets: set[str] = set()
         captures_by_id: dict[str, CaptureRecord] = {}
         forecasts_by_id: dict[str, ForecastRecord] = {}
+        links_by_record_id: dict[str, CaptureForecastLink] = {}
         markets_by_record_id: dict[str, MarketObservationRecord] = {}
         results_by_game: dict[int, list[OfficialResultRecord]] = {}
         result_revision_keys: set[tuple[int, str, str]] = set()
@@ -972,6 +1013,30 @@ class LedgerStore:
                         raise ValueError(
                             "link capture and forecast normalized_input_hash must match"
                         )
+                    if record.supersedes_link_record_id is not None:
+                        superseded = links_by_record_id.get(
+                            record.supersedes_link_record_id
+                        )
+                        if superseded is None:
+                            raise ValueError(
+                                "link supersedes missing capture-forecast link"
+                            )
+                        if (
+                            superseded.capture_id != record.capture_id
+                            or superseded.forecast_run_id
+                            != record.forecast_run_id
+                        ):
+                            raise ValueError(
+                                "link supersession must stay in one "
+                                "capture-forecast relationship"
+                            )
+                        if (
+                            record.supersedes_link_record_id
+                            in link_supersession_targets
+                        ):
+                            raise ValueError(
+                                "link supersession target already has a successor"
+                            )
                 elif isinstance(record, MarketObservationRecord):
                     if record.supersedes_record_id is not None:
                         superseded = markets_by_record_id.get(
@@ -1049,6 +1114,12 @@ class LedgerStore:
             elif isinstance(record, ForecastRecord):
                 forecast_run_ids.add(record.forecast_run_id)
                 forecasts_by_id[record.forecast_run_id] = record
+            elif isinstance(record, CaptureForecastLink):
+                links_by_record_id[record.envelope.record_id] = record
+                if record.supersedes_link_record_id is not None:
+                    link_supersession_targets.add(
+                        record.supersedes_link_record_id
+                    )
             elif isinstance(record, MarketObservationRecord):
                 markets_by_record_id[record.envelope.record_id] = record
                 if record.supersedes_record_id is not None:
@@ -1706,6 +1777,11 @@ class LedgerStore:
                 relationships[old_record.envelope.record_id] = (
                     record.envelope.record_id
                 )
+            elif isinstance(record, CaptureForecastLink):
+                if record.supersedes_link_record_id is not None:
+                    relationships[record.supersedes_link_record_id] = (
+                        record.envelope.record_id
+                    )
             elif isinstance(record, (MarketObservationRecord, OfficialResultRecord)):
                 if record.supersedes_record_id is not None:
                     relationships[record.supersedes_record_id] = (
