@@ -55,6 +55,7 @@ class PregameLookup:
 
     capture: CaptureRecord | None
     active_capture: CaptureRecord | None
+    active_confirmed_capture: CaptureRecord | None
     forecast: ForecastRecord | None
     link: CaptureForecastLink | None
 
@@ -324,10 +325,10 @@ class PregameLedgerSession:
             None,
         )
 
-    def _latest_active_capture(
+    def _active_captures(
         self,
         game_pk: int,
-    ) -> IndexedRecord | None:
+    ) -> tuple[IndexedRecord, ...]:
         captures = tuple(
             record
             for record in self.checkpoint.records
@@ -346,6 +347,13 @@ class PregameLedgerSession:
             and record.captured_at < record.first_pitch
             and record.capture_id not in superseded_ids
         )
+        return active
+
+    def _latest_active_capture(
+        self,
+        game_pk: int,
+    ) -> IndexedRecord | None:
+        active = self._active_captures(game_pk)
         if not active:
             return None
         return max(
@@ -356,6 +364,29 @@ class PregameLedgerSession:
                 record.record_id,
             ),
         )
+
+    def _active_confirmed_capture(
+        self,
+        game_pk: int,
+    ) -> CaptureRecord | None:
+        active = sorted(
+            self._active_captures(game_pk),
+            key=lambda record: (
+                record.captured_at,
+                record.appended_at,
+                record.record_id,
+            ),
+            reverse=True,
+        )
+        for indexed in active:
+            capture = self._load_indexed_record(indexed)
+            if not isinstance(capture, CaptureRecord):
+                raise LedgerCorruptionError(
+                    "active capture checkpoint resolved wrong kind"
+                )
+            if capture.lineup_state == "confirmed":
+                return capture
+        return None
 
     def _validate_lookup_snapshot(self) -> None:
         try:
@@ -400,6 +431,7 @@ class PregameLedgerSession:
     ) -> PregameLookup:
         capture_index = self._indexed_capture_for_key(capture_key)
         active_index = self._latest_active_capture(game_pk)
+        active_confirmed_capture = self._active_confirmed_capture(game_pk)
         forecast_index = self._indexed_forecast(forecast_run_id)
         link_index = (
             None
@@ -446,6 +478,7 @@ class PregameLedgerSession:
         return PregameLookup(
             capture=capture,
             active_capture=active_capture,
+            active_confirmed_capture=active_confirmed_capture,
             forecast=forecast,
             link=link,
         )
@@ -486,6 +519,9 @@ class PregameLedgerSession:
             capture=capture,
             forecast=forecast,
             link=link,
+            capture_replayed=not capture_is_new,
+            forecast_replayed=not forecast_is_new,
+            link_replayed=not link_is_new,
         )
 
     def _resolve_capture(
@@ -509,6 +545,13 @@ class PregameLedgerSession:
                 )
             return existing, False
 
+        if (
+            command.lineup_state == "projected"
+            and self._active_confirmed_capture(command.game_pk) is not None
+        ):
+            raise LedgerHeadChangedError(
+                "active confirmed pregame capture blocks a new projected capture"
+            )
         active = self._latest_active_capture(command.game_pk)
         actual_active_capture_id = (
             None if active is None else active.capture_id

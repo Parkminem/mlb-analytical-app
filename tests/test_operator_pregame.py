@@ -485,6 +485,48 @@ def test_projected_run_uses_one_atomic_shadow_append(
     assert result.link.capture_id == result.capture.capture_id
 
 
+def test_concurrent_same_key_reuse_reports_atomic_replay_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+    original_record = service_module.record_shadow_run
+    concurrent_records = None
+
+    def concurrently_record_same_key(store, game_input, *args, **kwargs):
+        nonlocal concurrent_records
+        if concurrent_records is None:
+            concurrent_records = original_record(
+                LedgerStore(ledger_path),
+                game_input,
+                *args,
+                **kwargs,
+            )
+        return original_record(store, game_input, *args, **kwargs)
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        concurrently_record_same_key,
+    )
+
+    result = run_projected(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert concurrent_records is not None
+    assert result.capture == concurrent_records.capture
+    assert result.forecast == concurrent_records.forecast
+    assert result.link == concurrent_records.link
+    assert result.capture_replayed is True
+    assert result.forecast_replayed is True
+    assert result.link_replayed is True
+    assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
+
+
 def test_exact_projected_retry_replays_every_record_and_original_lineage(
     tmp_path: Path,
 ) -> None:
@@ -1456,6 +1498,47 @@ def test_active_capture_selection_uses_latest_capture_order(tmp_path: Path) -> N
     assert result.capture.supersedes_capture_id != first.capture_id
 
 
+def test_projected_rejects_legacy_multi_root_with_any_active_confirmed_capture(
+    tmp_path: Path,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    store = LedgerStore(ledger_path)
+    game = _projected_game()
+    confirmed_game = _confirmed_game(
+        captured_at=game.captured_at,
+    )
+    projected_game = replace(
+        game,
+        captured_at=game.captured_at + timedelta(minutes=1),
+    )
+    incoming_game = replace(
+        game,
+        captured_at=game.captured_at + timedelta(minutes=2),
+    )
+    confirmed = store.append_capture(
+        "manual:legacy-confirmed-root",
+        build_shadow_capture_command(confirmed_game),
+    )
+    latest_projected = store.append_capture(
+        "manual:legacy-projected-root",
+        build_shadow_capture_command(projected_game),
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="projected capture.*confirmed",
+    ):
+        run_projected(
+            _pregame_bundle("projected", incoming_game),
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
+    assert latest_projected.captured_at > confirmed.captured_at
+    assert captures == (confirmed, latest_projected)
+
+
 def test_postgame_successor_deactivates_pregame_supersession_target(
     tmp_path: Path,
 ) -> None:
@@ -1539,6 +1622,63 @@ def test_projected_run_retries_when_head_changes_after_preflight(
     assert len(active) == 1
     assert result.capture.supersedes_capture_id == interloper_capture_id
     assert sum(capture.supersedes_capture_id is None for capture in captures) == 1
+
+
+def test_projected_rejects_concurrent_confirmed_root_when_head_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    game = _projected_game()
+    projected_root_game = replace(
+        game,
+        captured_at=game.captured_at + timedelta(minutes=2),
+    )
+    incoming_game = replace(
+        game,
+        captured_at=game.captured_at + timedelta(minutes=3),
+    )
+    store = LedgerStore(ledger_path)
+    projected_root = store.append_capture(
+        "manual:projected-root",
+        build_shadow_capture_command(projected_root_game),
+    )
+    original_record = service_module.record_shadow_run
+    attempts = 0
+
+    def add_confirmed_root_then_record(store, game_input, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            confirmed_game = _confirmed_game(
+                captured_at=game.captured_at + timedelta(minutes=1),
+            )
+            store.append_capture(
+                "manual:concurrent-confirmed-root",
+                build_shadow_capture_command(confirmed_game),
+            )
+        return original_record(store, game_input, *args, **kwargs)
+
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        add_confirmed_root_then_record,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="projected capture.*confirmed",
+    ):
+        run_projected(
+            _pregame_bundle("projected", incoming_game),
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+    captures = tuple(LedgerStore(ledger_path).iter_records("capture"))
+    assert attempts == 1
+    assert len(captures) == 2
+    assert max(captures, key=lambda capture: capture.captured_at) == projected_root
 
 
 def test_projected_run_rejects_older_capture_after_concurrent_newer_head(

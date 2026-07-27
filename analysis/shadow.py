@@ -1,7 +1,7 @@
 """One-way comparison of legacy decisions with shadow forecast outputs."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 import hashlib
 import json
 import math
@@ -549,6 +549,9 @@ class ShadowRunRecords:
     capture: CaptureRecord
     forecast: ForecastRecord
     link: CaptureForecastLink
+    capture_replayed: bool | None = field(default=None, compare=False)
+    forecast_replayed: bool | None = field(default=None, compare=False)
+    link_replayed: bool | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, CaptureRecord):
@@ -561,6 +564,13 @@ class ShadowRunRecords:
             raise ValueError("link capture_id must match capture")
         if self.link.forecast_run_id != self.forecast.forecast_run_id:
             raise ValueError("link forecast_run_id must match forecast")
+        for field_name, value in (
+            ("capture_replayed", self.capture_replayed),
+            ("forecast_replayed", self.forecast_replayed),
+            ("link_replayed", self.link_replayed),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{field_name} must be bool or None")
 
 
 @dataclass(frozen=True)

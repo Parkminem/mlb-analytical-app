@@ -302,14 +302,14 @@ def _resolve_supersession_target(
     stage: str,
     existing_capture: CaptureRecord | None,
     active_head: CaptureRecord | None,
+    active_confirmed_capture: CaptureRecord | None,
 ) -> str | None:
     if existing_capture is not None:
         return existing_capture.supersedes_capture_id
 
     if (
         stage == "projected"
-        and active_head is not None
-        and active_head.lineup_state == "confirmed"
+        and active_confirmed_capture is not None
     ):
         raise OperatorPreconditionError(
             "new projected capture is not allowed after an active confirmed capture"
@@ -639,6 +639,9 @@ def _run_pregame(
                 stage=expected_stage,
                 existing_capture=existing_capture,
                 active_head=active_head,
+                active_confirmed_capture=(
+                    lookup.active_confirmed_capture
+                ),
             )
             forecast_replayed = lookup.forecast is not None
             link_replayed = lookup.link is not None
@@ -675,6 +678,12 @@ def _run_pregame(
             raise RuntimeError(
                 "pregame head CAS retry loop exited unexpectedly"
             )
+        if records.capture_replayed is not None:
+            capture_replayed = records.capture_replayed
+        if records.forecast_replayed is not None:
+            forecast_replayed = records.forecast_replayed
+        if records.link_replayed is not None:
+            link_replayed = records.link_replayed
         managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
         return PregameRunResult(
             stage=expected_stage,

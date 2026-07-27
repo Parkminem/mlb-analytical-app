@@ -352,6 +352,12 @@ def test_atomic_exact_replay_returns_same_records_without_appending(
     )
 
     assert replay == first
+    assert first.capture_replayed is False
+    assert first.forecast_replayed is False
+    assert first.link_replayed is False
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
     assert store.path.read_bytes() == before
 
 
