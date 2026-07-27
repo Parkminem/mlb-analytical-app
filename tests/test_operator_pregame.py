@@ -660,6 +660,52 @@ def test_malformed_component_diagnostics_replay_calls_forecast(
         )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    ("offense_numeric_overflow", "bullpen_numeric_overflow"),
+)
+def test_overflowing_component_diagnostics_replay_calls_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    outputs = json.loads(canonical_json(first.forecast.outputs))
+    diagnostics = outputs["component_diagnostics"]
+
+    if corruption == "offense_numeric_overflow":
+        diagnostics["away_offense"]["_context"][
+            "normalized_pa_weights"
+        ] = [1e308] * 9
+    else:
+        diagnostics["home_bullpen"]["segments"][0][
+            "base_log_standard_error"
+        ] = 1e308
+
+    _rewrite_forecast_outputs(ledger_path, first.forecast, outputs)
+
+    class ForecastCalled(RuntimeError):
+        pass
+
+    def fail_forecast(*args, **kwargs):
+        raise ForecastCalled(corruption)
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(ForecastCalled, match=corruption):
+        run_confirmed(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
 def test_reordered_equivalent_legacy_replay_skips_forecast(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

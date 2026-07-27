@@ -1031,6 +1031,14 @@ def _component_diagnostics_from_payload(
     away_team: str | None,
     home_team: str | None,
 ) -> tuple[Mapping[str, object], frozenset[str]]:
+    def decode(decoder, diagnostic: object, field_name: str) -> object:
+        try:
+            return decoder(diagnostic, field_name=field_name)
+        except OverflowError as error:
+            raise ValueError(
+                f"{field_name} contains an overflowing numeric value"
+            ) from error
+
     payload = _payload_mapping(
         value,
         "forecast outputs component_diagnostics",
@@ -1038,19 +1046,20 @@ def _component_diagnostics_from_payload(
     )
     diagnostics: dict[str, object] = {}
     for side in ("away", "home"):
-        diagnostics[f"{side}_pitcher_chain"] = (
-            deserialize_pitcher_chain_forecast(
-                payload[f"{side}_pitcher_chain"],
-                field_name=f"{side} pitcher-chain diagnostic",
-            )
+        diagnostics[f"{side}_pitcher_chain"] = decode(
+            deserialize_pitcher_chain_forecast,
+            payload[f"{side}_pitcher_chain"],
+            f"{side} pitcher-chain diagnostic",
         )
-        diagnostics[f"{side}_offense"] = deserialize_offense_forecast(
+        diagnostics[f"{side}_offense"] = decode(
+            deserialize_offense_forecast,
             payload[f"{side}_offense"],
-            field_name=f"{side} offense diagnostic",
+            f"{side} offense diagnostic",
         )
-        bullpen = deserialize_bullpen_forecast(
+        bullpen = decode(
+            deserialize_bullpen_forecast,
             payload[f"{side}_bullpen"],
-            field_name=f"{side} bullpen diagnostic",
+            f"{side} bullpen diagnostic",
         )
         expected_team = away_team if side == "away" else home_team
         if expected_team is not None and bullpen.team != expected_team:
