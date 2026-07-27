@@ -1215,7 +1215,7 @@ def _legacy_priority_score(
     market_key: str,
     linked_comparison: object,
     *,
-    corrected_link: bool,
+    link_overrides_forecast_comparison: bool,
 ) -> object:
     def score_from_roots(
         roots: tuple[Mapping[str, object], ...],
@@ -1251,7 +1251,7 @@ def _legacy_priority_score(
                     return True, comparison["legacy_priority_score"]
         return False, None
 
-    if corrected_link and linked_comparison is not None:
+    if link_overrides_forecast_comparison and linked_comparison is not None:
         found, score = score_from_roots(
             (
                 _require_mapping(
@@ -1510,7 +1510,11 @@ def _row_for_review(
             forecast_market,
             review.market_key,
             linked_shadow_comparison(link, forecast),
-            corrected_link=link.supersedes_link_record_id is not None,
+            # A link-owned comparison is the explicit authoritative override,
+            # including a root link that completes a legacy partial write.
+            link_overrides_forecast_comparison=(
+                link.shadow_comparison is not None
+            ),
         ),
         p_win=p_win,
         p_push=p_push,

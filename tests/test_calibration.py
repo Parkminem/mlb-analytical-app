@@ -1631,6 +1631,76 @@ class CalibrationSelectionTests(unittest.TestCase):
             "80-84",
         )
 
+    def test_partial_forecast_root_override_drives_review_priority_grouping(
+        self,
+    ):
+        game_pk = 920103
+        capture_key = f"capture:{game_pk}:partial-root-override"
+        normalized_input_hash = "input:partial-root-override"
+        capture_command = CaptureCommand(
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            first_pitch=FIRST_PITCH,
+            lineup_state="confirmed",
+            out_of_sample_eligible=True,
+            normalized_input_hash=normalized_input_hash,
+            payload=capture_payload(game_pk),
+        )
+        capture = self.store.append_capture(capture_key, capture_command)
+        stale_outputs = forecast_outputs(game_pk, legacy_score=72)
+        stale_outputs["forecast_output"]["markets"][market_key(game_pk)][
+            "legacy_priority_score"
+        ] = 82
+        forecast = self.store.append_forecast(
+            ForecastCommand(
+                forecast_run_id="partial-root-override-run",
+                model_version="forecast-v1",
+                simulation_config_hash="simulation-v1",
+                normalized_input_hash=normalized_input_hash,
+                outputs=stale_outputs,
+            )
+        )
+        corrected_outputs = forecast_outputs(game_pk, legacy_score=86)
+        corrected_outputs["forecast_output"]["markets"][market_key(game_pk)][
+            "legacy_priority_score"
+        ] = 82
+
+        completed = self.store.append_shadow_run_atomic(
+            capture_key,
+            capture_command,
+            ForecastCommand(
+                forecast_run_id=forecast.forecast_run_id,
+                model_version=forecast.model_version,
+                simulation_config_hash=forecast.simulation_config_hash,
+                normalized_input_hash=forecast.normalized_input_hash,
+                outputs=corrected_outputs,
+            ),
+            capture.capture_id,
+        )
+
+        self.assertIsNone(completed.link.supersedes_link_record_id)
+        self.assertEqual(
+            completed.link.shadow_comparison,
+            corrected_outputs["shadow_comparison"],
+        )
+        self._complete_reviews(
+            game_pk,
+            ((capture, forecast, completed.link),),
+        )
+        review = next(self.store.iter_records("review"))
+        rows = select_primary_rows(self.store)
+        report = build_calibration_report(rows)
+
+        self.assertEqual(
+            review.capture_forecast_link_record_id,
+            completed.link.envelope.record_id,
+        )
+        self.assertEqual(rows[0].legacy_priority_score, 86)
+        self.assertEqual(
+            dict(report.groups[0].dimensions)["priority_score_bucket"],
+            "85-100",
+        )
+
     def test_unchanged_repeated_capture_counts_once_after_primary_selection(self):
         first = append_capture_link(
             self.store,
