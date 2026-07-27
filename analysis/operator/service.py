@@ -2,11 +2,17 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
+import hashlib
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeVar
 
 from analysis.forecasting import LineupState, run_forecast
+from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.identity import (
+    build_forecast_run_id_for_input,
+    canonical_json,
+)
 from analysis.forecasting.validation import (
     PregameRelationshipError,
     PregameTimingError,
@@ -352,6 +358,86 @@ def _record_replay_state(
     return forecast_replayed, link_replayed
 
 
+def _simulation_config_hash(config: SimulationConfig) -> str:
+    mapping = config.to_mapping()
+    return hashlib.sha256(canonical_json(mapping).encode("utf-8")).hexdigest()
+
+
+def _capture_matches_command(
+    capture: CaptureRecord,
+    command: CaptureCommand,
+    *,
+    capture_key: str,
+    expected_stage: str,
+) -> bool:
+    return (
+        capture.envelope.idempotency_key == capture_key
+        and capture.game_pk == command.game_pk
+        and capture.captured_at == command.captured_at
+        and capture.first_pitch == command.first_pitch
+        and capture.lineup_state == command.lineup_state
+        and capture.lineup_state == expected_stage
+        and capture.out_of_sample_eligible
+        == command.out_of_sample_eligible
+        and capture.normalized_input_hash
+        == command.normalized_input_hash
+        and capture.payload == command.payload
+    )
+
+
+def _exact_pregame_replay(
+    store: LedgerStore,
+    bundle: _Bundle,
+    *,
+    expected_stage: str,
+    command: CaptureCommand,
+    capture_key: str,
+    forecast_run_id: str,
+    config: SimulationConfig,
+) -> tuple[CaptureRecord, ForecastRecord, CaptureForecastLink] | None:
+    lookup = _ledger_operation(
+        "unable to look up shadow pregame replay",
+        lambda: store.lookup_shadow_pregame(
+            capture_key,
+            forecast_run_id,
+            bundle.game_pk,
+        ),
+    )
+    capture = lookup.capture
+    forecast = lookup.forecast
+    link = lookup.link
+    if capture is None or forecast is None or link is None:
+        return None
+    if not _capture_matches_command(
+        capture,
+        command,
+        capture_key=capture_key,
+        expected_stage=expected_stage,
+    ):
+        return None
+    if (
+        forecast.forecast_run_id != forecast_run_id
+        or forecast.model_version != config.version
+        or forecast.simulation_config_hash != _simulation_config_hash(config)
+        or forecast.normalized_input_hash != command.normalized_input_hash
+        or link.capture_id != capture.capture_id
+        or link.forecast_run_id != forecast.forecast_run_id
+    ):
+        return None
+    try:
+        comparison = deserialize_shadow_comparison(
+            forecast.outputs.get("shadow_comparison")
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        comparison.forecast_run_id != forecast_run_id
+        or comparison.legacy != bundle.payload.legacy_decision
+    ):
+        return None
+    return capture, forecast, link
+
+
 def _pregame_partial_progress(
     store: LedgerStore,
     bundle: _Bundle,
@@ -434,9 +520,11 @@ def _run_pregame(
         bundle.stage,
         command,
     )
-
-    forecast = _pregame_operation(
-        lambda: run_forecast(bundle.payload.game_input, config)
+    forecast_run_id = _pregame_operation(
+        lambda: build_forecast_run_id_for_input(
+            bundle.payload.game_input,
+            config,
+        )
     )
 
     store = _open_ledger(ledger_path)
@@ -445,6 +533,37 @@ def _run_pregame(
     link_replayed: bool | None = None
     managed_bundle: ManagedBundleCopy | None = None
     try:
+        exact_replay = _exact_pregame_replay(
+            store,
+            bundle,
+            expected_stage=expected_stage,
+            command=command,
+            capture_key=capture_key,
+            forecast_run_id=forecast_run_id,
+            config=config,
+        )
+        if exact_replay is not None:
+            capture, stored_forecast, link = exact_replay
+            capture_replayed = True
+            forecast_replayed = True
+            link_replayed = True
+            managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+            return PregameRunResult(
+                stage=expected_stage,
+                game_pk=bundle.game_pk,
+                lineup_state=capture.lineup_state,
+                capture=capture,
+                forecast=stored_forecast,
+                link=link,
+                managed_bundle=managed_bundle,
+                capture_replayed=True,
+                forecast_replayed=True,
+                link_replayed=True,
+            )
+
+        forecast = _pregame_operation(
+            lambda: run_forecast(bundle.payload.game_input, config)
+        )
         for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
             captures = _captures(store)
             existing_capture = _existing_keyed_capture(captures, capture_key)
@@ -463,7 +582,7 @@ def _run_pregame(
             forecast_replayed, link_replayed = _record_replay_state(
                 store,
                 existing_capture=existing_capture,
-                forecast_run_id=forecast.forecast_run_id,
+                forecast_run_id=forecast_run_id,
             )
             capture_replayed = existing_capture is not None
             try:
@@ -518,7 +637,7 @@ def _run_pregame(
                 bundle,
                 error=error,
                 capture_key=capture_key,
-                forecast_run_id=forecast.forecast_run_id,
+                forecast_run_id=forecast_run_id,
                 capture_replayed=capture_replayed,
                 forecast_replayed=forecast_replayed,
                 link_replayed=link_replayed,

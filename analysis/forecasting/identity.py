@@ -10,6 +10,7 @@ import math
 from types import UnionType
 from typing import Union, get_args, get_origin
 
+from .config import SimulationConfig
 from .inputs import (
     FeatureProvenance,
     MarketType,
@@ -435,6 +436,26 @@ def build_forecast_run_id(
         semantic_forecast_payload(game),
         model_version,
         simulation_config,
+    )
+
+
+def build_forecast_run_id_for_input(
+    game_input: NormalizedGameInput,
+    config: SimulationConfig,
+) -> str:
+    """Build the run ID through the same validated input path as forecasting."""
+
+    from .engine import resolve_forecast_input
+    from .validation import validate_pregame_input
+
+    validate_pregame_input(game_input)
+    if not isinstance(config, SimulationConfig):
+        raise TypeError("config must be SimulationConfig")
+    resolved_game = resolve_forecast_input(game_input)
+    return build_forecast_run_id(
+        resolved_game,
+        config.version,
+        config.to_mapping(),
     )
 
 

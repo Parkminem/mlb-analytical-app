@@ -8,7 +8,7 @@ from types import MappingProxyType
 
 from .bullpen import BullpenForecast, forecast_bullpen
 from .config import SimulationConfig
-from .identity import build_forecast_run_id
+from .identity import build_forecast_run_id_for_input as build_forecast_run_id
 from .inputs import (
     MarketInput,
     MarketType,
@@ -438,8 +438,7 @@ def run_forecast(
     config_mapping = config.to_mapping()
     forecast_run_id = build_forecast_run_id(
         resolved_game,
-        config.version,
-        config_mapping,
+        config,
     )
 
     away_pitcher_chain = forecast_pitcher_chain(

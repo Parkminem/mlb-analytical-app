@@ -406,6 +406,156 @@ def test_exact_projected_retry_replays_every_record_and_original_lineage(
     assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
 
 
+def test_exact_confirmed_replay_returns_frozen_records_without_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("exact replay must not run forecast")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    replay = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert replay.capture == first.capture
+    assert replay.forecast == first.forecast
+    assert replay.link == first.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+    assert replay.managed_bundle.replayed is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        "missing_link",
+        "lineup",
+        "provenance",
+        "market",
+        "config",
+        "legacy",
+    ),
+)
+def test_uncertain_or_changed_confirmed_replay_calls_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    replay_bundle = bundle
+
+    if change == "missing_link":
+        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+        retained = tuple(
+            line
+            for line in lines
+            if json.loads(line)["envelope"]["record_kind"]
+            != "capture_forecast_link"
+        )
+        ledger_path.write_text(
+            "\n".join(retained) + "\n",
+            encoding="utf-8",
+        )
+    elif change == "config":
+        monkeypatch.setattr(
+            service_module,
+            "load_forecast_config",
+            lambda version, *, registry_root=None: SimulationConfig(
+                version=version,
+                simulations=13,
+            ),
+        )
+    elif change == "legacy":
+        changed_legacy = replace(
+            bundle.payload.legacy_decision,
+            notes=("operator correction",),
+        )
+        replay_bundle = bundle.model_copy(
+            update={
+                "payload": bundle.payload.model_copy(
+                    update={"legacy_decision": changed_legacy}
+                )
+            }
+        )
+    else:
+        game = bundle.payload.game_input
+        if change == "lineup":
+            changed_lineup = replace(
+                game.away_lineup,
+                recent_form_index=replace(
+                    game.away_lineup.recent_form_index,
+                    value=1.1,
+                ),
+            )
+            changed_game = replace(game, away_lineup=changed_lineup)
+        elif change == "provenance":
+            changed_observation = replace(
+                game.observations[0],
+                fetched_at=game.observations[0].fetched_at
+                + timedelta(seconds=1),
+            )
+            changed_game = replace(
+                game,
+                observations=(
+                    changed_observation,
+                    *game.observations[1:],
+                ),
+            )
+        else:
+            changed_market = replace(
+                game.markets[0],
+                selected_decimal_price=(
+                    game.markets[0].selected_decimal_price or 1.0
+                )
+                + 0.01,
+            )
+            changed_game = replace(
+                game,
+                markets=(changed_market, *game.markets[1:]),
+            )
+        replay_bundle = bundle.model_copy(
+            update={
+                "payload": bundle.payload.model_copy(
+                    update={"game_input": changed_game}
+                )
+            }
+        )
+
+    class ForecastCalled(RuntimeError):
+        pass
+
+    def fail_forecast(*args, **kwargs):
+        raise ForecastCalled(change)
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(ForecastCalled, match=change):
+        run_confirmed(
+            replay_bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
 def test_pregame_artifact_failure_reports_committed_progress_and_reruns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

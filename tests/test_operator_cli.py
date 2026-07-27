@@ -837,6 +837,75 @@ def test_cli_prints_authoritative_partial_progress_and_reruns_safely(
     assert len(tuple(LedgerStore(ledger_path).iter_records())) == 3
 
 
+def test_confirmed_cli_exact_replay_skips_forecast_and_preserves_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_path = tmp_path / "confirmed.json"
+    mapping = confirmed_bundle_mapping()
+    mapping["payload"]["game_input"] = capture_payload(_complete_game())
+    bundle_path.write_text(
+        _raw(mapping),
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "ledger" / "shadow.jsonl"
+    bundle_root = tmp_path / "managed"
+    monkeypatch.setattr(
+        service_module,
+        "load_forecast_config",
+        lambda version, *, registry_root=None: SimulationConfig(
+            version=version,
+            simulations=12,
+        ),
+    )
+    arguments = [
+        "confirmed",
+        "--bundle",
+        str(bundle_path),
+        "--ledger",
+        str(ledger_path),
+        "--bundle-root",
+        str(bundle_root),
+    ]
+
+    first = runner.invoke(cli_module.app, arguments)
+    assert first.exit_code == 0, first.output
+    records = tuple(LedgerStore(ledger_path).iter_records())
+    capture = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture"
+    )
+    forecast = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "forecast"
+    )
+    link = next(
+        record
+        for record in records
+        if record.envelope.record_kind == "capture_forecast_link"
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("exact CLI replay must not run forecast")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    replay = runner.invoke(cli_module.app, arguments)
+
+    assert replay.exit_code == 0, replay.output
+    assert f"capture_id: {capture.capture_id}" in replay.output
+    assert f"forecast_run_id: {forecast.forecast_run_id}" in replay.output
+    assert (
+        f"capture_forecast_link_record_id: {link.envelope.record_id}"
+        in replay.output
+    )
+    assert "capture_replayed: true" in replay.output
+    assert "forecast_replayed: true" in replay.output
+    assert "link_replayed: true" in replay.output
+
+
 @pytest.mark.parametrize("command", ("projected", "confirmed", "review"))
 def test_missing_required_bundle_exits_two(command: str) -> None:
     result = runner.invoke(cli_module.app, [command])
