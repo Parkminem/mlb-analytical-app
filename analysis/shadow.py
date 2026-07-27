@@ -1548,7 +1548,13 @@ def _binding_payload(binding: CandidateReviewBinding) -> dict[str, object]:
     }
 
 
-def _legacy_payload(legacy: LegacyDecisionSnapshot) -> dict[str, object]:
+def canonical_legacy_decision_payload(
+    legacy: LegacyDecisionSnapshot,
+) -> dict[str, object]:
+    """Serialize legacy content in the exact canonical persistence order."""
+
+    if not isinstance(legacy, LegacyDecisionSnapshot):
+        raise TypeError("legacy must be LegacyDecisionSnapshot")
     return {
         "model_version": legacy.model_version,
         "candidates": [
@@ -1604,7 +1610,7 @@ def _shadow_comparison_payload(
 ) -> dict[str, object]:
     return {
         "authority": comparison.authority,
-        "legacy": _legacy_payload(comparison.legacy),
+        "legacy": canonical_legacy_decision_payload(comparison.legacy),
         "forecast_run_id": comparison.forecast_run_id,
         "market_comparisons": [
             _market_comparison_payload(market)
@@ -1773,6 +1779,7 @@ __all__ = (
     "ShadowRunIdempotencyKeys",
     "ShadowRunRecords",
     "build_shadow_capture_command",
+    "canonical_legacy_decision_payload",
     "compare_shadow_forecast",
     "deserialize_forecast_context",
     "deserialize_shadow_comparison",

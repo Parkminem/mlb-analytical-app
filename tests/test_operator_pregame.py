@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
+import hashlib
 import json
 from pathlib import Path
 import warnings
@@ -17,18 +18,21 @@ from analysis.operator.bundles import (
 )
 from analysis.forecasting import LineupState
 from analysis.forecasting.config import SimulationConfig
-from analysis.forecasting.identity import capture_payload
+from analysis.forecasting.identity import canonical_json, capture_payload
 from analysis.forecasting.validation import (
     PregameRelationshipError,
     PregameTimingError,
 )
 from analysis.ledger import (
+    ForecastCommand,
+    ForecastRecord,
     IdempotencyConflict,
     LedgerCorruptionError,
     LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
 )
+from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorError,
@@ -47,7 +51,15 @@ from analysis.operator.service import (
     run_confirmed,
     run_projected,
 )
-from analysis.shadow import build_shadow_capture_command
+from analysis.review.classification import (
+    ContradictionRule,
+    PrincipalPathBinding,
+)
+from analysis.shadow import (
+    CandidateReviewBinding,
+    LegacyDecisionSnapshot,
+    build_shadow_capture_command,
+)
 from tests.test_forecasting_engine import _complete_game
 from tests.test_forecasting_inputs import complete_forecast_game
 from tests.test_operator_schemas import (
@@ -88,8 +100,103 @@ def _pregame_bundle(stage: str, game):
     return parse_confirmed_bundle_json(raw)
 
 
+def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
+    paths = (
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("home_pitcher_chain_runs_allowed",),
+            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+        ),
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            component_ids=(
+                "away_full_runs",
+                "away_full_traffic",
+                "away_full_extra_base_hits",
+            ),
+            contradiction_rule=(
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+        ),
+    )
+    candidates = (
+        PriorityMarketCandidate(
+            market="ml",
+            score=78,
+            decision_rating="play",
+            evidence_paths=frozenset(
+                path.evidence_path for path in paths
+            ),
+        ),
+        PriorityMarketCandidate(
+            market="full_total",
+            score=74,
+            decision_rating="lean",
+            evidence_paths=frozenset(
+                path.evidence_path for path in paths
+            ),
+        ),
+    )
+    return LegacyDecisionSnapshot(
+        model_version="legacy-fixed-v1",
+        candidates=candidates,
+        final_priority=("ml", "full_total"),
+        review_bindings=(
+            CandidateReviewBinding(
+                market_key="sea_ml",
+                legacy_candidate_index=0,
+                legacy_market="ml",
+                principal_paths=paths,
+            ),
+            CandidateReviewBinding(
+                market_key="full_under",
+                legacy_candidate_index=1,
+                legacy_market="full_total",
+                principal_paths=paths,
+            ),
+        ),
+        notes=("canonical replay order",),
+    )
+
+
 def _run_paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "ledger" / "shadow.jsonl", tmp_path / "bundles"
+
+
+def _rewrite_forecast_outputs(
+    ledger_path: Path,
+    forecast: ForecastRecord,
+    outputs: dict[str, object],
+) -> None:
+    command = ForecastCommand(
+        forecast_run_id=forecast.forecast_run_id,
+        model_version=forecast.model_version,
+        simulation_config_hash=forecast.simulation_config_hash,
+        normalized_input_hash=forecast.normalized_input_hash,
+        outputs=outputs,
+    )
+    payload_hash = hashlib.sha256(
+        canonical_json(command).encode("utf-8")
+    ).hexdigest()
+    replacement = replace(
+        forecast,
+        envelope=replace(forecast.envelope, payload_hash=payload_hash),
+        outputs=outputs,
+    )
+    records = tuple(LedgerStore(ledger_path).iter_records())
+    ledger_path.write_text(
+        "".join(
+            canonical_json(
+                replacement
+                if isinstance(record, ForecastRecord)
+                and record.forecast_run_id == forecast.forecast_run_id
+                else record
+            )
+            + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -436,6 +543,122 @@ def test_exact_confirmed_replay_returns_frozen_records_without_forecast(
     assert replay.forecast_replayed is True
     assert replay.link_replayed is True
     assert replay.managed_bundle.replayed is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "run_id",
+        "simulation_config",
+        "simulation_count",
+        "market_input",
+        "market_evaluation",
+        "incomplete",
+    ),
+)
+def test_inconsistent_frozen_outputs_replay_calls_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    outputs = json.loads(canonical_json(first.forecast.outputs))
+
+    if corruption == "run_id":
+        outputs["forecast_run_id"] = "0" * 64
+    elif corruption == "simulation_config":
+        outputs["simulation_config"]["league_woba"] += 0.001
+    elif corruption == "simulation_count":
+        outputs["simulation_count"] += 1
+    elif corruption == "market_input":
+        outputs["market_inputs"]["sea_ml"]["selected_decimal_price"] += 0.01
+    elif corruption == "market_evaluation":
+        outputs["markets"]["sea_ml"]["edge"] += 0.01
+    else:
+        outputs.pop("intervals")
+
+    _rewrite_forecast_outputs(ledger_path, first.forecast, outputs)
+
+    class ForecastCalled(RuntimeError):
+        pass
+
+    def fail_forecast(*args, **kwargs):
+        raise ForecastCalled(corruption)
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(ForecastCalled, match=corruption):
+        run_confirmed(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
+def test_reordered_equivalent_legacy_replay_skips_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    base = _pregame_bundle("confirmed", _confirmed_game())
+    legacy = _ordered_legacy_decision()
+    bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    reordered_legacy = replace(
+        legacy,
+        review_bindings=tuple(
+            replace(
+                binding,
+                principal_paths=tuple(
+                    reversed(binding.principal_paths)
+                ),
+            )
+            for binding in reversed(legacy.review_bindings)
+        ),
+    )
+    reordered_bundle = bundle.model_copy(
+        update={
+            "payload": bundle.payload.model_copy(
+                update={"legacy_decision": reordered_legacy}
+            )
+        }
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError(
+            "canonical-equivalent legacy replay must not run forecast"
+        )
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    replay = run_confirmed(
+        reordered_bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert replay.capture == first.capture
+    assert replay.forecast == first.forecast
+    assert replay.link == first.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,10 @@ from typing import TypeVar
 
 from analysis.forecasting import LineupState, run_forecast
 from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.engine import (
+    build_semantic_market_inputs,
+    resolve_forecast_input,
+)
 from analysis.forecasting.identity import (
     build_forecast_run_id_for_input,
     canonical_json,
@@ -44,8 +48,11 @@ from analysis.review.calibration import (
 from analysis.shadow import (
     ShadowRunIdempotencyKeys,
     build_shadow_capture_command,
+    canonical_legacy_decision_payload,
+    deserialize_forecast_context,
     deserialize_shadow_comparison,
     record_shadow_run,
+    validate_shadow_forecast_context,
 )
 
 from .bundles import (
@@ -385,6 +392,57 @@ def _capture_matches_command(
     )
 
 
+def _forecast_outputs_match(
+    forecast: ForecastRecord,
+    bundle: _Bundle,
+    config: SimulationConfig,
+    forecast_run_id: str,
+) -> bool:
+    game = bundle.payload.game_input
+    resolved_game = resolve_forecast_input(game)
+    expected_market_inputs = build_semantic_market_inputs(
+        resolved_game.markets
+    )
+    try:
+        context = deserialize_forecast_context(
+            forecast.outputs,
+            away_team=game.identity.away_team,
+            home_team=game.identity.home_team,
+        )
+        comparison = deserialize_shadow_comparison(
+            forecast.outputs.get("shadow_comparison")
+        )
+        validate_shadow_forecast_context(
+            comparison,
+            context.market_inputs,
+            context.markets,
+            context.component_distributions,
+            away_team=game.identity.away_team,
+            home_team=game.identity.home_team,
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        context.forecast_run_id == forecast_run_id
+        and context.forecast_run_id == forecast.forecast_run_id
+        and context.config_version == forecast.model_version
+        and context.simulation_config == config
+        and context.simulation_count == config.simulations
+        and forecast.simulation_config_hash
+        == _simulation_config_hash(context.simulation_config)
+        and context.market_inputs == expected_market_inputs
+        and comparison.forecast_run_id == forecast_run_id
+        and canonical_json(
+            canonical_legacy_decision_payload(comparison.legacy)
+        )
+        == canonical_json(
+            canonical_legacy_decision_payload(
+                bundle.payload.legacy_decision
+            )
+        )
+    )
+
+
 def _exact_pregame_replay(
     store: LedgerStore,
     bundle: _Bundle,
@@ -424,15 +482,11 @@ def _exact_pregame_replay(
         or link.forecast_run_id != forecast.forecast_run_id
     ):
         return None
-    try:
-        comparison = deserialize_shadow_comparison(
-            forecast.outputs.get("shadow_comparison")
-        )
-    except (TypeError, ValueError):
-        return None
-    if (
-        comparison.forecast_run_id != forecast_run_id
-        or comparison.legacy != bundle.payload.legacy_decision
+    if not _forecast_outputs_match(
+        forecast,
+        bundle,
+        config,
+        forecast_run_id,
     ):
         return None
     return capture, forecast, link
