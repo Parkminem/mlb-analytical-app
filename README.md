@@ -50,6 +50,9 @@ Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`
 - Lower-level `analysis.shadow.record_shadow_run`은 여전히 caller-supplied capture key로 append/replay하며, 선택적 `supersedes_capture_id`와 active-head guard를 받습니다. 이 API와 `LedgerStore`의 동작은 append-only입니다. supersession은 이전 record를 수정하거나 삭제하지 않고 새 record로 관계만 추가합니다.
 - 공식 결과 정정은 새 `source_revision`과 최신 결과를 가리키는 `supersedes_record_id`로 새 immutable result를 append합니다. 이전 결과는 변경하지 않으며 review와 calibration은 최신 non-superseded official result만 사용합니다.
 - 공식 결과가 선발 체인 실점과 불펜 실점을 모두 제공하면 각 투수진의 두 값은 음이 아닌 정수여야 하며 상대 최종 득점과 정확히 일치해야 합니다. 보존되지 않는 구성요소는 review 또는 calibration에 들어가기 전에 거부됩니다.
+- Pregame 조회는 ledger 옆의 rebuildable `checkpoint-v1` 파생 파일을 사용합니다. JSONL만 권위가 있으며 checkpoint는 삭제하거나 손상돼도 strict ledger scan으로 복구됩니다.
+- Historical 평문 forecast 배열은 계속 읽히고, 신규 20,000개 component 배열은 canonical JSON 기반으로 결정론적·무손실 압축됩니다. Decode 결과, review, calibration report mapping은 동일합니다.
+- 완전한 exact projected/confirmed replay만 시뮬레이션을 건너뜁니다. 입력, config, legacy snapshot, market 또는 frozen output 검증이 하나라도 다르면 기존 20,000회 forecast를 그대로 실행합니다.
 
 ## Documentation
 

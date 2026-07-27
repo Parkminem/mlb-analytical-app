@@ -102,6 +102,7 @@ class PregameLedgerSession:
                 "ledger",
             )
             self._checkpoint = self._load_or_rebuild_checkpoint()
+            self._store._pregame_checkpoint_cache = self._checkpoint
             return self
         except Exception:
             self._release()
@@ -136,6 +137,13 @@ class PregameLedgerSession:
             ledger_stat, ledger_sha256 = ledger_state(self._ledger_descriptor)
         except CheckpointError as error:
             raise LedgerCorruptionError(str(error)) from error
+        expected_fingerprint = LedgerFingerprint.from_stat(
+            ledger_stat,
+            ledger_sha256,
+        )
+        cached = self._store._pregame_checkpoint_cache
+        if cached is not None and cached.fingerprint == expected_fingerprint:
+            return cached
         try:
             return LedgerCheckpoint.load(
                 self._store.checkpoint_path,
@@ -696,6 +704,7 @@ class PregameLedgerSession:
             records=all_indexed,
         )
         self._checkpoint = checkpoint
+        self._store._pregame_checkpoint_cache = checkpoint
         try:
             _publish_checkpoint(checkpoint)
         except (CheckpointError, OSError):

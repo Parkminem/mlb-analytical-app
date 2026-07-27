@@ -669,6 +669,7 @@ class LedgerStore:
         self._parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
         self._ledger_identity: tuple[int, int] | None = None
         self._lock_identity: tuple[int, int] | None = None
+        self._pregame_checkpoint_cache: LedgerCheckpoint | None = None
         self._parent_descriptor_finalizer = weakref.finalize(
             self,
             os.close,

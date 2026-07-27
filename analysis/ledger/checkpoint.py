@@ -736,127 +736,29 @@ def _extract_index_fields(
     line_number: int,
 ) -> dict[str, object]:
     try:
-        text = raw_row.decode("utf-8")
-        decoder = json.JSONDecoder(
+        value = json.loads(
+            raw_row.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_json_constant,
         )
-        index = _skip_json_whitespace(text, 0)
-        if index >= len(text) or text[index] != "{":
+        if not isinstance(value, dict):
             raise CheckpointError(
                 f"checkpoint row {line_number} must be a JSON object"
             )
-        index += 1
-        fields: dict[str, object] = {}
-        seen_keys: set[str] = set()
-        while True:
-            index = _skip_json_whitespace(text, index)
-            if index >= len(text):
-                raise CheckpointError(
-                    f"checkpoint row {line_number} is incomplete JSON"
-                )
-            if text[index] == "}":
-                index += 1
-                break
-            key, index = decoder.raw_decode(text, index)
-            if not isinstance(key, str):
-                raise CheckpointError(
-                    f"checkpoint row {line_number} has a non-string key"
-                )
-            if key in seen_keys:
-                raise CheckpointError(
-                    f"checkpoint row {line_number} has duplicate key {key}"
-                )
-            seen_keys.add(key)
-            index = _skip_json_whitespace(text, index)
-            if index >= len(text) or text[index] != ":":
-                raise CheckpointError(
-                    f"checkpoint row {line_number} is missing a key separator"
-                )
-            index = _skip_json_whitespace(text, index + 1)
-            if key in _ROW_INDEX_FIELDS:
-                fields[key], index = decoder.raw_decode(text, index)
-            else:
-                index = _skip_json_value(text, index, line_number)
-            index = _skip_json_whitespace(text, index)
-            if index >= len(text):
-                raise CheckpointError(
-                    f"checkpoint row {line_number} is incomplete JSON"
-                )
-            if text[index] == ",":
-                index += 1
-                continue
-            if text[index] == "}":
-                index += 1
-                break
-            raise CheckpointError(
-                f"checkpoint row {line_number} has invalid JSON framing"
-            )
-        if _skip_json_whitespace(text, index) != len(text):
-            raise CheckpointError(
-                f"checkpoint row {line_number} has trailing JSON content"
-            )
-        return fields
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        return {
+            key: item
+            for key, item in value.items()
+            if key in _ROW_INDEX_FIELDS
+        }
+    except (
+        CheckpointError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as error:
         raise CheckpointError(
             f"checkpoint row {line_number} cannot be indexed safely"
         ) from error
-
-
-def _skip_json_whitespace(text: str, index: int) -> int:
-    while index < len(text) and text[index] in " \t\r\n":
-        index += 1
-    return index
-
-
-def _skip_json_value(text: str, index: int, line_number: int) -> int:
-    if index >= len(text):
-        raise CheckpointError(
-            f"checkpoint row {line_number} is missing a JSON value"
-        )
-    if text[index] not in "[{":
-        decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
-        _, end = decoder.raw_decode(text, index)
-        return end
-
-    closing_stack = ["]" if text[index] == "[" else "}"]
-    index += 1
-    while closing_stack:
-        if index >= len(text):
-            raise CheckpointError(
-                f"checkpoint row {line_number} has an incomplete JSON value"
-            )
-        character = text[index]
-        if character == '"':
-            index = _skip_json_string(text, index, line_number)
-            continue
-        if character == "[":
-            closing_stack.append("]")
-        elif character == "{":
-            closing_stack.append("}")
-        elif character in "]}":
-            if character != closing_stack[-1]:
-                raise CheckpointError(
-                    f"checkpoint row {line_number} has mismatched JSON framing"
-                )
-            closing_stack.pop()
-        index += 1
-    return index
-
-
-def _skip_json_string(text: str, index: int, line_number: int) -> int:
-    index += 1
-    while index < len(text):
-        character = text[index]
-        if character == '"':
-            return index + 1
-        if character == "\\":
-            index += 2
-        else:
-            index += 1
-    raise CheckpointError(
-        f"checkpoint row {line_number} has an incomplete JSON string"
-    )
 
 
 def _validate_indexed_row(

@@ -93,6 +93,19 @@ Operator capture key는 `(schema_version, stage, intrinsic CaptureCommand)`에�
 - Review의 `partial.rerun_safe: true`는 I/O 오류 뒤에도 지정한 frozen capture가 최신 active capture임을 재확인했음을 뜻합니다.
 - `partial.rerun_safe: true`이면 같은 command와 override를 그대로 재실행합니다. `false`는 rollback을 뜻하지 않으며 자동 재실행 안전성을 확인하지 못했다는 뜻이므로 ledger와 active lineage를 먼저 점검합니다.
 
+## Checkpoint와 Forecast 압축 호환성
+
+Pregame 명령은 ledger 옆의 `<ledger 파일명>.checkpoint-v1.json`을 재구축 가능한 조회 가속 상태로 사용합니다.
+
+- JSONL ledger가 유일한 authoritative state입니다. Checkpoint는 ledger bytes를 수정하거나 대체하지 않으며 언제든 삭제할 수 있습니다. 없거나 손상됐거나 ledger의 device, inode, size, mtime, 전체 SHA-256 또는 row metadata와 맞지 않으면 strict JSONL 검증으로 다시 만듭니다.
+- 첫 checkpoint 구축은 전체 historical ledger를 엄격하게 읽는 일회성 비용입니다. 이후 warm load는 전체 fingerprint와 각 canonical JSON row의 envelope 및 관계 metadata를 검증하지만 historical forecast domain object 전체를 재구성하지 않습니다.
+- 한 pregame 명령 안에서는 immutable checkpoint가 full ledger fingerprint와 정확히 같을 때만 다음 lock-scoped session에서 재사용됩니다. Ledger가 바뀌면 재사용하지 않고 authoritative state를 다시 검증합니다.
+- 구형 forecast record의 평문 `values` 배열은 계속 읽을 수 있습니다. 신규 forecast는 각 component의 전체 20,000개 값을 canonical JSON, zlib level 6, base64 형식으로 결정론적·무손실 압축합니다. Decode 후 값과 정수/실수 타입은 구형 표현과 같습니다.
+- Review와 calibration은 압축 여부와 무관하게 같은 decoded forecast context와 report mapping을 사용합니다. 압축은 확률, interval, classification, migration count 또는 보고서 값을 바꾸지 않습니다.
+- 완전한 exact replay는 frozen capture, forecast output, legacy snapshot, market context와 exact link를 모두 검증한 뒤에만 20,000회 시뮬레이션을 생략합니다. 하나라도 없거나 다르거나 해석할 수 없으면 기존 전체 forecast 경로로 보수적으로 돌아갑니다.
+
+Checkpoint를 수동으로 지우는 것은 안전하지만 다음 pregame 명령에서 strict rebuild 비용이 다시 발생합니다. JSONL ledger나 기존 forecast row를 checkpoint 복구 목적으로 수정하거나 재작성하지 않습니다.
+
 ## Exit Code
 
 | Code | 의미 |

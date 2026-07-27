@@ -38,6 +38,7 @@ from analysis.ledger import (
     MarketObservationRecord,
     OfficialResultCommand,
     OfficialResultRecord,
+    PregameLookup,
     ReviewRecord,
 )
 from analysis.review import build_and_record_review
@@ -299,26 +300,25 @@ def _latest_active_capture(
 def _resolve_supersession_target(
     *,
     stage: str,
-    captures: tuple[CaptureRecord, ...],
     existing_capture: CaptureRecord | None,
-    game_pk: int,
+    active_head: CaptureRecord | None,
 ) -> str | None:
     if existing_capture is not None:
         return existing_capture.supersedes_capture_id
 
-    active = _active_game_captures(captures, game_pk)
-    if stage == "projected" and any(
-        capture.lineup_state == "confirmed" for capture in active
+    if (
+        stage == "projected"
+        and active_head is not None
+        and active_head.lineup_state == "confirmed"
     ):
         raise OperatorPreconditionError(
             "new projected capture is not allowed after an active confirmed capture"
         )
-    latest = _latest_active_capture(captures, game_pk)
-    if latest is None:
+    if active_head is None:
         return None
-    if stage == "projected" and latest.lineup_state != "projected":
+    if stage == "projected" and active_head.lineup_state != "projected":
         return None
-    return latest.capture_id
+    return active_head.capture_id
 
 
 def _require_chronological_new_capture(
@@ -444,7 +444,7 @@ def _forecast_outputs_match(
 
 
 def _exact_pregame_replay(
-    store: LedgerStore,
+    lookup: PregameLookup,
     bundle: _Bundle,
     *,
     expected_stage: str,
@@ -453,14 +453,6 @@ def _exact_pregame_replay(
     forecast_run_id: str,
     config: SimulationConfig,
 ) -> tuple[CaptureRecord, ForecastRecord, CaptureForecastLink] | None:
-    lookup = _ledger_operation(
-        "unable to look up shadow pregame replay",
-        lambda: store.lookup_shadow_pregame(
-            capture_key,
-            forecast_run_id,
-            bundle.game_pk,
-        ),
-    )
     capture = lookup.capture
     forecast = lookup.forecast
     link = lookup.link
@@ -587,8 +579,16 @@ def _run_pregame(
     link_replayed: bool | None = None
     managed_bundle: ManagedBundleCopy | None = None
     try:
+        lookup = _ledger_operation(
+            "unable to look up shadow pregame replay",
+            lambda: store.lookup_shadow_pregame(
+                capture_key,
+                forecast_run_id,
+                bundle.game_pk,
+            ),
+        )
         exact_replay = _exact_pregame_replay(
-            store,
+            lookup,
             bundle,
             expected_stage=expected_stage,
             command=command,
@@ -619,9 +619,17 @@ def _run_pregame(
             lambda: run_forecast(bundle.payload.game_input, config)
         )
         for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
-            captures = _captures(store)
-            existing_capture = _existing_keyed_capture(captures, capture_key)
-            active_head = _latest_active_capture(captures, bundle.game_pk)
+            if attempt:
+                lookup = _ledger_operation(
+                    "unable to refresh shadow pregame state",
+                    lambda: store.lookup_shadow_pregame(
+                        capture_key,
+                        forecast_run_id,
+                        bundle.game_pk,
+                    ),
+                )
+            existing_capture = lookup.capture
+            active_head = lookup.active_capture
             _require_chronological_new_capture(
                 command,
                 existing_capture,
@@ -629,15 +637,11 @@ def _run_pregame(
             )
             supersedes_capture_id = _resolve_supersession_target(
                 stage=expected_stage,
-                captures=captures,
                 existing_capture=existing_capture,
-                game_pk=bundle.game_pk,
+                active_head=active_head,
             )
-            forecast_replayed, link_replayed = _record_replay_state(
-                store,
-                existing_capture=existing_capture,
-                forecast_run_id=forecast_run_id,
-            )
+            forecast_replayed = lookup.forecast is not None
+            link_replayed = lookup.link is not None
             capture_replayed = existing_capture is not None
             try:
                 records = _pregame_operation(

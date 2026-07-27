@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import analysis.ledger.checkpoint as checkpoint_module
 from analysis.ledger import (
     CaptureCommand,
     ForecastCommand,
@@ -78,6 +79,19 @@ def write_checkpoint_json(
         json.dumps(value, separators=(",", ":"), sort_keys=True),
         encoding="utf-8",
     )
+
+
+def test_checkpoint_row_parser_rejects_invalid_nested_json_constants() -> None:
+    raw_row = (
+        b'{"envelope":{"appended_at":"2026-07-27T01:30:00Z",'
+        b'"idempotency_key":"forecast:test","payload_hash":"'
+        + b"0" * 64
+        + b'","record_id":"00000000000000000000000000000000",'
+        b'"record_kind":"forecast"},"outputs":{"invalid":NaN}}'
+    )
+
+    with pytest.raises(CheckpointError, match="indexed safely"):
+        checkpoint_module._extract_index_fields(raw_row, 1)
 
 
 def mutate_capture_game_pk(value: dict[str, object]) -> None:
