@@ -571,7 +571,7 @@ def build_checkpoint(
     from .store import LedgerStore
 
     path = _absolute_path(ledger_path)
-    store = LedgerStore(path)
+    store = LedgerStore(path, _resolve_path_aliases=False)
     supplied_records = tuple(records)
     lock_descriptor = store._open_no_follow(
         store._lock_name,

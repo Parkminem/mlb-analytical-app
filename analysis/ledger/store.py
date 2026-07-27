@@ -640,8 +640,18 @@ def _require_active_capture_head(
 class LedgerStore:
     """A JSONL ledger whose file is the sole authoritative state."""
 
-    def __init__(self, path: Path | str) -> None:
-        self.path = Path(path).resolve(strict=False)
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        _resolve_path_aliases: bool = True,
+    ) -> None:
+        candidate_path = Path(path)
+        self.path = (
+            candidate_path.resolve(strict=False)
+            if _resolve_path_aliases
+            else Path(os.path.abspath(os.fspath(candidate_path)))
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         self.checkpoint_path = checkpoint_path_for(self.path)

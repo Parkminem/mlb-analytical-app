@@ -585,6 +585,32 @@ def test_build_rejects_fabricated_record_with_matching_envelope(
         build_checkpoint(store.path, fabricated)
 
 
+def test_build_rejects_final_component_ledger_symlink_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    store, records = seeded_ledger_store(tmp_path)
+    store.pregame_checkpoint()
+    alias_path = tmp_path / "ledger-alias.jsonl"
+    alias_path.symlink_to(store.path.name)
+    alias_checkpoint_path = alias_path.with_name(
+        f"{alias_path.name}.checkpoint-v1.json"
+    )
+    alias_lock_path = alias_path.with_name(f"{alias_path.name}.lock")
+    ledger_before = store.path.read_bytes()
+    checkpoint_before = store.checkpoint_path.read_bytes()
+    lock_before = store.lock_path.read_bytes()
+
+    with pytest.raises(LedgerCorruptionError, match="symlink"):
+        build_checkpoint(alias_path, records)
+
+    assert alias_path.is_symlink()
+    assert store.path.read_bytes() == ledger_before
+    assert store.checkpoint_path.read_bytes() == checkpoint_before
+    assert store.lock_path.read_bytes() == lock_before
+    assert not alias_checkpoint_path.exists()
+    assert not alias_lock_path.exists()
+
+
 def test_checkpoint_indexes_relationships_and_values_are_frozen(
     tmp_path: Path,
 ) -> None:
