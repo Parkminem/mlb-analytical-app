@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Callable, TypeVar
+from typing import TYPE_CHECKING, Callable, TypeVar
 import uuid
 import weakref
 
@@ -39,6 +39,12 @@ from .records import (
     ReviewRecord,
     freeze_mapping,
 )
+
+
+if TYPE_CHECKING:
+    from analysis.shadow import ShadowRunRecords
+
+    from .pregame import PregameLookup
 
 
 _RecordT = TypeVar(
@@ -1884,6 +1890,61 @@ class LedgerStore:
                     os.close(descriptor)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def lookup_shadow_pregame(
+        self,
+        capture_key: str,
+        forecast_run_id: str,
+        game_pk: int,
+    ) -> "PregameLookup":
+        """Resolve one pregame relationship without full ledger reconstruction."""
+
+        if not isinstance(capture_key, str) or not capture_key.strip():
+            raise ValueError("capture_key must be a non-empty string")
+        if not isinstance(forecast_run_id, str) or not forecast_run_id.strip():
+            raise ValueError("forecast_run_id must be a non-empty string")
+        if (
+            isinstance(game_pk, bool)
+            or not isinstance(game_pk, int)
+            or game_pk <= 0
+        ):
+            raise ValueError("game_pk must be a positive integer")
+        from .pregame import PregameLedgerSession
+
+        with PregameLedgerSession(self, exclusive=False) as session:
+            return session.lookup(capture_key, forecast_run_id, game_pk)
+
+    def append_shadow_run_atomic(
+        self,
+        capture_key: str,
+        capture_command: CaptureCommand,
+        forecast_command: ForecastCommand,
+        expected_active_capture_id: str | None,
+    ) -> "ShadowRunRecords":
+        """Append or replay one capture/forecast/link relationship atomically."""
+
+        if not isinstance(capture_key, str) or not capture_key.strip():
+            raise ValueError("capture_key must be a non-empty string")
+        if not isinstance(capture_command, CaptureCommand):
+            raise TypeError("capture_command must be CaptureCommand")
+        if not isinstance(forecast_command, ForecastCommand):
+            raise TypeError("forecast_command must be ForecastCommand")
+        if expected_active_capture_id is not None and (
+            not isinstance(expected_active_capture_id, str)
+            or not expected_active_capture_id.strip()
+        ):
+            raise ValueError(
+                "expected_active_capture_id must be None or a non-empty string"
+            )
+        from .pregame import PregameLedgerSession
+
+        with PregameLedgerSession(self, exclusive=True) as session:
+            return session.append_shadow_run(
+                capture_key,
+                capture_command,
+                forecast_command,
+                expected_active_capture_id,
+            )
 
 
 __all__ = (

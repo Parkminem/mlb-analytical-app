@@ -348,6 +348,36 @@ def test_projected_run_creates_capture_forecast_link_and_bundle(
         result.stage = "confirmed"
 
 
+def test_projected_run_uses_one_atomic_shadow_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("projected", _projected_game())
+    real_append = LedgerStore.append_shadow_run_atomic
+    calls = 0
+
+    def append_spy(self, *args):
+        nonlocal calls
+        calls += 1
+        return real_append(self, *args)
+
+    monkeypatch.setattr(
+        LedgerStore,
+        "append_shadow_run_atomic",
+        append_spy,
+    )
+
+    result = run_projected(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+
+    assert calls == 1
+    assert result.link.capture_id == result.capture.capture_id
+
+
 def test_exact_projected_retry_replays_every_record_and_original_lineage(
     tmp_path: Path,
 ) -> None:

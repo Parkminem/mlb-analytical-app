@@ -1662,7 +1662,7 @@ def build_shadow_capture_command(
     )
 
 
-def _require_store_interface(store: object) -> None:
+def _require_legacy_store_interface(store: object) -> None:
     for method_name in (
         "append_capture",
         "append_forecast",
@@ -1689,7 +1689,9 @@ def record_shadow_run(
 ) -> ShadowRunRecords:
     """Append or replay capture, capture-independent forecast, and link."""
 
-    _require_store_interface(store)
+    atomic_append = getattr(store, "append_shadow_run_atomic", None)
+    if not callable(atomic_append):
+        _require_legacy_store_interface(store)
     if not isinstance(game_input, NormalizedGameInput):
         raise TypeError("game_input must be NormalizedGameInput")
     if not isinstance(forecast, ForecastOutput):
@@ -1730,6 +1732,18 @@ def record_shadow_run(
         outputs=_forecast_outputs(forecast, comparison),
     )
 
+    if (
+        expected_active_capture_id is not _EXPECTED_ACTIVE_CAPTURE_ID_UNSET
+        and callable(atomic_append)
+    ):
+        return atomic_append(
+            idempotency_keys.capture,
+            capture_command,
+            forecast_command,
+            expected_active_capture_id,
+        )
+
+    _require_legacy_store_interface(store)
     if expected_active_capture_id is _EXPECTED_ACTIVE_CAPTURE_ID_UNSET:
         capture = store.append_capture(idempotency_keys.capture, capture_command)
     else:

@@ -27,6 +27,7 @@ from analysis.forecasting.identity import (
     normalized_input_hash,
 )
 from analysis.ledger import (
+    CaptureCommand,
     CaptureForecastLink,
     CaptureRecord,
     ForecastCommand,
@@ -326,6 +327,16 @@ class FailOnceAfterAppendStore(TrackingStore):
         record = super().link_capture_forecast(*args, **kwargs)
         self._fail_once("link")
         return record
+
+
+class AtomicOnlyStore:
+    def __init__(self, store: LedgerStore) -> None:
+        self.store = store
+        self.calls: list[tuple[object, ...]] = []
+
+    def append_shadow_run_atomic(self, *args):
+        self.calls.append(args)
+        return self.store.append_shadow_run_atomic(*args)
 
 
 class ShadowComparisonTests(unittest.TestCase):
@@ -1152,6 +1163,26 @@ class ShadowRecordingTests(unittest.TestCase):
         self.assertIsInstance(result.link, CaptureForecastLink)
         with self.assertRaises(FrozenInstanceError):
             result.capture = result.capture
+
+    def test_recording_prefers_atomic_store_and_forwards_expected_head(self) -> None:
+        atomic_store = AtomicOnlyStore(self.store)
+
+        result = record_shadow_run(
+            atomic_store,
+            self.game,
+            self.legacy,
+            self.forecast,
+            self.keys(),
+            expected_active_capture_id=None,
+        )
+
+        self.assertEqual(len(atomic_store.calls), 1)
+        args = atomic_store.calls[0]
+        self.assertEqual(args[0], self.keys().capture)
+        self.assertIsInstance(args[1], CaptureCommand)
+        self.assertIsInstance(args[2], ForecastCommand)
+        self.assertIsNone(args[3])
+        self.assertEqual(result.capture.game_pk, self.game.identity.game_pk)
 
     def test_known_unevaluated_market_records_without_invented_pricing(self) -> None:
         game, forecast, legacy = three_way_f5_scenario()

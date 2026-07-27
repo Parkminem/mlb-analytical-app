@@ -30,6 +30,7 @@ from .store import (
     LedgerReferenceError,
     LedgerStore,
 )
+from .pregame import PregameLookup
 
 __all__ = (
     "CaptureCommand",
@@ -52,6 +53,7 @@ __all__ = (
     "MarketObservationRecord",
     "OfficialResultCommand",
     "OfficialResultRecord",
+    "PregameLookup",
     "RecordEnvelope",
     "ReviewCommand",
     "ReviewRecord",
