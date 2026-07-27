@@ -21,6 +21,10 @@ from analysis.forecasting.market import (
     market_semantic_fingerprint,
     price_market,
 )
+from analysis.ledger.forecast_codec import (
+    compact_forecast_outputs,
+    expand_component_distributions,
+)
 from analysis.ledger import (
     CaptureCommand,
     CaptureForecastLink,
@@ -39,6 +43,7 @@ from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
     ShadowRunIdempotencyKeys,
+    deserialize_forecast_context,
     record_shadow_run,
 )
 from tests.test_forecasting_engine import _complete_game, _fast_config
@@ -217,7 +222,15 @@ class ReviewServiceTests(unittest.TestCase):
 
     @classmethod
     def _fresh_outputs(cls) -> dict[str, object]:
-        return json.loads(canonical_json(cls.base_outputs))
+        outputs = json.loads(canonical_json(cls.base_outputs))
+        outputs["component_distributions"] = expand_component_distributions(
+            outputs["component_distributions"]
+        )
+        return outputs
+
+    @classmethod
+    def _compact_outputs(cls) -> dict[str, object]:
+        return compact_forecast_outputs(cls._fresh_outputs())
 
     @classmethod
     def _default_component_values(cls) -> dict[str, float]:
@@ -233,6 +246,7 @@ class ReviewServiceTests(unittest.TestCase):
     def fixture(
         self,
         *,
+        outputs=None,
         mutate_outputs=None,
         component_values=None,
         documented_events=None,
@@ -249,7 +263,11 @@ class ReviewServiceTests(unittest.TestCase):
         record_first_pitch=None,
         record_lineup_state="confirmed",
     ) -> RecordedFixture:
-        outputs = self._fresh_outputs()
+        outputs = (
+            self._fresh_outputs()
+            if outputs is None
+            else json.loads(canonical_json(outputs))
+        )
         if mutate_outputs is not None:
             mutate_outputs(outputs)
         capture_payload = json.loads(canonical_json(self.capture_payload))
@@ -549,6 +567,68 @@ class ReviewServiceTests(unittest.TestCase):
                 )
         self.assertEqual(observation.value, 99.0)
         self.assertNotEqual(forecast.interval.p90, observation.value)
+
+    def test_compact_and_historical_forecasts_build_equivalent_reviews(self):
+        historical = self.fixture()
+        historical_context = deserialize_forecast_context(
+            historical.forecast.outputs,
+            away_team=self.game.identity.away_team,
+            home_team=self.game.identity.home_team,
+        )
+        historical_review = build_and_record_review(
+            self.store,
+            historical.link.envelope.record_id,
+            historical.result.envelope.record_id,
+            MARKET_KEY,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            compact_store = LedgerStore(Path(directory) / "ledger.jsonl")
+            original_store = self.store
+            self.store = compact_store
+            try:
+                compact = self.fixture(outputs=self._compact_outputs())
+                compact_context = deserialize_forecast_context(
+                    compact.forecast.outputs,
+                    away_team=self.game.identity.away_team,
+                    home_team=self.game.identity.home_team,
+                )
+                compact_review = build_and_record_review(
+                    self.store,
+                    compact.link.envelope.record_id,
+                    compact.result.envelope.record_id,
+                    MARKET_KEY,
+                )
+            finally:
+                self.store = original_store
+
+        self.assertEqual(historical_context, compact_context)
+        self.assertEqual(
+            canonical_json(
+                {
+                    "classification": historical_review.command.classification,
+                    "component_reviews": historical_review.command.component_reviews,
+                    "contradicted_paths": historical_review.command.contradicted_paths,
+                    "inside_80_ratio": historical_review.command.inside_80_ratio,
+                    "market_result": historical_review.command.market_result,
+                    "qualifying_exogenous_source_observation_ids": (
+                        historical_review.command.qualifying_exogenous_source_observation_ids
+                    ),
+                }
+            ),
+            canonical_json(
+                {
+                    "classification": compact_review.command.classification,
+                    "component_reviews": compact_review.command.component_reviews,
+                    "contradicted_paths": compact_review.command.contradicted_paths,
+                    "inside_80_ratio": compact_review.command.inside_80_ratio,
+                    "market_result": compact_review.command.market_result,
+                    "qualifying_exogenous_source_observation_ids": (
+                        compact_review.command.qualifying_exogenous_source_observation_ids
+                    ),
+                }
+            ),
+        )
 
     def test_missing_exact_pregame_binding_is_not_reconstructed(self):
         def remove_exact_comparison(outputs):

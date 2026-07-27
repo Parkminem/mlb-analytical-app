@@ -37,6 +37,10 @@ from analysis.forecasting.simulation import (
     validate_component_distribution_domain,
 )
 from analysis.forecasting.validation import validate_pregame_input
+from analysis.ledger.forecast_codec import (
+    compact_forecast_outputs,
+    expand_component_distributions,
+)
 from analysis.ledger.records import (
     CaptureCommand,
     CaptureForecastLink,
@@ -1189,7 +1193,7 @@ def deserialize_forecast_context(
         payload["component_diagnostics"]
     )
     distributions = _component_distributions_from_payload(
-        payload["component_distributions"],
+        expand_component_distributions(payload["component_distributions"]),
         simulation_count,
         component_ids,
     )
@@ -1616,6 +1620,7 @@ def _forecast_outputs(
     outputs = json.loads(canonical_json(forecast))
     if not isinstance(outputs, dict):
         raise TypeError("forecast output must serialize to a mapping")
+    outputs = compact_forecast_outputs(outputs)
     outputs["shadow_comparison"] = _shadow_comparison_payload(comparison)
     return outputs
 

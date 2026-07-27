@@ -1,12 +1,19 @@
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
+import base64
 import hashlib
 import inspect
+import json
 from pathlib import Path
 import tempfile
 import unittest
+import zlib
 
 import analysis.shadow as shadow_module
+from analysis.ledger.forecast_codec import (
+    compact_forecast_outputs,
+    expand_component_distributions,
+)
 from analysis.forecasting import (
     MarketType,
     OutcomeProbabilities,
@@ -54,6 +61,113 @@ deserialize_shadow_comparison = getattr(
     "deserialize_shadow_comparison",
     None,
 )
+
+
+class ForecastDistributionCodecTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        forecast = run_forecast(_complete_game(), _fast_config())
+        cls.outputs = json.loads(canonical_json(forecast))
+
+    def test_compaction_round_trips_real_forecast_distributions(self) -> None:
+        compact = compact_forecast_outputs(self.outputs)
+
+        expanded = expand_component_distributions(
+            compact["component_distributions"]
+        )
+
+        self.assertEqual(
+            canonical_json(expanded),
+            canonical_json(self.outputs["component_distributions"]),
+        )
+        self.assertNotIn(
+            "values",
+            next(iter(compact["component_distributions"].values())),
+        )
+
+    def test_compaction_preserves_integer_and_float_value_types(self) -> None:
+        outputs = {
+            "component_distributions": {
+                "fixture": {
+                    "component_id": "fixture",
+                    "values": [0, 1.25, 2],
+                    "summary": {"median": 1.25},
+                }
+            }
+        }
+
+        expanded = expand_component_distributions(
+            compact_forecast_outputs(outputs)["component_distributions"]
+        )
+
+        values = expanded["fixture"]["values"]
+        self.assertEqual(values, [0, 1.25, 2])
+        self.assertEqual(tuple(type(value) for value in values), (int, float, int))
+
+    def test_expansion_rejects_malformed_encoded_values(self) -> None:
+        compact = compact_forecast_outputs(self.outputs)[
+            "component_distributions"
+        ]
+        component_id = next(iter(compact))
+
+        cases = (
+            ("base64", "%%%"),
+            (
+                "zlib",
+                base64.b64encode(b"not a zlib payload").decode("ascii"),
+            ),
+            (
+                "JSON",
+                base64.b64encode(
+                    zlib.compress(b"{")
+                ).decode("ascii"),
+            ),
+        )
+        for expected, values_data in cases:
+            with self.subTest(expected=expected):
+                malformed = json.loads(canonical_json(compact))
+                malformed[component_id]["values_data"] = values_data
+
+                with self.assertRaisesRegex(ValueError, expected):
+                    expand_component_distributions(malformed)
+
+    def test_expansion_rejects_count_mismatch_unknown_fields_and_non_list_values(
+        self,
+    ) -> None:
+        compact = compact_forecast_outputs(self.outputs)[
+            "component_distributions"
+        ]
+        component_id = next(iter(compact))
+
+        mismatched_count = json.loads(canonical_json(compact))
+        mismatched_count[component_id]["values_count"] += 1
+        unknown_field = json.loads(canonical_json(compact))
+        unknown_field[component_id]["unexpected"] = True
+        historical_unknown_field = json.loads(
+            canonical_json(self.outputs["component_distributions"])
+        )
+        historical_unknown_field[component_id]["unexpected"] = True
+        non_list_values = json.loads(canonical_json(compact))
+        non_list_values[component_id]["values_data"] = base64.b64encode(
+            zlib.compress(b'{"not":"a list"}')
+        ).decode("ascii")
+
+        for expected, malformed in (
+            ("values_count", mismatched_count),
+            ("unknown", unknown_field),
+            ("unknown", historical_unknown_field),
+            ("list", non_list_values),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ValueError, expected):
+                    expand_component_distributions(malformed)
+
+    def test_expansion_returns_historical_values_payload_unchanged(self) -> None:
+        historical = self.outputs["component_distributions"]
+
+        expanded = expand_component_distributions(historical)
+
+        self.assertIs(expanded, historical)
 
 
 def principal_paths() -> tuple[PrincipalPathBinding, ...]:
