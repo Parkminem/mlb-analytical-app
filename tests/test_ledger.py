@@ -716,6 +716,70 @@ class LedgerStoreTests(unittest.TestCase):
             ):
                 tuple(LedgerStore(path).iter_records())
 
+    def test_multiple_active_link_roots_are_corruption_on_strict_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            capture = store.append_capture("capture:1", capture_command())
+            forecast = store.append_forecast(forecast_command())
+            store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            logical_payload = {
+                "capture_id": capture.capture_id,
+                "forecast_run_id": forecast.forecast_run_id,
+            }
+            append_forged_record(
+                path,
+                "capture_forecast_link",
+                "capture-forecast:legacy-second-root",
+                logical_payload,
+            )
+
+            with self.assertRaisesRegex(
+                LedgerCorruptionError,
+                "one active|multiple active",
+            ):
+                tuple(LedgerStore(path).iter_records())
+
+    def test_link_correction_chain_remains_valid_on_strict_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(path)
+            capture = store.append_capture("capture:1", capture_command())
+            forecast = store.append_forecast(forecast_command())
+            original = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            logical_payload = {
+                "capture_id": capture.capture_id,
+                "forecast_run_id": forecast.forecast_run_id,
+                "shadow_comparison": {"notes": ["corrected"]},
+                "supersedes_link_record_id": original.envelope.record_id,
+            }
+            append_forged_record(
+                path,
+                "capture_forecast_link",
+                "capture-forecast:legacy-correction",
+                logical_payload,
+                shadow_comparison={"notes": ["corrected"]},
+                supersedes_link_record_id=original.envelope.record_id,
+            )
+
+            links = tuple(
+                LedgerStore(path).iter_records("capture_forecast_link")
+            )
+
+            self.assertEqual(len(links), 2)
+            self.assertEqual(
+                links[-1].supersedes_link_record_id,
+                original.envelope.record_id,
+            )
+
     def test_capture_supersession_requires_existing_same_game_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LedgerStore(Path(directory) / "ledger.jsonl")

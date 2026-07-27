@@ -1135,6 +1135,20 @@ class LedgerStore:
                 )
             elif isinstance(record, ReviewRecord):
                 review_ids.add(record.review_id)
+        active_links_by_relationship: dict[
+            tuple[str, str],
+            CaptureForecastLink,
+        ] = {}
+        for record_id, link in links_by_record_id.items():
+            if record_id in link_supersession_targets:
+                continue
+            relationship = (link.capture_id, link.forecast_run_id)
+            if relationship in active_links_by_relationship:
+                raise LedgerCorruptionError(
+                    "capture-forecast relationship must have exactly one "
+                    "active link"
+                )
+            active_links_by_relationship[relationship] = link
         return tuple(records)
 
     def _append(

@@ -1,7 +1,7 @@
 """One-way comparison of legacy decisions with shadow forecast outputs."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 import hashlib
 import json
 import math
@@ -41,6 +41,7 @@ from analysis.forecasting.inputs import (
 from analysis.forecasting.market import (
     MarketEvaluation,
     OutcomeProbabilities,
+    evaluate_market_from_score_distributions,
     market_is_push_capable,
 )
 from analysis.forecasting.simulation import (
@@ -1284,6 +1285,77 @@ def deserialize_forecast_context(
     )
 
 
+def validate_frozen_market_output_binding(
+    context: FrozenForecastContext,
+    *,
+    away_team: str | None = None,
+    home_team: str | None = None,
+) -> None:
+    """Bind stored market outputs to the exact frozen score distributions."""
+
+    if not isinstance(context, FrozenForecastContext):
+        raise TypeError("context must be FrozenForecastContext")
+    if (away_team is None) != (home_team is None):
+        raise ValueError("away_team and home_team must be provided together")
+    score_component_ids = (
+        "away_f5_runs",
+        "home_f5_runs",
+        "away_full_runs",
+        "home_full_runs",
+    )
+    try:
+        score_distributions = {
+            component_id: context.component_distributions[
+                component_id
+            ].values
+            for component_id in score_component_ids
+        }
+    except KeyError as error:
+        raise ValueError(
+            "frozen score distributions are incomplete"
+        ) from error
+    reconstructed_markets = {}
+    for market_key, market_input in context.market_inputs.items():
+        resolved_market_input = market_input
+        if (
+            market_input.market_type
+            in (MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5)
+            and market_input.selected_side not in {"away", "home"}
+        ):
+            if away_team is None or home_team is None:
+                raise ValueError(
+                    "captured team aliases require away_team and home_team"
+                )
+            selected_side = {
+                away_team: "away",
+                home_team: "home",
+            }.get(market_input.selected_side)
+            if selected_side is None:
+                raise ValueError(
+                    "side market selected_side is not a captured team alias"
+                )
+            resolved_market_input = replace(
+                market_input,
+                selected_side=selected_side,
+            )
+        reconstructed = evaluate_market_from_score_distributions(
+            resolved_market_input,
+            **score_distributions,
+        )
+        reconstructed_markets[market_key] = replace(
+            reconstructed,
+            semantic_fingerprint=(
+                context.markets[market_key].semantic_fingerprint
+            ),
+        )
+    if canonical_json(reconstructed_markets) != canonical_json(
+        context.markets
+    ):
+        raise ValueError(
+            "frozen market outputs must match score distributions"
+        )
+
+
 def _evaluation_fingerprint(market_key: str, value: object) -> str:
     fingerprint = (
         value.get("semantic_fingerprint")
@@ -1855,5 +1927,6 @@ __all__ = (
     "deserialize_forecast_context",
     "deserialize_shadow_comparison",
     "record_shadow_run",
+    "validate_frozen_market_output_binding",
     "validate_shadow_forecast_context",
 )

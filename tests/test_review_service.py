@@ -21,6 +21,7 @@ from analysis.forecasting.market import (
     market_semantic_fingerprint,
     price_market,
 )
+from analysis.forecasting.simulation import _summarize
 from analysis.ledger.forecast_codec import (
     compact_forecast_outputs,
     expand_component_distributions,
@@ -1482,6 +1483,47 @@ class ReviewServiceTests(unittest.TestCase):
                 fixture.result.envelope.record_id,
                 MARKET_KEY,
             )
+
+    def test_review_rejects_distribution_market_output_mismatch_before_append(
+        self,
+    ):
+        def change_score_distribution_without_changing_market(outputs):
+            away = outputs["component_distributions"]["away_full_runs"]
+            home_values = outputs["component_distributions"][
+                "home_full_runs"
+            ]["values"]
+            for index, (away_runs, home_runs) in enumerate(
+                zip(away["values"], home_values)
+            ):
+                if away_runs <= home_runs:
+                    away["values"][index] = home_runs + 1
+                    break
+            else:
+                self.fail("fixture requires one non-away-win simulation")
+            summary = json.loads(
+                canonical_json(_summarize(tuple(away["values"])))
+            )
+            away["summary"] = summary
+            outputs["intervals"]["away_full_runs"] = summary
+
+        fixture = self.fixture(
+            mutate_outputs=(
+                change_score_distribution_without_changing_market
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "market outputs|score distributions",
+        ):
+            build_and_record_review(
+                self.store,
+                fixture.link.envelope.record_id,
+                fixture.result.envelope.record_id,
+                MARKET_KEY,
+            )
+
+        self.assertEqual(tuple(self.store.iter_records("review")), ())
 
     def test_non_push_market_rejects_frozen_push_probability(self):
         def add_consistent_ml_push_probability(outputs):

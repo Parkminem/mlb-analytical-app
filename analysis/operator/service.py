@@ -17,9 +17,6 @@ from analysis.forecasting.identity import (
     build_forecast_run_id_for_input,
     canonical_json,
 )
-from analysis.forecasting.market import (
-    evaluate_market_from_score_distributions,
-)
 from analysis.forecasting.validation import (
     PregameRelationshipError,
     PregameTimingError,
@@ -57,6 +54,7 @@ from analysis.shadow import (
     deserialize_forecast_context,
     deserialize_shadow_comparison,
     record_shadow_run,
+    validate_frozen_market_output_binding,
     validate_shadow_forecast_context,
 )
 
@@ -414,6 +412,11 @@ def _forecast_outputs_match(
             away_team=game.identity.away_team,
             home_team=game.identity.home_team,
         )
+        validate_frozen_market_output_binding(
+            context,
+            away_team=game.identity.away_team,
+            home_team=game.identity.home_team,
+        )
         comparison = deserialize_shadow_comparison(
             linked_shadow_comparison(link, forecast)
         )
@@ -425,24 +428,6 @@ def _forecast_outputs_match(
             away_team=game.identity.away_team,
             home_team=game.identity.home_team,
         )
-        score_distributions = {
-            component_id: context.component_distributions[
-                component_id
-            ].values
-            for component_id in (
-                "away_f5_runs",
-                "home_f5_runs",
-                "away_full_runs",
-                "home_full_runs",
-            )
-        }
-        reconstructed_markets = {
-            market_key: evaluate_market_from_score_distributions(
-                market_input,
-                **score_distributions,
-            )
-            for market_key, market_input in context.market_inputs.items()
-        }
     except (TypeError, ValueError):
         return False
     return (
@@ -454,8 +439,6 @@ def _forecast_outputs_match(
         and forecast.simulation_config_hash
         == _simulation_config_hash(context.simulation_config)
         and context.market_inputs == expected_market_inputs
-        and canonical_json(reconstructed_markets)
-        == canonical_json(context.markets)
         and comparison.forecast_run_id == forecast_run_id
         and canonical_json(
             canonical_legacy_decision_payload(comparison.legacy)

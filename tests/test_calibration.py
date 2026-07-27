@@ -1526,6 +1526,83 @@ class CalibrationSelectionTests(unittest.TestCase):
             },
         )
 
+    def test_corrected_link_score_drives_priority_grouping(self):
+        game_pk = 920100
+        capture, forecast, original_link = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="corrected-priority-run",
+            id_suffix="corrected-priority",
+            legacy_score=72,
+        )
+        corrected_outputs = dict(forecast.outputs)
+        corrected_outputs["shadow_comparison"] = {
+            "market_comparisons": [
+                {
+                    "market_key": market_key(game_pk),
+                    "legacy_score": 86,
+                }
+            ]
+        }
+        corrected = self.store.append_shadow_run_atomic(
+            f"capture:{game_pk}:corrected-priority",
+            CaptureCommand(
+                game_pk=capture.game_pk,
+                captured_at=capture.captured_at,
+                first_pitch=capture.first_pitch,
+                lineup_state=capture.lineup_state,
+                out_of_sample_eligible=capture.out_of_sample_eligible,
+                normalized_input_hash=capture.normalized_input_hash,
+                payload=capture.payload,
+            ),
+            ForecastCommand(
+                forecast_run_id=forecast.forecast_run_id,
+                model_version=forecast.model_version,
+                simulation_config_hash=forecast.simulation_config_hash,
+                normalized_input_hash=forecast.normalized_input_hash,
+                outputs=corrected_outputs,
+            ),
+            capture.capture_id,
+        )
+        self.assertEqual(
+            corrected.link.supersedes_link_record_id,
+            original_link.envelope.record_id,
+        )
+        self._complete_reviews(
+            game_pk,
+            ((capture, forecast, corrected.link),),
+        )
+
+        rows = select_primary_rows(self.store)
+        report = build_calibration_report(rows)
+
+        self.assertEqual(rows[0].legacy_priority_score, 86)
+        priority_group = next(
+            group
+            for group in report.groups
+            if dict(group.dimensions)["priority_score_bucket"] == "85-100"
+        )
+        self.assertEqual(priority_group.metrics.sample_size, 1)
+
+    def test_uncorrected_link_keeps_forecast_priority_score(self):
+        game_pk = 920101
+        context = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="uncorrected-priority-run",
+            id_suffix="uncorrected-priority",
+            legacy_score=72,
+        )
+        self._complete_reviews(game_pk, (context,))
+
+        rows = select_primary_rows(self.store)
+
+        self.assertEqual(rows[0].legacy_priority_score, 72)
+
     def test_unchanged_repeated_capture_counts_once_after_primary_selection(self):
         first = append_capture_link(
             self.store,

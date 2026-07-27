@@ -15,6 +15,7 @@ from analysis.ledger.records import (
     MarketObservationRecord,
     OfficialResultRecord,
     ReviewRecord,
+    linked_shadow_comparison,
 )
 from analysis.ledger.store import LedgerCorruptionError
 
@@ -1212,13 +1213,16 @@ def _legacy_priority_score(
     outputs: Mapping[str, object],
     market: Mapping[str, object],
     market_key: str,
+    linked_comparison: object,
 ) -> object:
-    if "legacy_priority_score" in market:
-        return market["legacy_priority_score"]
     comparison_roots: list[Mapping[str, object]] = []
+    if linked_comparison is not None:
+        comparison_roots.append(
+            _require_mapping(linked_comparison, "linked shadow comparison")
+        )
     for field_name in ("shadow_comparison", "comparison", "shadow"):
         value = outputs.get(field_name)
-        if value is not None:
+        if value is not None and value is not linked_comparison:
             comparison_roots.append(_require_mapping(value, field_name))
     if "market_comparisons" in outputs:
         comparison_roots.append(outputs)
@@ -1246,6 +1250,8 @@ def _legacy_priority_score(
                 return comparison["legacy_score"]
             if "legacy_priority_score" in comparison:
                 return comparison["legacy_priority_score"]
+    if "legacy_priority_score" in market:
+        return market["legacy_priority_score"]
     return None
 
 
@@ -1420,6 +1426,7 @@ def _no_vig_probability(
 def _row_for_review(
     capture: CaptureRecord,
     forecast,
+    link: CaptureForecastLink,
     review: ReviewRecord,
     ledger_index: _CalibrationLedgerIndex,
 ) -> CalibrationRow:
@@ -1482,6 +1489,7 @@ def _row_for_review(
             outputs,
             forecast_market,
             review.market_key,
+            linked_shadow_comparison(link, forecast),
         ),
         p_win=p_win,
         p_push=p_push,
@@ -1552,6 +1560,7 @@ def select_primary_rows(
                 _row_for_review(
                     capture,
                     forecast,
+                    link,
                     review,
                     ledger_index,
                 )

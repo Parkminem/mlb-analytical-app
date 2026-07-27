@@ -308,12 +308,18 @@ def _exact_shadow_comparison(
     from analysis.shadow import (
         FrozenForecastContext,
         deserialize_shadow_comparison,
+        validate_frozen_market_output_binding,
         validate_shadow_forecast_context,
     )
 
     if not isinstance(forecast_context, FrozenForecastContext):
         raise TypeError("forecast_context must be FrozenForecastContext")
 
+    validate_frozen_market_output_binding(
+        forecast_context,
+        away_team=away_team,
+        home_team=home_team,
+    )
     shadow = deserialize_shadow_comparison(comparison_payload)
     if shadow.forecast_run_id != forecast_run_id:
         raise ValueError(
