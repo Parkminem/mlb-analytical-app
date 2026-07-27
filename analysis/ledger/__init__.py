@@ -1,5 +1,12 @@
 """Public append-only forecast ledger contract."""
 
+from .checkpoint import (
+    CheckpointError,
+    IndexedRecord,
+    LedgerCheckpoint,
+    LedgerFingerprint,
+    build_checkpoint,
+)
 from .records import (
     CaptureCommand,
     CaptureForecastLink,
@@ -28,11 +35,15 @@ __all__ = (
     "CaptureCommand",
     "CaptureForecastLink",
     "CaptureRecord",
+    "CheckpointError",
     "ForecastCommand",
     "ForecastRecord",
     "IdempotencyConflict",
+    "IndexedRecord",
     "LedgerActiveCaptureHeadChangedError",
     "LedgerCorruptionError",
+    "LedgerCheckpoint",
+    "LedgerFingerprint",
     "LedgerHeadChangedError",
     "LedgerMarketHeadChangedError",
     "LedgerReferenceError",
@@ -44,4 +55,5 @@ __all__ = (
     "RecordEnvelope",
     "ReviewCommand",
     "ReviewRecord",
+    "build_checkpoint",
 )

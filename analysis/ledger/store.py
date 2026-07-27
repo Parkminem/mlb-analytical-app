@@ -15,6 +15,14 @@ import weakref
 
 from analysis.forecasting.identity import canonical_json
 
+from .checkpoint import (
+    CheckpointError,
+    LedgerCheckpoint,
+    LedgerFingerprint,
+    build_checkpoint_from_descriptor,
+    checkpoint_path_for,
+    ledger_state,
+)
 from .forecast_codec import expand_component_distributions
 from .records import (
     CaptureCommand,
@@ -636,6 +644,7 @@ class LedgerStore:
         self.path = Path(path).resolve(strict=False)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+        self.checkpoint_path = checkpoint_path_for(self.path)
         self._parent_path = self.path.parent
         self._ledger_name = self.path.name
         self._lock_name = self.lock_path.name
@@ -1770,6 +1779,95 @@ class LedgerStore:
         if kind is None:
             return iter(records)
         return (record for record in records if record.envelope.record_kind == kind)
+
+    def pregame_checkpoint(self) -> LedgerCheckpoint:
+        """Load or strictly rebuild disposable pregame acceleration state."""
+
+        lock_descriptor = self._open_no_follow(
+            self._lock_name,
+            os.O_RDWR,
+            "ledger lock",
+        )
+        with os.fdopen(lock_descriptor, "r+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            try:
+                self._validate_open_descriptor(
+                    lock_file.fileno(),
+                    self._lock_name,
+                    "ledger lock",
+                )
+                ledger_flags = os.O_RDONLY
+                if self._ledger_identity is None:
+                    ledger_flags |= os.O_CREAT
+                descriptor = self._open_no_follow(
+                    self._ledger_name,
+                    ledger_flags,
+                    "ledger",
+                )
+                ledger_locked = False
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_SH)
+                    ledger_locked = True
+                    self._validate_open_descriptor(
+                        descriptor,
+                        self._ledger_name,
+                        "ledger",
+                    )
+                    try:
+                        ledger_stat, ledger_sha256 = ledger_state(descriptor)
+                    except CheckpointError as error:
+                        raise LedgerCorruptionError(str(error)) from error
+                    try:
+                        checkpoint = LedgerCheckpoint.load(
+                            self.checkpoint_path,
+                            ledger_stat,
+                            ledger_sha256,
+                        )
+                    except CheckpointError:
+                        records = self._read_records(descriptor)
+                        try:
+                            checkpoint = build_checkpoint_from_descriptor(
+                                self.path,
+                                descriptor,
+                                records,
+                            )
+                            final_stat, final_sha256 = ledger_state(descriptor)
+                        except CheckpointError as error:
+                            raise LedgerCorruptionError(str(error)) from error
+                        if checkpoint.fingerprint != LedgerFingerprint.from_stat(
+                            final_stat,
+                            final_sha256,
+                        ):
+                            raise LedgerCorruptionError(
+                                "ledger changed during checkpoint rebuild"
+                            )
+                    self._validate_open_descriptor(
+                        descriptor,
+                        self._ledger_name,
+                        "ledger",
+                    )
+                    return_stat = os.fstat(descriptor)
+                    if (
+                        return_stat.st_dev,
+                        return_stat.st_ino,
+                        return_stat.st_size,
+                        return_stat.st_mtime_ns,
+                    ) != (
+                        checkpoint.fingerprint.device,
+                        checkpoint.fingerprint.inode,
+                        checkpoint.fingerprint.size,
+                        checkpoint.fingerprint.mtime_ns,
+                    ):
+                        raise LedgerCorruptionError(
+                            "ledger changed during checkpoint validation"
+                        )
+                    return checkpoint
+                finally:
+                    if ledger_locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 __all__ = (
