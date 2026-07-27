@@ -1822,6 +1822,7 @@ class LedgerStore:
                             self.checkpoint_path,
                             ledger_stat,
                             ledger_sha256,
+                            ledger_descriptor=descriptor,
                         )
                     except CheckpointError:
                         records = self._read_records(descriptor)
@@ -1841,6 +1842,11 @@ class LedgerStore:
                             raise LedgerCorruptionError(
                                 "ledger changed during checkpoint rebuild"
                             )
+                    except OSError as error:
+                        raise LedgerCorruptionError(
+                            "authoritative ledger could not be read during "
+                            "checkpoint validation"
+                        ) from error
                     self._validate_open_descriptor(
                         descriptor,
                         self._ledger_name,

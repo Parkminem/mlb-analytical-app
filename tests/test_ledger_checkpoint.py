@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -80,6 +80,22 @@ def write_checkpoint_json(
     )
 
 
+def mutate_capture_game_pk(value: dict[str, object]) -> None:
+    value["records"][0]["metadata"]["game_pk"] = 900002
+
+
+def mutate_unique_idempotency_key(value: dict[str, object]) -> None:
+    value["records"][0]["idempotency_key"] = "capture:forged"
+
+
+def mutate_contiguous_offsets(value: dict[str, object]) -> None:
+    first = value["records"][0]
+    second = value["records"][1]
+    first["byte_length"] += 1
+    second["byte_offset"] += 1
+    second["byte_length"] -= 1
+
+
 def test_checkpoint_builds_from_strictly_validated_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -128,6 +144,48 @@ def test_warm_checkpoint_does_not_call_read_records(
     warm = LedgerStore(store.path).pregame_checkpoint()
 
     assert warm.record_count == len(expected_records)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        mutate_capture_game_pk,
+        mutate_unique_idempotency_key,
+        mutate_contiguous_offsets,
+    ),
+    ids=("capture-game-pk", "idempotency-key", "contiguous-offsets"),
+)
+def test_coherently_tampered_checkpoint_rebuilds_from_authoritative_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+) -> None:
+    store, expected_records = seeded_ledger_store(tmp_path)
+    checkpoint = store.pregame_checkpoint()
+    value = read_checkpoint_json(checkpoint)
+    mutate(value)
+    write_checkpoint_json(checkpoint, value)
+    real_read_records = LedgerStore._read_records
+    calls = 0
+
+    def read_records_spy(
+        instance: LedgerStore,
+        descriptor: int | None = None,
+    ) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        return real_read_records(instance, descriptor)
+
+    monkeypatch.setattr(LedgerStore, "_read_records", read_records_spy)
+
+    rebuilt = LedgerStore(store.path).pregame_checkpoint()
+
+    assert calls == 1
+    assert rebuilt.records[0].game_pk == expected_records[0].game_pk
+    assert rebuilt.records[0].idempotency_key == "capture:seed"
+    assert rebuilt.records[0].byte_length == len(
+        store.path.read_bytes().splitlines(keepends=True)[0]
+    )
 
 
 def test_changed_ledger_rebuilds_checkpoint(
@@ -358,6 +416,100 @@ def test_deleted_checkpoint_is_rebuilt(
     assert rebuilt.path.is_file()
 
 
+def test_deeply_nested_checkpoint_json_is_disposable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, expected_records = seeded_ledger_store(tmp_path)
+    checkpoint = store.pregame_checkpoint()
+    checkpoint.path.write_text("[[[0]]]", encoding="utf-8")
+    real_loads = json.loads
+
+    def recurse_on_checkpoint(
+        value: str | bytes | bytearray,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if value == "[[[0]]]":
+            raise RecursionError("injected deeply nested checkpoint")
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "analysis.ledger.checkpoint.json.loads",
+        recurse_on_checkpoint,
+    )
+
+    rebuilt = LedgerStore(store.path).pregame_checkpoint()
+
+    assert rebuilt.record_count == len(expected_records)
+    assert rebuilt.path.is_file()
+
+
+def test_checkpoint_removal_during_post_read_validation_rebuilds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, expected_records = seeded_ledger_store(tmp_path)
+    checkpoint = store.pregame_checkpoint()
+    real_stat = os.stat
+    checkpoint_stat_calls = 0
+
+    def remove_before_post_read_stat(
+        path: str | os.PathLike[str],
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal checkpoint_stat_calls
+        if (
+            path == checkpoint.path.name
+            and kwargs.get("dir_fd") is not None
+        ):
+            checkpoint_stat_calls += 1
+            if checkpoint_stat_calls == 2:
+                os.unlink(path, dir_fd=kwargs["dir_fd"])
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "analysis.ledger.checkpoint.os.stat",
+        remove_before_post_read_stat,
+    )
+
+    rebuilt = LedgerStore(store.path).pregame_checkpoint()
+
+    assert checkpoint_stat_calls >= 2
+    assert rebuilt.record_count == len(expected_records)
+    assert rebuilt.path.is_file()
+
+
+def test_authoritative_row_read_failure_is_ledger_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = seeded_ledger_store(tmp_path)
+    store.pregame_checkpoint()
+    real_pread = os.pread
+    calls = 0
+
+    def fail_first_row_read(
+        descriptor: int,
+        length: int,
+        offset: int,
+    ) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("injected authoritative row read failure")
+        return real_pread(descriptor, length, offset)
+
+    monkeypatch.setattr(
+        "analysis.ledger.checkpoint.os.pread",
+        fail_first_row_read,
+    )
+
+    with pytest.raises(LedgerCorruptionError, match="authoritative ledger"):
+        LedgerStore(store.path).pregame_checkpoint()
+
+
 def test_invalid_ledger_never_uses_or_replaces_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -385,8 +537,15 @@ def test_warm_load_rejects_ledger_mutation_after_fingerprinting(
         path: Path,
         ledger_stat: os.stat_result,
         ledger_sha256: str,
+        *,
+        ledger_descriptor: int | None = None,
     ) -> LedgerCheckpoint:
-        checkpoint = real_load(path, ledger_stat, ledger_sha256)
+        checkpoint = real_load(
+            path,
+            ledger_stat,
+            ledger_sha256,
+            ledger_descriptor=ledger_descriptor,
+        )
         store.path.write_bytes(store.path.read_bytes() + b" ")
         return checkpoint
 
@@ -411,6 +570,19 @@ def test_build_rejects_raw_rows_that_disagree_with_validated_records(
 
     with pytest.raises(CheckpointError, match="validated record"):
         build_checkpoint(store.path, expected_records)
+
+
+def test_build_rejects_fabricated_record_with_matching_envelope(
+    tmp_path: Path,
+) -> None:
+    store, expected_records = seeded_ledger_store(tmp_path)
+    fabricated = (
+        replace(expected_records[0], game_pk=900002),
+        *expected_records[1:],
+    )
+
+    with pytest.raises(CheckpointError, match="authoritative ledger"):
+        build_checkpoint(store.path, fabricated)
 
 
 def test_checkpoint_indexes_relationships_and_values_are_frozen(

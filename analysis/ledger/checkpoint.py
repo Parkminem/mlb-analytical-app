@@ -52,6 +52,18 @@ _FORECAST_METADATA_KEYS = frozenset(
 )
 _LINK_METADATA_KEYS = frozenset(("capture_id", "forecast_run_id"))
 _EMPTY_METADATA_KEYS = frozenset()
+_ROW_INDEX_FIELDS = frozenset(
+    (
+        "capture_id",
+        "captured_at",
+        "envelope",
+        "first_pitch",
+        "forecast_run_id",
+        "game_pk",
+        "normalized_input_hash",
+        "supersedes_capture_id",
+    )
+)
 
 LedgerRecord = (
     CaptureRecord
@@ -470,6 +482,8 @@ class LedgerCheckpoint:
         path: Path,
         ledger_stat: os.stat_result,
         ledger_sha256: str,
+        *,
+        ledger_descriptor: int | None = None,
     ) -> "LedgerCheckpoint":
         """Load a checkpoint only when every ledger fingerprint field matches."""
 
@@ -481,9 +495,14 @@ class LedgerCheckpoint:
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=_reject_json_constant,
             )
-        except (UnicodeError, json.JSONDecodeError) as error:
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise CheckpointError("checkpoint is not valid UTF-8 JSON") from error
-        checkpoint = _checkpoint_from_json(checkpoint_path, value)
+        try:
+            checkpoint = _checkpoint_from_json(checkpoint_path, value)
+        except RecursionError as error:
+            raise CheckpointError(
+                "checkpoint JSON nesting is too deep"
+            ) from error
         expected_fingerprint = LedgerFingerprint.from_stat(
             ledger_stat,
             ledger_sha256,
@@ -492,6 +511,14 @@ class LedgerCheckpoint:
             raise CheckpointError(
                 "checkpoint fingerprint differs from the complete ledger "
                 "fingerprint"
+            )
+        if ledger_descriptor is not None:
+            _validate_checkpoint_rows(checkpoint, ledger_descriptor)
+        else:
+            _validate_checkpoint_rows_from_path(
+                checkpoint,
+                ledger_stat,
+                ledger_sha256,
             )
         return checkpoint
 
@@ -541,29 +568,50 @@ def build_checkpoint(
 ) -> LedgerCheckpoint:
     """Build and atomically publish a checkpoint from validated typed records."""
 
+    from .store import LedgerStore
+
     path = _absolute_path(ledger_path)
-    parent_descriptor = _open_parent_directory(path.parent)
-    try:
-        ledger_descriptor = _open_regular_at(
-            parent_descriptor,
-            path.name,
-            "ledger",
-        )
-        ledger_locked = False
+    store = LedgerStore(path)
+    supplied_records = tuple(records)
+    lock_descriptor = store._open_no_follow(
+        store._lock_name,
+        os.O_RDWR,
+        "ledger lock",
+    )
+    with os.fdopen(lock_descriptor, "r+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
         try:
-            fcntl.flock(ledger_descriptor, fcntl.LOCK_SH)
-            ledger_locked = True
-            return build_checkpoint_from_descriptor(
-                path,
-                ledger_descriptor,
-                records,
+            store._validate_open_descriptor(
+                lock_file.fileno(),
+                store._lock_name,
+                "ledger lock",
             )
+            ledger_descriptor = store._open_no_follow(
+                store._ledger_name,
+                os.O_RDONLY,
+                "ledger",
+            )
+            ledger_locked = False
+            try:
+                fcntl.flock(ledger_descriptor, fcntl.LOCK_SH)
+                ledger_locked = True
+                authoritative_records = store._read_records(ledger_descriptor)
+                if supplied_records != authoritative_records:
+                    raise CheckpointError(
+                        "supplied validated records differ from the "
+                        "authoritative ledger"
+                    )
+                return build_checkpoint_from_descriptor(
+                    path,
+                    ledger_descriptor,
+                    authoritative_records,
+                )
+            finally:
+                if ledger_locked:
+                    fcntl.flock(ledger_descriptor, fcntl.LOCK_UN)
+                os.close(ledger_descriptor)
         finally:
-            if ledger_locked:
-                fcntl.flock(ledger_descriptor, fcntl.LOCK_UN)
-            os.close(ledger_descriptor)
-    finally:
-        os.close(parent_descriptor)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def build_checkpoint_from_descriptor(
@@ -621,6 +669,283 @@ def _read_descriptor(descriptor: int, expected_size: int) -> bytes:
     if os.pread(descriptor, 1, expected_size):
         raise CheckpointError("ledger changed while scanning raw offsets")
     return b"".join(chunks)
+
+
+def _validate_checkpoint_rows_from_path(
+    checkpoint: LedgerCheckpoint,
+    ledger_stat: os.stat_result,
+    ledger_sha256: str,
+) -> None:
+    checkpoint_name = checkpoint.path.name
+    if not checkpoint_name.endswith(_CHECKPOINT_SUFFIX):
+        raise CheckpointError("checkpoint path does not identify its ledger")
+    ledger_name = checkpoint_name[: -len(_CHECKPOINT_SUFFIX)]
+    if not ledger_name:
+        raise CheckpointError("checkpoint path does not identify its ledger")
+    parent_descriptor = _open_parent_directory(checkpoint.path.parent)
+    try:
+        ledger_descriptor = _open_regular_at(
+            parent_descriptor,
+            ledger_name,
+            "ledger",
+        )
+        ledger_locked = False
+        try:
+            fcntl.flock(ledger_descriptor, fcntl.LOCK_SH)
+            ledger_locked = True
+            actual_stat, actual_sha256 = ledger_state(ledger_descriptor)
+            if LedgerFingerprint.from_stat(
+                actual_stat,
+                actual_sha256,
+            ) != LedgerFingerprint.from_stat(ledger_stat, ledger_sha256):
+                raise CheckpointError(
+                    "ledger changed while validating checkpoint rows"
+                )
+            _validate_checkpoint_rows(checkpoint, ledger_descriptor)
+        finally:
+            if ledger_locked:
+                fcntl.flock(ledger_descriptor, fcntl.LOCK_UN)
+            os.close(ledger_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _validate_checkpoint_rows(
+    checkpoint: LedgerCheckpoint,
+    ledger_descriptor: int,
+) -> None:
+    for line_number, indexed in enumerate(checkpoint.records, start=1):
+        raw_line = os.pread(
+            ledger_descriptor,
+            indexed.byte_length,
+            indexed.byte_offset,
+        )
+        if (
+            len(raw_line) != indexed.byte_length
+            or not raw_line.endswith(b"\n")
+        ):
+            raise CheckpointError(
+                f"checkpoint row {line_number} does not resolve to one ledger row"
+            )
+        fields = _extract_index_fields(raw_line[:-1], line_number)
+        _validate_indexed_row(indexed, fields, line_number)
+
+
+def _extract_index_fields(
+    raw_row: bytes,
+    line_number: int,
+) -> dict[str, object]:
+    try:
+        text = raw_row.decode("utf-8")
+        decoder = json.JSONDecoder(
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+        index = _skip_json_whitespace(text, 0)
+        if index >= len(text) or text[index] != "{":
+            raise CheckpointError(
+                f"checkpoint row {line_number} must be a JSON object"
+            )
+        index += 1
+        fields: dict[str, object] = {}
+        seen_keys: set[str] = set()
+        while True:
+            index = _skip_json_whitespace(text, index)
+            if index >= len(text):
+                raise CheckpointError(
+                    f"checkpoint row {line_number} is incomplete JSON"
+                )
+            if text[index] == "}":
+                index += 1
+                break
+            key, index = decoder.raw_decode(text, index)
+            if not isinstance(key, str):
+                raise CheckpointError(
+                    f"checkpoint row {line_number} has a non-string key"
+                )
+            if key in seen_keys:
+                raise CheckpointError(
+                    f"checkpoint row {line_number} has duplicate key {key}"
+                )
+            seen_keys.add(key)
+            index = _skip_json_whitespace(text, index)
+            if index >= len(text) or text[index] != ":":
+                raise CheckpointError(
+                    f"checkpoint row {line_number} is missing a key separator"
+                )
+            index = _skip_json_whitespace(text, index + 1)
+            if key in _ROW_INDEX_FIELDS:
+                fields[key], index = decoder.raw_decode(text, index)
+            else:
+                index = _skip_json_value(text, index, line_number)
+            index = _skip_json_whitespace(text, index)
+            if index >= len(text):
+                raise CheckpointError(
+                    f"checkpoint row {line_number} is incomplete JSON"
+                )
+            if text[index] == ",":
+                index += 1
+                continue
+            if text[index] == "}":
+                index += 1
+                break
+            raise CheckpointError(
+                f"checkpoint row {line_number} has invalid JSON framing"
+            )
+        if _skip_json_whitespace(text, index) != len(text):
+            raise CheckpointError(
+                f"checkpoint row {line_number} has trailing JSON content"
+            )
+        return fields
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise CheckpointError(
+            f"checkpoint row {line_number} cannot be indexed safely"
+        ) from error
+
+
+def _skip_json_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _skip_json_value(text: str, index: int, line_number: int) -> int:
+    if index >= len(text):
+        raise CheckpointError(
+            f"checkpoint row {line_number} is missing a JSON value"
+        )
+    if text[index] not in "[{":
+        decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
+        _, end = decoder.raw_decode(text, index)
+        return end
+
+    closing_stack = ["]" if text[index] == "[" else "}"]
+    index += 1
+    while closing_stack:
+        if index >= len(text):
+            raise CheckpointError(
+                f"checkpoint row {line_number} has an incomplete JSON value"
+            )
+        character = text[index]
+        if character == '"':
+            index = _skip_json_string(text, index, line_number)
+            continue
+        if character == "[":
+            closing_stack.append("]")
+        elif character == "{":
+            closing_stack.append("}")
+        elif character in "]}":
+            if character != closing_stack[-1]:
+                raise CheckpointError(
+                    f"checkpoint row {line_number} has mismatched JSON framing"
+                )
+            closing_stack.pop()
+        index += 1
+    return index
+
+
+def _skip_json_string(text: str, index: int, line_number: int) -> int:
+    index += 1
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            return index + 1
+        if character == "\\":
+            index += 2
+        else:
+            index += 1
+    raise CheckpointError(
+        f"checkpoint row {line_number} has an incomplete JSON string"
+    )
+
+
+def _validate_indexed_row(
+    indexed: IndexedRecord,
+    fields: dict[str, object],
+    line_number: int,
+) -> None:
+    envelope = _require_exact_mapping(
+        fields.get("envelope"),
+        frozenset(
+            (
+                "record_id",
+                "record_kind",
+                "idempotency_key",
+                "payload_hash",
+                "appended_at",
+            )
+        ),
+        f"checkpoint row {line_number}.envelope",
+    )
+    actual_envelope = (
+        envelope["record_kind"],
+        envelope["record_id"],
+        envelope["idempotency_key"],
+        envelope["payload_hash"],
+        _parse_datetime(
+            envelope["appended_at"],
+            f"checkpoint row {line_number}.envelope.appended_at",
+        ),
+    )
+    expected_envelope = (
+        indexed.record_kind,
+        indexed.record_id,
+        indexed.idempotency_key,
+        indexed.payload_hash,
+        indexed.appended_at,
+    )
+    if actual_envelope != expected_envelope:
+        raise CheckpointError(
+            f"checkpoint row {line_number} envelope metadata differs from ledger"
+        )
+
+    if indexed.record_kind == "capture":
+        actual_metadata = (
+            fields.get("capture_id"),
+            fields.get("game_pk"),
+            _parse_datetime(
+                fields.get("captured_at"),
+                f"checkpoint row {line_number}.captured_at",
+            ),
+            _parse_datetime(
+                fields.get("first_pitch"),
+                f"checkpoint row {line_number}.first_pitch",
+            ),
+            fields.get("normalized_input_hash"),
+            fields.get("supersedes_capture_id"),
+        )
+        expected_metadata = (
+            indexed.capture_id,
+            indexed.game_pk,
+            indexed.captured_at,
+            indexed.first_pitch,
+            indexed.normalized_input_hash,
+            indexed.supersedes_capture_id,
+        )
+    elif indexed.record_kind == "forecast":
+        actual_metadata = (
+            fields.get("forecast_run_id"),
+            fields.get("normalized_input_hash"),
+        )
+        expected_metadata = (
+            indexed.forecast_run_id,
+            indexed.normalized_input_hash,
+        )
+    elif indexed.record_kind == "capture_forecast_link":
+        actual_metadata = (
+            fields.get("capture_id"),
+            fields.get("forecast_run_id"),
+        )
+        expected_metadata = (
+            indexed.capture_id,
+            indexed.forecast_run_id,
+        )
+    else:
+        return
+    if actual_metadata != expected_metadata:
+        raise CheckpointError(
+            f"checkpoint row {line_number} relationship metadata differs from ledger"
+        )
 
 
 def _index_records(
@@ -981,6 +1306,11 @@ def _open_parent_directory(path: Path) -> int:
             raise CheckpointError(
                 "checkpoint parent changed while being opened"
             )
+    except OSError as error:
+        os.close(descriptor)
+        raise CheckpointError(
+            "checkpoint parent changed while being opened"
+        ) from error
     except Exception:
         os.close(descriptor)
         raise
@@ -1032,6 +1362,9 @@ def _open_regular_at(
             != (path_stat.st_dev, path_stat.st_ino)
         ):
             raise CheckpointError(f"{label} must be one regular file")
+    except OSError as error:
+        os.close(descriptor)
+        raise CheckpointError(f"{label} changed while being opened") from error
     except Exception:
         os.close(descriptor)
         raise
@@ -1047,25 +1380,40 @@ def _read_checkpoint_file(path: Path) -> bytes:
             "checkpoint",
         )
         try:
-            before = os.fstat(descriptor)
-            with os.fdopen(descriptor, "rb") as checkpoint_file:
-                descriptor = -1
-                content = checkpoint_file.read()
-                after = os.fstat(checkpoint_file.fileno())
-            path_stat = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                or (after.st_dev, after.st_ino)
-                != (path_stat.st_dev, path_stat.st_ino)
-            ):
-                raise CheckpointError("checkpoint changed while being read")
-            _validate_parent_directory(path.parent, parent_descriptor)
-            return content
+            try:
+                before = os.fstat(descriptor)
+                with os.fdopen(descriptor, "rb") as checkpoint_file:
+                    descriptor = -1
+                    content = checkpoint_file.read()
+                    after = os.fstat(checkpoint_file.fileno())
+                path_stat = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    )
+                    != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                    )
+                    or (after.st_dev, after.st_ino)
+                    != (path_stat.st_dev, path_stat.st_ino)
+                ):
+                    raise CheckpointError("checkpoint changed while being read")
+                _validate_parent_directory(path.parent, parent_descriptor)
+                return content
+            except OSError as error:
+                raise CheckpointError(
+                    "checkpoint changed while being read"
+                ) from error
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
