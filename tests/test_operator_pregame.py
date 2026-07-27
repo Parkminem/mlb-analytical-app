@@ -601,6 +601,65 @@ def test_inconsistent_frozen_outputs_replay_calls_forecast(
         )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "offense_null",
+        "offense_unknown_field",
+        "pitcher_role",
+        "pitcher_boolean",
+        "bullpen_team",
+        "bullpen_segment_role",
+    ),
+)
+def test_malformed_component_diagnostics_replay_calls_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    ledger_path, bundle_root = _run_paths(tmp_path)
+    bundle = _pregame_bundle("confirmed", _confirmed_game())
+    first = run_confirmed(
+        bundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+    )
+    outputs = json.loads(canonical_json(first.forecast.outputs))
+    diagnostics = outputs["component_diagnostics"]
+
+    if corruption == "offense_null":
+        diagnostics["away_offense"] = None
+    elif corruption == "offense_unknown_field":
+        diagnostics["home_offense"]["unknown_field"] = "not canonical"
+    elif corruption == "pitcher_role":
+        diagnostics["away_pitcher_chain"]["pitchers"][0]["role"] = "closer"
+    elif corruption == "pitcher_boolean":
+        diagnostics["home_pitcher_chain"]["pitchers"][0][
+            "command_risk"
+        ] = "false"
+    elif corruption == "bullpen_team":
+        diagnostics["away_bullpen"]["team"] = _confirmed_game().identity.home_team
+    else:
+        diagnostics["home_bullpen"]["segments"][0]["role"] = "closer"
+
+    _rewrite_forecast_outputs(ledger_path, first.forecast, outputs)
+
+    class ForecastCalled(RuntimeError):
+        pass
+
+    def fail_forecast(*args, **kwargs):
+        raise ForecastCalled(corruption)
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(ForecastCalled, match=corruption):
+        run_confirmed(
+            bundle,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+        )
+
+
 def test_reordered_equivalent_legacy_replay_skips_forecast(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

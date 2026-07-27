@@ -15,11 +15,23 @@ from analysis.forecasting.engine import (
     resolve_forecast_input,
 )
 from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.bullpen import (
+    BullpenForecast,
+    deserialize_bullpen_forecast,
+)
 from analysis.forecasting.identity import (
     build_forecast_run_id,
     canonical_json,
     capture_payload,
     normalized_input_hash,
+)
+from analysis.forecasting.offense import (
+    OffenseForecast,
+    deserialize_offense_forecast,
+)
+from analysis.forecasting.starter import (
+    PitcherChainForecast,
+    deserialize_pitcher_chain_forecast,
 )
 from analysis.forecasting.inputs import (
     MarketType,
@@ -559,6 +571,7 @@ class FrozenForecastContext:
     simulation_count: int
     market_inputs: Mapping[str, SemanticMarketInput]
     markets: Mapping[str, MarketEvaluation]
+    component_diagnostics: Mapping[str, object]
     component_distributions: Mapping[str, ComponentDistribution]
     intervals: Mapping[str, DistributionSummary]
 
@@ -1012,12 +1025,66 @@ def _simulation_config_from_payload(value: object) -> SimulationConfig:
     return config
 
 
-def _diagnostic_component_ids(value: object) -> frozenset[str]:
-    diagnostics = _payload_mapping(
+def _component_diagnostics_from_payload(
+    value: object,
+    *,
+    away_team: str | None,
+    home_team: str | None,
+) -> tuple[Mapping[str, object], frozenset[str]]:
+    payload = _payload_mapping(
         value,
         "forecast outputs component_diagnostics",
         _DIAGNOSTIC_FIELDS,
     )
+    diagnostics: dict[str, object] = {}
+    for side in ("away", "home"):
+        diagnostics[f"{side}_pitcher_chain"] = (
+            deserialize_pitcher_chain_forecast(
+                payload[f"{side}_pitcher_chain"],
+                field_name=f"{side} pitcher-chain diagnostic",
+            )
+        )
+        diagnostics[f"{side}_offense"] = deserialize_offense_forecast(
+            payload[f"{side}_offense"],
+            field_name=f"{side} offense diagnostic",
+        )
+        bullpen = deserialize_bullpen_forecast(
+            payload[f"{side}_bullpen"],
+            field_name=f"{side} bullpen diagnostic",
+        )
+        expected_team = away_team if side == "away" else home_team
+        if expected_team is not None and bullpen.team != expected_team:
+            raise ValueError(
+                f"{side} bullpen diagnostic team must match game identity"
+            )
+        diagnostics[f"{side}_bullpen"] = bullpen
+
+    away_offense = diagnostics["away_offense"]
+    home_offense = diagnostics["home_offense"]
+    away_chain = diagnostics["away_pitcher_chain"]
+    home_chain = diagnostics["home_pitcher_chain"]
+    if (
+        not isinstance(away_offense, OffenseForecast)
+        or not isinstance(home_offense, OffenseForecast)
+        or not isinstance(away_chain, PitcherChainForecast)
+        or not isinstance(home_chain, PitcherChainForecast)
+    ):
+        raise TypeError("decoded component diagnostics have invalid types")
+    expected_away_matchups = tuple(
+        pitcher.pitcher_id for pitcher in home_chain.pitchers
+    )
+    expected_home_matchups = tuple(
+        pitcher.pitcher_id for pitcher in away_chain.pitchers
+    )
+    if tuple(away_offense.matchup_multipliers) != expected_away_matchups:
+        raise ValueError(
+            "away offense diagnostic must match the home pitcher chain"
+        )
+    if tuple(home_offense.matchup_multipliers) != expected_home_matchups:
+        raise ValueError(
+            "home offense diagnostic must match the away pitcher chain"
+        )
+
     component_ids = {
         f"{side}_{suffix}"
         for side in ("away", "home")
@@ -1025,38 +1092,18 @@ def _diagnostic_component_ids(value: object) -> frozenset[str]:
     }
     for side in ("away", "home"):
         bullpen = diagnostics[f"{side}_bullpen"]
-        if not isinstance(bullpen, Mapping):
-            raise ValueError(f"{side} bullpen diagnostic must be a mapping")
-        segments = _payload_sequence(
-            bullpen.get("segments"),
-            f"{side} bullpen diagnostic segments",
+        if not isinstance(bullpen, BullpenForecast):
+            raise TypeError(f"{side} bullpen diagnostic has invalid type")
+        component_ids.update(
+            f"{side}_bullpen_segment_{segment.segment_id}_exposed"
+            for segment in bullpen.available_segments
         )
-        segment_ids = set()
-        for segment_value in segments:
-            if not isinstance(segment_value, Mapping):
-                raise ValueError(
-                    f"{side} bullpen diagnostic segment must be a mapping"
-                )
-            segment_id = segment_value.get("segment_id")
-            _require_nonempty_string(
-                segment_id,
-                f"{side} bullpen diagnostic segment_id",
-            )
-            if segment_id in segment_ids:
-                raise ValueError(
-                    f"{side} bullpen diagnostic segment IDs must be unique"
-                )
-            segment_ids.add(segment_id)
-            available = segment_value.get("available")
-            if not isinstance(available, bool):
-                raise ValueError(
-                    f"{side} bullpen diagnostic available must be boolean"
-                )
-            if available:
-                component_ids.add(
-                    f"{side}_bullpen_segment_{segment_id}_exposed"
-                )
-    return frozenset(component_ids)
+    return (
+        MappingProxyType(
+            {key: diagnostics[key] for key in sorted(diagnostics)}
+        ),
+        frozenset(component_ids),
+    )
 
 
 def _distribution_summary_from_payload(
@@ -1189,8 +1236,12 @@ def deserialize_forecast_context(
         away_team=away_team,
         home_team=home_team,
     )
-    component_ids = _diagnostic_component_ids(
-        payload["component_diagnostics"]
+    component_diagnostics, component_ids = (
+        _component_diagnostics_from_payload(
+            payload["component_diagnostics"],
+            away_team=away_team,
+            home_team=home_team,
+        )
     )
     distributions = _component_distributions_from_payload(
         expand_component_distributions(payload["component_distributions"]),
@@ -1208,6 +1259,7 @@ def deserialize_forecast_context(
         simulation_count=simulation_count,
         market_inputs=market_inputs,
         markets=markets,
+        component_diagnostics=component_diagnostics,
         component_distributions=distributions,
         intervals=intervals,
     )

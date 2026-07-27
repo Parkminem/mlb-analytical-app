@@ -5,6 +5,7 @@ import math
 from statistics import median_low
 
 from .config import SimulationConfig
+from .diagnostic_codec import exact_mapping, sequence
 from .inputs import PitcherChainInput, PitcherInput
 from .randomness import weighted_choice
 
@@ -13,6 +14,22 @@ _BUCKET_NAMES = ("under_five", "five", "six_plus")
 _WORKLOAD_SOURCES = frozenset({"pitcher_history", "combined_chain_history"})
 _PITCHER_ROLES = frozenset({"starter", "opener", "bulk", "prim"})
 _PROBABILITY_TOLERANCE = 1e-12
+_WORKLOAD_FIELDS = frozenset(("probabilities", "supports", "source", "notes"))
+_PITCHER_FORECAST_FIELDS = frozenset(
+    (
+        "pitcher_id",
+        "role",
+        "workload",
+        "run_prevention_multiplier",
+        "log_standard_error",
+        "command_risk",
+        "home_run_risk",
+        "diagnostics",
+    )
+)
+_PITCHER_CHAIN_FIELDS = frozenset(
+    ("pitchers", "combined_workload", "log_standard_error", "diagnostics")
+)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -346,6 +363,82 @@ class PitcherChainForecast:
             segments=tuple(segments),
             combined_outs=combined_outs,
         )
+
+
+def _workload_from_diagnostic(
+    value: object,
+    field_name: str,
+) -> WorkloadDistribution:
+    payload = exact_mapping(value, _WORKLOAD_FIELDS, field_name)
+    probabilities = tuple(
+        sequence(payload["probabilities"], f"{field_name}.probabilities")
+    )
+    supports = tuple(
+        tuple(sequence(bucket, f"{field_name}.supports[{index}]"))
+        for index, bucket in enumerate(
+            sequence(payload["supports"], f"{field_name}.supports")
+        )
+    )
+    notes = tuple(sequence(payload["notes"], f"{field_name}.notes"))
+    return WorkloadDistribution(
+        probabilities=probabilities,
+        supports=supports,
+        source=payload["source"],
+        notes=notes,
+    )
+
+
+def deserialize_pitcher_chain_forecast(
+    value: object,
+    *,
+    field_name: str = "pitcher-chain diagnostic",
+) -> PitcherChainForecast:
+    """Reconstruct a persisted chain through its original domain invariants."""
+
+    payload = exact_mapping(value, _PITCHER_CHAIN_FIELDS, field_name)
+    pitchers = []
+    for index, pitcher_value in enumerate(
+        sequence(payload["pitchers"], f"{field_name}.pitchers")
+    ):
+        pitcher_name = f"{field_name}.pitchers[{index}]"
+        pitcher = exact_mapping(
+            pitcher_value,
+            _PITCHER_FORECAST_FIELDS,
+            pitcher_name,
+        )
+        pitchers.append(
+            PitcherForecast(
+                pitcher_id=pitcher["pitcher_id"],
+                role=pitcher["role"],
+                workload=_workload_from_diagnostic(
+                    pitcher["workload"],
+                    f"{pitcher_name}.workload",
+                ),
+                run_prevention_multiplier=pitcher[
+                    "run_prevention_multiplier"
+                ],
+                log_standard_error=pitcher["log_standard_error"],
+                command_risk=pitcher["command_risk"],
+                home_run_risk=pitcher["home_run_risk"],
+                diagnostics=tuple(
+                    sequence(
+                        pitcher["diagnostics"],
+                        f"{pitcher_name}.diagnostics",
+                    )
+                ),
+            )
+        )
+    return PitcherChainForecast(
+        pitchers=tuple(pitchers),
+        combined_workload=_workload_from_diagnostic(
+            payload["combined_workload"],
+            f"{field_name}.combined_workload",
+        ),
+        log_standard_error=payload["log_standard_error"],
+        diagnostics=tuple(
+            sequence(payload["diagnostics"], f"{field_name}.diagnostics")
+        ),
+    )
 
 
 def _normalize_probabilities(values: list[float]) -> tuple[float, float, float]:

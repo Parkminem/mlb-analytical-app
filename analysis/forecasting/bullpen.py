@@ -6,6 +6,12 @@ import math
 from types import MappingProxyType
 
 from .config import SimulationConfig
+from .diagnostic_codec import (
+    enum_value,
+    exact_mapping,
+    sequence,
+    string_mapping,
+)
 from .inputs import BullpenInput, BullpenRole, BullpenSegmentInput
 
 
@@ -19,10 +25,45 @@ _UNSCHEDULED_F5_SEGMENT_ID = "league_unscheduled_f5_relief"
 _LIMITED_NOTES = ("limited_performance_or_use_risk",)
 _UNSCHEDULED_F5_NOTES = ("unscheduled_f5_neutral_prior",)
 _FLOAT_TOLERANCE = 1e-12
+_BULLPEN_CONTEXT_FIELDS = frozenset(
+    (
+        "league_ra9",
+        "bullpen_ra9_bounds",
+        "limited_reliever_log_se_penalty",
+        "unscheduled_f5_relief_log_standard_error",
+    )
+)
+_BULLPEN_SEGMENT_FIELDS = frozenset(
+    (
+        "segment_id",
+        "role",
+        "projected_ra9",
+        "run_prevention_multiplier",
+        "base_log_standard_error",
+        "log_standard_error",
+        "available",
+        "limited_performance_or_use_risk",
+        "synthetic",
+        "notes",
+        "_context",
+    )
+)
+_BULLPEN_FORECAST_FIELDS = frozenset(
+    (
+        "team",
+        "segments",
+        "by_role",
+        "high_leverage_available",
+        "lower_relief_risk",
+        "unscheduled_f5_relief",
+        "_context",
+    )
+)
 
 __all__ = (
     "BullpenSegmentForecast",
     "BullpenForecast",
+    "deserialize_bullpen_forecast",
     "forecast_bullpen",
     "select_bullpen_segment",
 )
@@ -402,6 +443,128 @@ def _unscheduled_f5_prior(
         limited_performance_or_use_risk=False,
         synthetic=True,
         notes=_UNSCHEDULED_F5_NOTES,
+        _context=context,
+    )
+
+
+def _bullpen_context_from_diagnostic(
+    value: object,
+    field_name: str,
+) -> _BullpenInvariantContext:
+    payload = exact_mapping(value, _BULLPEN_CONTEXT_FIELDS, field_name)
+    return _BullpenInvariantContext(
+        league_ra9=payload["league_ra9"],
+        bullpen_ra9_bounds=tuple(
+            sequence(
+                payload["bullpen_ra9_bounds"],
+                f"{field_name}.bullpen_ra9_bounds",
+            )
+        ),
+        limited_reliever_log_se_penalty=payload[
+            "limited_reliever_log_se_penalty"
+        ],
+        unscheduled_f5_relief_log_standard_error=payload[
+            "unscheduled_f5_relief_log_standard_error"
+        ],
+    )
+
+
+def _bullpen_segment_from_diagnostic(
+    value: object,
+    context: _BullpenInvariantContext,
+    context_payload: object,
+    field_name: str,
+) -> BullpenSegmentForecast:
+    payload = exact_mapping(value, _BULLPEN_SEGMENT_FIELDS, field_name)
+    nested_context = exact_mapping(
+        payload["_context"],
+        _BULLPEN_CONTEXT_FIELDS,
+        f"{field_name}._context",
+    )
+    if nested_context != context_payload:
+        raise ValueError(f"{field_name} must share the bullpen context")
+    return BullpenSegmentForecast(
+        segment_id=payload["segment_id"],
+        role=enum_value(
+            BullpenRole,
+            payload["role"],
+            f"{field_name}.role",
+        ),
+        projected_ra9=payload["projected_ra9"],
+        run_prevention_multiplier=payload["run_prevention_multiplier"],
+        base_log_standard_error=payload["base_log_standard_error"],
+        log_standard_error=payload["log_standard_error"],
+        available=payload["available"],
+        limited_performance_or_use_risk=payload[
+            "limited_performance_or_use_risk"
+        ],
+        synthetic=payload["synthetic"],
+        notes=tuple(sequence(payload["notes"], f"{field_name}.notes")),
+        _context=context,
+    )
+
+
+def deserialize_bullpen_forecast(
+    value: object,
+    *,
+    field_name: str = "bullpen diagnostic",
+) -> BullpenForecast:
+    """Reconstruct persisted bullpen diagnostics with shared object identity."""
+
+    payload = exact_mapping(value, _BULLPEN_FORECAST_FIELDS, field_name)
+    context_payload = exact_mapping(
+        payload["_context"],
+        _BULLPEN_CONTEXT_FIELDS,
+        f"{field_name}._context",
+    )
+    context = _bullpen_context_from_diagnostic(
+        context_payload,
+        f"{field_name}._context",
+    )
+    segment_values = sequence(payload["segments"], f"{field_name}.segments")
+    segments = tuple(
+        _bullpen_segment_from_diagnostic(
+            segment,
+            context,
+            context_payload,
+            f"{field_name}.segments[{index}]",
+        )
+        for index, segment in enumerate(segment_values)
+    )
+    by_role_payload = string_mapping(
+        payload["by_role"],
+        f"{field_name}.by_role",
+    )
+    expected_role_keys = {role.value for role in _BULLPEN_ROLE_ORDER}
+    if set(by_role_payload) != expected_role_keys:
+        raise ValueError(f"{field_name}.by_role must contain all bullpen roles")
+    segments_by_role = {segment.role: segment for segment in segments}
+    for role in _BULLPEN_ROLE_ORDER:
+        decoded = _bullpen_segment_from_diagnostic(
+            by_role_payload[role.value],
+            context,
+            context_payload,
+            f"{field_name}.by_role[{role.value}]",
+        )
+        if decoded != segments_by_role.get(role):
+            raise ValueError(
+                f"{field_name}.by_role[{role.value}] must match segments"
+            )
+    unscheduled = _bullpen_segment_from_diagnostic(
+        payload["unscheduled_f5_relief"],
+        context,
+        context_payload,
+        f"{field_name}.unscheduled_f5_relief",
+    )
+    return BullpenForecast(
+        team=payload["team"],
+        segments=segments,
+        by_role={
+            role: segments_by_role[role] for role in _BULLPEN_ROLE_ORDER
+        },
+        high_leverage_available=payload["high_leverage_available"],
+        lower_relief_risk=payload["lower_relief_risk"],
+        unscheduled_f5_relief=unscheduled,
         _context=context,
     )
 

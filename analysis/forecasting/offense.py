@@ -7,12 +7,59 @@ from types import MappingProxyType
 import weakref
 
 from .config import SimulationConfig
+from .diagnostic_codec import exact_mapping, sequence, string_mapping
 from .inputs import LineupInput, LineupSlot, PitcherInput, PitchUsage
 
 
 _SLOT_LABELS = frozenset({"플러스", "중립", "마이너스", "표본 부족"})
 _EXPECTED_SIDES = frozenset({"R", "L"})
 _FLOAT_TOLERANCE = 1e-12
+_OFFENSE_CONTEXT_FIELDS = frozenset(
+    (
+        "league_woba",
+        "normalized_pa_weights",
+        "matchup_bounds",
+        "lineup_log_standard_error",
+        "sample_shortage_log_se_penalty",
+        "bats_by_order",
+        "pitcher_throws",
+    )
+)
+_SLOT_FORECAST_FIELDS = frozenset(
+    (
+        "order",
+        "batter_id",
+        "batter_name",
+        "expected_side",
+        "pitcher_id",
+        "evaluated_pitch_types",
+        "normalized_pitch_usages",
+        "average_velocities_mph",
+        "selected_band_widths",
+        "velocity_deltas_mph",
+        "plate_appearances",
+        "adjusted_wobas",
+        "labels",
+        "sample_strengths",
+        "exposure_weighted_adjusted_woba",
+        "unknown_exposure",
+        "_context",
+    )
+)
+_OFFENSE_FORECAST_FIELDS = frozenset(
+    (
+        "base_offense_multiplier",
+        "matchup_multipliers",
+        "projected_traffic_per_9",
+        "projected_extra_base_hits_per_9",
+        "log_standard_error",
+        "slot_forecasts",
+        "matchup_log_standard_errors",
+        "matchup_unknown_exposures",
+        "unknown_bullpen_matchup_log_se_penalty",
+        "_context",
+    )
+)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -1033,9 +1080,183 @@ def _build_forecast_offense():
             issue_context,
         )
 
-    return forecast_offense, is_factory_context
+    def deserialize_offense_forecast(
+        value: object,
+        *,
+        field_name: str = "offense diagnostic",
+    ) -> OffenseForecast:
+        payload = exact_mapping(
+            value,
+            _OFFENSE_FORECAST_FIELDS,
+            field_name,
+        )
+        context_payload = exact_mapping(
+            payload["_context"],
+            _OFFENSE_CONTEXT_FIELDS,
+            f"{field_name}._context",
+        )
+        pitcher_throws = tuple(
+            tuple(
+                sequence(
+                    pair,
+                    f"{field_name}._context.pitcher_throws[{index}]",
+                )
+            )
+            for index, pair in enumerate(
+                sequence(
+                    context_payload["pitcher_throws"],
+                    f"{field_name}._context.pitcher_throws",
+                )
+            )
+        )
+        context = issue_context(
+            league_woba=context_payload["league_woba"],
+            normalized_pa_weights=tuple(
+                sequence(
+                    context_payload["normalized_pa_weights"],
+                    f"{field_name}._context.normalized_pa_weights",
+                )
+            ),
+            matchup_bounds=tuple(
+                sequence(
+                    context_payload["matchup_bounds"],
+                    f"{field_name}._context.matchup_bounds",
+                )
+            ),
+            lineup_log_standard_error=context_payload[
+                "lineup_log_standard_error"
+            ],
+            sample_shortage_log_se_penalty=context_payload[
+                "sample_shortage_log_se_penalty"
+            ],
+            bats_by_order=tuple(
+                sequence(
+                    context_payload["bats_by_order"],
+                    f"{field_name}._context.bats_by_order",
+                )
+            ),
+            pitcher_throws=pitcher_throws,
+        )
+        pitcher_ids = tuple(pitcher_id for pitcher_id, _ in pitcher_throws)
+
+        def ordered_pitcher_mapping(
+            mapping_value: object,
+            mapping_name: str,
+        ) -> dict[str, object]:
+            mapping = string_mapping(mapping_value, mapping_name)
+            if set(mapping) != set(pitcher_ids):
+                raise ValueError(
+                    f"{mapping_name} keys must match the offense context"
+                )
+            return {
+                pitcher_id: mapping[pitcher_id] for pitcher_id in pitcher_ids
+            }
+
+        slot_forecasts = []
+        for index, slot_value in enumerate(
+            sequence(payload["slot_forecasts"], f"{field_name}.slot_forecasts")
+        ):
+            slot_name = f"{field_name}.slot_forecasts[{index}]"
+            slot = exact_mapping(
+                slot_value,
+                _SLOT_FORECAST_FIELDS,
+                slot_name,
+            )
+            slot_context = exact_mapping(
+                slot["_context"],
+                _OFFENSE_CONTEXT_FIELDS,
+                f"{slot_name}._context",
+            )
+            if slot_context != context_payload:
+                raise ValueError(f"{slot_name} must share the offense context")
+            slot_forecasts.append(
+                SlotMatchupForecast(
+                    order=slot["order"],
+                    batter_id=slot["batter_id"],
+                    batter_name=slot["batter_name"],
+                    expected_side=slot["expected_side"],
+                    pitcher_id=slot["pitcher_id"],
+                    evaluated_pitch_types=tuple(
+                        sequence(
+                            slot["evaluated_pitch_types"],
+                            f"{slot_name}.evaluated_pitch_types",
+                        )
+                    ),
+                    normalized_pitch_usages=string_mapping(
+                        slot["normalized_pitch_usages"],
+                        f"{slot_name}.normalized_pitch_usages",
+                    ),
+                    average_velocities_mph=string_mapping(
+                        slot["average_velocities_mph"],
+                        f"{slot_name}.average_velocities_mph",
+                    ),
+                    selected_band_widths=string_mapping(
+                        slot["selected_band_widths"],
+                        f"{slot_name}.selected_band_widths",
+                    ),
+                    velocity_deltas_mph=string_mapping(
+                        slot["velocity_deltas_mph"],
+                        f"{slot_name}.velocity_deltas_mph",
+                    ),
+                    plate_appearances=string_mapping(
+                        slot["plate_appearances"],
+                        f"{slot_name}.plate_appearances",
+                    ),
+                    adjusted_wobas=string_mapping(
+                        slot["adjusted_wobas"],
+                        f"{slot_name}.adjusted_wobas",
+                    ),
+                    labels=tuple(
+                        sequence(slot["labels"], f"{slot_name}.labels")
+                    ),
+                    sample_strengths=string_mapping(
+                        slot["sample_strengths"],
+                        f"{slot_name}.sample_strengths",
+                    ),
+                    exposure_weighted_adjusted_woba=slot[
+                        "exposure_weighted_adjusted_woba"
+                    ],
+                    unknown_exposure=slot["unknown_exposure"],
+                    _context=context,
+                )
+            )
+        return OffenseForecast(
+            base_offense_multiplier=payload["base_offense_multiplier"],
+            matchup_multipliers=ordered_pitcher_mapping(
+                payload["matchup_multipliers"],
+                f"{field_name}.matchup_multipliers",
+            ),
+            projected_traffic_per_9=payload["projected_traffic_per_9"],
+            projected_extra_base_hits_per_9=payload[
+                "projected_extra_base_hits_per_9"
+            ],
+            log_standard_error=payload["log_standard_error"],
+            slot_forecasts=tuple(slot_forecasts),
+            matchup_log_standard_errors=ordered_pitcher_mapping(
+                payload["matchup_log_standard_errors"],
+                f"{field_name}.matchup_log_standard_errors",
+            ),
+            matchup_unknown_exposures=ordered_pitcher_mapping(
+                payload["matchup_unknown_exposures"],
+                f"{field_name}.matchup_unknown_exposures",
+            ),
+            unknown_bullpen_matchup_log_se_penalty=payload[
+                "unknown_bullpen_matchup_log_se_penalty"
+            ],
+            _context=context,
+        )
+
+    return (
+        forecast_offense,
+        is_factory_context,
+        deserialize_offense_forecast,
+    )
 
 
 # Keep context issuance inaccessible from module consumers.
-forecast_offense, _is_factory_context = _build_forecast_offense()
+(
+    forecast_offense,
+    _is_factory_context,
+    deserialize_offense_forecast,
+) = _build_forecast_offense()
 del _build_forecast_offense
