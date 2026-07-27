@@ -13,6 +13,7 @@ from analysis.ledger import (
     CaptureRecord,
     ForecastCommand,
     ForecastRecord,
+    LedgerCorruptionError,
     LedgerHeadChangedError,
     LedgerStore,
 )
@@ -117,6 +118,56 @@ def test_lookup_returns_exact_relationship_and_same_latest_active_capture(
     assert ("forecast", unrelated.forecast_run_id) not in loaded
     with pytest.raises(FrozenInstanceError):
         lookup.capture = active
+
+
+def test_lookup_rejects_ledger_path_replacement_after_indexed_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "ledger.jsonl"
+    displaced_path = tmp_path / "ledger-displaced.jsonl"
+    replacement_path = tmp_path / "ledger-replacement.jsonl"
+    store = LedgerStore(path)
+    capture = store.append_capture("capture:trusted", capture_command())
+    forecast = store.append_forecast(forecast_command())
+    store.link_capture_forecast(capture.capture_id, forecast.forecast_run_id)
+    store.pregame_checkpoint()
+    replacement_store = LedgerStore(replacement_path)
+    replacement_store.append_capture(
+        "capture:replacement",
+        capture_command(normalized_input_hash="replacement-input"),
+    )
+    replacement_content = replacement_path.read_bytes()
+
+    import analysis.ledger.pregame as pregame_module
+
+    real_load = pregame_module.PregameLedgerSession._load_indexed_record
+    swapped = False
+
+    def load_then_replace(session, indexed):
+        nonlocal swapped
+        record = real_load(session, indexed)
+        if indexed.record_kind == "capture_forecast_link" and not swapped:
+            path.rename(displaced_path)
+            replacement_path.rename(path)
+            swapped = True
+        return record
+
+    monkeypatch.setattr(
+        pregame_module.PregameLedgerSession,
+        "_load_indexed_record",
+        load_then_replace,
+    )
+
+    with pytest.raises(LedgerCorruptionError, match="changed|identity"):
+        store.lookup_shadow_pregame(
+            "capture:trusted",
+            forecast.forecast_run_id,
+            capture.game_pk,
+        )
+
+    assert swapped is True
+    assert path.read_bytes() == replacement_content
 
 
 def test_atomic_append_matches_legacy_record_contract_and_row_order(

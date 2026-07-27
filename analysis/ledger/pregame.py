@@ -349,6 +349,41 @@ class PregameLedgerSession:
             ),
         )
 
+    def _validate_lookup_snapshot(self) -> None:
+        try:
+            ledger_stat, ledger_sha256 = ledger_state(
+                self._ledger_descriptor
+            )
+        except CheckpointError as error:
+            raise LedgerCorruptionError(str(error)) from error
+        if LedgerFingerprint.from_stat(
+            ledger_stat,
+            ledger_sha256,
+        ) != self.checkpoint.fingerprint:
+            raise LedgerCorruptionError(
+                "ledger changed during pregame lookup"
+            )
+        self._store._validate_open_descriptor(
+            self._ledger_descriptor,
+            self._store._ledger_name,
+            "ledger",
+        )
+        return_stat = os.fstat(self._ledger_descriptor)
+        if (
+            return_stat.st_dev,
+            return_stat.st_ino,
+            return_stat.st_size,
+            return_stat.st_mtime_ns,
+        ) != (
+            self.checkpoint.fingerprint.device,
+            self.checkpoint.fingerprint.inode,
+            self.checkpoint.fingerprint.size,
+            self.checkpoint.fingerprint.mtime_ns,
+        ):
+            raise LedgerCorruptionError(
+                "ledger changed during pregame lookup"
+            )
+
     def lookup(
         self,
         capture_key: str,
@@ -399,6 +434,7 @@ class PregameLedgerSession:
             raise LedgerCorruptionError("forecast checkpoint resolved wrong kind")
         if link is not None and not isinstance(link, CaptureForecastLink):
             raise LedgerCorruptionError("link checkpoint resolved wrong kind")
+        self._validate_lookup_snapshot()
         return PregameLookup(
             capture=capture,
             active_capture=active_capture,
