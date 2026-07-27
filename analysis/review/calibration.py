@@ -1214,45 +1214,65 @@ def _legacy_priority_score(
     market: Mapping[str, object],
     market_key: str,
     linked_comparison: object,
+    *,
+    corrected_link: bool,
 ) -> object:
-    comparison_roots: list[Mapping[str, object]] = []
-    if linked_comparison is not None:
-        comparison_roots.append(
-            _require_mapping(linked_comparison, "linked shadow comparison")
+    def score_from_roots(
+        roots: tuple[Mapping[str, object], ...],
+    ) -> tuple[bool, object]:
+        for root in roots:
+            comparisons = root.get("market_comparisons")
+            if comparisons is None:
+                continue
+            if isinstance(comparisons, Mapping):
+                comparison = comparisons.get(market_key)
+                candidates = () if comparison is None else (comparison,)
+            elif isinstance(comparisons, Sequence) and not isinstance(
+                comparisons, (str, bytes)
+            ):
+                candidates = comparisons
+            else:
+                raise ValueError(
+                    "market_comparisons must be a mapping or sequence"
+                )
+            for candidate in candidates:
+                comparison = _require_mapping(
+                    candidate,
+                    "market comparison",
+                )
+                if comparison.get("market_key") != market_key and not (
+                    isinstance(comparisons, Mapping)
+                    and len(candidates) == 1
+                ):
+                    continue
+                if "legacy_score" in comparison:
+                    return True, comparison["legacy_score"]
+                if "legacy_priority_score" in comparison:
+                    return True, comparison["legacy_priority_score"]
+        return False, None
+
+    if corrected_link and linked_comparison is not None:
+        found, score = score_from_roots(
+            (
+                _require_mapping(
+                    linked_comparison,
+                    "linked shadow comparison",
+                ),
+            )
         )
+        if found:
+            return score
+    if "legacy_priority_score" in market:
+        return market["legacy_priority_score"]
+    comparison_roots: list[Mapping[str, object]] = []
     for field_name in ("shadow_comparison", "comparison", "shadow"):
         value = outputs.get(field_name)
-        if value is not None and value is not linked_comparison:
+        if value is not None:
             comparison_roots.append(_require_mapping(value, field_name))
     if "market_comparisons" in outputs:
         comparison_roots.append(outputs)
-
-    for root in comparison_roots:
-        comparisons = root.get("market_comparisons")
-        if comparisons is None:
-            continue
-        if isinstance(comparisons, Mapping):
-            comparison = comparisons.get(market_key)
-            candidates = () if comparison is None else (comparison,)
-        elif isinstance(comparisons, Sequence) and not isinstance(
-            comparisons, (str, bytes)
-        ):
-            candidates = comparisons
-        else:
-            raise ValueError("market_comparisons must be a mapping or sequence")
-        for candidate in candidates:
-            comparison = _require_mapping(candidate, "market comparison")
-            if comparison.get("market_key") != market_key and not (
-                isinstance(comparisons, Mapping) and len(candidates) == 1
-            ):
-                continue
-            if "legacy_score" in comparison:
-                return comparison["legacy_score"]
-            if "legacy_priority_score" in comparison:
-                return comparison["legacy_priority_score"]
-    if "legacy_priority_score" in market:
-        return market["legacy_priority_score"]
-    return None
+    _, score = score_from_roots(tuple(comparison_roots))
+    return score
 
 
 def _pitching_structure(
@@ -1490,6 +1510,7 @@ def _row_for_review(
             forecast_market,
             review.market_key,
             linked_shadow_comparison(link, forecast),
+            corrected_link=link.supersedes_link_record_id is not None,
         ),
         p_win=p_win,
         p_push=p_push,
@@ -1522,7 +1543,20 @@ def select_primary_rows(
         latest_result = ledger_index.latest_results_by_game.get(capture.game_pk)
         if latest_result is None:
             continue
-        links = ledger_index.links_by_capture.get(capture.capture_id, ())
+        capture_links = ledger_index.links_by_capture.get(
+            capture.capture_id,
+            (),
+        )
+        superseded_link_record_ids = frozenset(
+            link.supersedes_link_record_id
+            for link in capture_links
+            if link.supersedes_link_record_id is not None
+        )
+        links = tuple(
+            link
+            for link in capture_links
+            if link.envelope.record_id not in superseded_link_record_ids
+        )
         for link in links:
             forecast = ledger_index.forecasts_by_run_id.get(link.forecast_run_id)
             if forecast is None:

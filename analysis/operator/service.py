@@ -1241,16 +1241,26 @@ def _append_official_result(
         ) from error
 
 
-def _review_idempotency_key(
-    capture: CaptureRecord,
-    forecast: ForecastRecord,
+def _review_for_exact_lineage(
+    records: tuple[object, ...],
+    link: CaptureForecastLink,
     result: OfficialResultRecord,
     market_key: str,
-) -> str:
-    return (
-        f"review:{capture.capture_id}:{forecast.forecast_run_id}:"
-        f"{result.envelope.record_id}:{market_key}"
+) -> ReviewRecord | None:
+    matches = tuple(
+        record
+        for record in records
+        if isinstance(record, ReviewRecord)
+        and record.capture_forecast_link_record_id
+        == link.envelope.record_id
+        and record.official_result_record_id == result.envelope.record_id
+        and record.market_key == market_key
     )
+    if len(matches) > 1:
+        raise OperatorLedgerError(
+            "review lineage has multiple immutable records"
+        )
+    return None if not matches else matches[0]
 
 
 def _review_partial_progress(
@@ -1290,15 +1300,11 @@ def _review_partial_progress(
     review_records: list[ReviewRecord] = []
     if result is not None:
         for market_key in market_keys:
-            record = _single_record(
+            record = _review_for_exact_lineage(
                 records,
-                ReviewRecord,
-                lambda candidate, key=_review_idempotency_key(
-                    capture,
-                    forecast,
-                    result,
-                    market_key,
-                ): candidate.envelope.idempotency_key == key,
+                link,
+                result,
+                market_key,
             )
             if record is not None:
                 review_records.append(record)
@@ -1599,15 +1605,11 @@ def run_review(
         review_replay_count = 0
         for market_key in market_keys:
             current_records = _review_ledger_records(store)
-            existing_review = _record_with_key(
+            existing_review = _review_for_exact_lineage(
                 current_records,
-                ReviewRecord,
-                _review_idempotency_key(
-                    capture,
-                    forecast,
-                    result_record,
-                    market_key,
-                ),
+                link,
+                result_record,
+                market_key,
             )
             if existing_review is not None:
                 review_records.append(existing_review)

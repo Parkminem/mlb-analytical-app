@@ -1603,6 +1603,34 @@ class CalibrationSelectionTests(unittest.TestCase):
 
         self.assertEqual(rows[0].legacy_priority_score, 72)
 
+    def test_uncorrected_market_priority_score_keeps_historical_precedence(
+        self,
+    ):
+        game_pk = 920102
+        outputs = forecast_outputs(game_pk, legacy_score=72)
+        outputs["forecast_output"]["markets"][market_key(game_pk)][
+            "legacy_priority_score"
+        ] = 82
+        context = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="historical-market-priority-run",
+            id_suffix="historical-market-priority",
+            forecast_outputs_override=outputs,
+        )
+        self._complete_reviews(game_pk, (context,))
+
+        rows = select_primary_rows(self.store)
+        report = build_calibration_report(rows)
+
+        self.assertEqual(rows[0].legacy_priority_score, 82)
+        self.assertEqual(
+            dict(report.groups[0].dimensions)["priority_score_bucket"],
+            "80-84",
+        )
+
     def test_unchanged_repeated_capture_counts_once_after_primary_selection(self):
         first = append_capture_link(
             self.store,

@@ -513,19 +513,15 @@ def _exogenous_events(
     )
 
 
-def build_review_candidate(
-    store: object,
+def _build_review_candidate_from_records(
+    records: tuple[object, ...],
     link_record_id: str,
     result_record_id: str,
     market_key: str,
 ) -> ReviewCandidate:
-    """Build one objective candidate from exact linked frozen records."""
-
-    _require_store(store)
     _require_nonempty_string(link_record_id, "link_record_id")
     _require_nonempty_string(result_record_id, "result_record_id")
     _require_nonempty_string(market_key, "market_key")
-    records = tuple(store.iter_records())
     link = _exact_record_by_id(
         records,
         CaptureForecastLink,
@@ -637,6 +633,23 @@ def build_review_candidate(
     )
 
 
+def build_review_candidate(
+    store: object,
+    link_record_id: str,
+    result_record_id: str,
+    market_key: str,
+) -> ReviewCandidate:
+    """Build one objective candidate from exact linked frozen records."""
+
+    _require_store(store)
+    return _build_review_candidate_from_records(
+        tuple(store.iter_records()),
+        link_record_id,
+        result_record_id,
+        market_key,
+    )
+
+
 def _component_review_payloads(
     classification: ReviewClassification,
 ) -> tuple[dict[str, object], ...]:
@@ -680,6 +693,26 @@ def _review_command(
     )
 
 
+def _review_idempotency_key(
+    link: CaptureForecastLink,
+    result_record_id: str,
+    market_key: str,
+) -> str:
+    """Return the stable review key for one exact link lineage."""
+
+    if not isinstance(link, CaptureForecastLink):
+        raise TypeError("link must be CaptureForecastLink")
+    _require_nonempty_string(result_record_id, "result_record_id")
+    _require_nonempty_string(market_key, "market_key")
+    base = (
+        f"review:{link.capture_id}:{link.forecast_run_id}:"
+        f"{result_record_id}:{market_key}"
+    )
+    if link.supersedes_link_record_id is None:
+        return base
+    return f"{base}:link:{link.envelope.record_id}"
+
+
 def build_and_record_review(
     store: object,
     link_record_id: str,
@@ -693,17 +726,45 @@ def build_and_record_review(
     """Classify and idempotently append one review after a pure build."""
 
     _require_store(store, append=True)
-    candidate = build_review_candidate(
-        store,
+    records = tuple(store.iter_records())
+    candidate = _build_review_candidate_from_records(
+        records,
         link_record_id,
         result_record_id,
         market_key,
     )
     classification = classify_review(candidate)
     command = _review_command(candidate, classification)
+    link = _exact_record_by_id(
+        records,
+        CaptureForecastLink,
+        candidate.capture_forecast_link_record_id,
+        "capture_forecast_link_record_id",
+    )
+    if not isinstance(link, CaptureForecastLink):
+        raise TypeError("link lookup must return CaptureForecastLink")
+    existing_reviews = tuple(
+        record
+        for record in records
+        if isinstance(record, ReviewRecord)
+        and record.capture_forecast_link_record_id
+        == candidate.capture_forecast_link_record_id
+        and record.official_result_record_id
+        == candidate.official_result_record_id
+        and record.market_key == candidate.market_key
+    )
+    if len(existing_reviews) > 1:
+        raise ValueError(
+            "review lineage must resolve at most one immutable record"
+        )
     idempotency_key = (
-        f"review:{candidate.capture_id}:{candidate.forecast_run_id}:"
-        f"{candidate.official_result_record_id}:{candidate.market_key}"
+        existing_reviews[0].envelope.idempotency_key
+        if existing_reviews
+        else _review_idempotency_key(
+            link,
+            candidate.official_result_record_id,
+            candidate.market_key,
+        )
     )
     if required_active_capture_id is _REQUIRED_ACTIVE_CAPTURE_ID_UNSET:
         record = store.append_review(command, idempotency_key=idempotency_key)

@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 import analysis.operator.service as service_module
 from analysis.forecasting import LineupState, run_forecast
 from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.identity import canonical_json
 from analysis.ledger import (
     CaptureCommand,
     ForecastCommand,
@@ -38,6 +40,7 @@ from analysis.review import (
     PrincipalPathBinding,
     build_and_record_review as real_build_and_record_review,
 )
+from analysis.review.calibration import select_primary_rows
 from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
@@ -295,6 +298,45 @@ def _records(context: ReviewContext, kind: str) -> tuple[object, ...]:
     return tuple(LedgerStore(context.ledger_path).iter_records(kind))
 
 
+def _append_score_correction(
+    context: ReviewContext,
+    score: int,
+):
+    capture = context.confirmed.capture
+    forecast = context.confirmed.forecast
+    outputs = json.loads(canonical_json(forecast.outputs))
+    comparison = outputs["shadow_comparison"]
+    market_comparison = next(
+        market
+        for market in comparison["market_comparisons"]
+        if market["market_key"] == "sea_ml"
+    )
+    candidate_index = market_comparison["legacy_candidate_index"]
+    comparison["legacy"]["candidates"][candidate_index]["score"] = score
+    market_comparison["legacy_score"] = score
+    return LedgerStore(context.ledger_path).append_shadow_run_atomic(
+        capture.envelope.idempotency_key,
+        CaptureCommand(
+            game_pk=capture.game_pk,
+            captured_at=capture.captured_at,
+            first_pitch=capture.first_pitch,
+            lineup_state=capture.lineup_state,
+            out_of_sample_eligible=capture.out_of_sample_eligible,
+            normalized_input_hash=capture.normalized_input_hash,
+            payload=capture.payload,
+            supersedes_capture_id=capture.supersedes_capture_id,
+        ),
+        ForecastCommand(
+            forecast_run_id=forecast.forecast_run_id,
+            model_version=forecast.model_version,
+            simulation_config_hash=forecast.simulation_config_hash,
+            normalized_input_hash=forecast.normalized_input_hash,
+            outputs=outputs,
+        ),
+        capture.capture_id,
+    )
+
+
 def _supersede_confirmed_capture(
     context: ReviewContext,
     store: LedgerStore,
@@ -369,6 +411,47 @@ def test_exact_review_retry_replays_every_record_and_managed_bundle(
     assert len(_records(review_context, "market_observation")) == 1
     assert len(_records(review_context, "official_result")) == 1
     assert len(_records(review_context, "review")) == 2
+
+
+def test_review_before_score_correction_records_corrected_lineage_and_calibration(
+    review_context: ReviewContext,
+) -> None:
+    original = _run(review_context)
+    corrected = _append_score_correction(review_context, 86)
+    corrected_payload = review_context.bundle.payload.model_copy(
+        update={
+            "capture_forecast_link_record_id": (
+                corrected.link.envelope.record_id
+            ),
+        }
+    )
+    corrected_bundle = review_context.bundle.model_copy(
+        update={"payload": corrected_payload}
+    )
+
+    corrected_review = _run(review_context, corrected_bundle)
+    replay = _run(review_context, corrected_bundle)
+    reviews = _records(review_context, "review")
+    rows = select_primary_rows(LedgerStore(review_context.ledger_path))
+
+    assert corrected.link.supersedes_link_record_id == (
+        review_context.confirmed.link.envelope.record_id
+    )
+    assert corrected_review.review_replay_count == 0
+    assert replay.review_replay_count == len(corrected_review.reviews)
+    assert len(reviews) == len(original.reviews) + len(corrected_review.reviews)
+    assert all(
+        review.capture_forecast_link_record_id
+        == corrected.link.envelope.record_id
+        for review in corrected_review.reviews
+    )
+    assert all(
+        corrected.link.envelope.record_id
+        in review.envelope.idempotency_key
+        for review in corrected_review.reviews
+    )
+    sea_row = next(row for row in rows if row.market_key == "sea_ml")
+    assert sea_row.legacy_priority_score == 86
 
 
 def test_completed_review_bundle_rejects_a_superseded_result_head(
