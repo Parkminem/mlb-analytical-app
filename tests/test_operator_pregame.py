@@ -8,6 +8,7 @@ import warnings
 import pytest
 
 import analysis.operator.service as service_module
+import analysis.shadow as shadow_module
 from analysis.operator.bundles import (
     ManagedBundleCopy,
     bundle_canonical_bytes,
@@ -167,6 +168,244 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
 
 def _run_paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "ledger" / "shadow.jsonl", tmp_path / "bundles"
+
+
+def _bundle_with_legacy(stage: str, game, legacy: dict[str, object]):
+    market_key = next(
+        market.market_key
+        for market in game.markets
+        if market.market_type.value == "ml"
+    )
+    for binding in legacy["review_bindings"]:
+        binding["market_key"] = market_key
+    mapping = (
+        projected_bundle_mapping()
+        if stage == "projected"
+        else confirmed_bundle_mapping()
+    )
+    mapping["payload"]["game_input"] = capture_payload(game)
+    mapping["payload"]["legacy_decision"] = legacy
+    raw = _raw(mapping)
+    if stage == "projected":
+        return parse_projected_bundle_json(raw)
+    return parse_confirmed_bundle_json(raw)
+
+
+def _invalid_recommended_legacy_mapping() -> dict[str, object]:
+    legacy = _complete_legacy_decision_mapping()
+    candidate = legacy["candidates"][0]
+    binding = legacy["review_bindings"][0]
+    candidate["decision_rating"] = "lean"
+    candidate["evidence_paths"] = ["starter_collapse"]
+    binding["principal_paths"] = [
+        {
+            "evidence_path": "starter_collapse",
+            "component_ids": ["home_pitcher_chain_runs_allowed"],
+            "contradiction_rule": "starter_collapse",
+        }
+    ]
+    return legacy
+
+
+def _valid_recommended_legacy_mapping() -> dict[str, object]:
+    legacy = _complete_legacy_decision_mapping()
+    candidate = legacy["candidates"][0]
+    binding = legacy["review_bindings"][0]
+    candidate["evidence_paths"] = [
+        "starter_suppression",
+        "top_order_matchup",
+    ]
+    binding["principal_paths"].append(
+        {
+            "evidence_path": "top_order_matchup",
+            "component_ids": [
+                "away_full_runs",
+                "away_full_traffic",
+                "away_full_extra_base_hits",
+            ],
+            "contradiction_rule": "top_order_or_recent_conversion",
+        }
+    )
+    return legacy
+
+
+def test_invalid_recommended_contract_before_forecast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _invalid_recommended_legacy_mapping(),
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("forecast must not run")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="recommended review contract is invalid",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+def test_recommended_pregame_run_records_and_replays(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+
+    first = runner(bundle, ledger_path=ledger, bundle_root=bundles)
+    replay = runner(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert replay.capture == first.capture
+    assert replay.forecast == first.forecast
+    assert replay.link == first.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
+
+
+def test_unbound_pass_candidate_is_accepted(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    legacy = _complete_legacy_decision_mapping()
+    legacy["candidates"][0]["decision_rating"] = "pass"
+    legacy["final_priority"] = []
+    legacy["review_bindings"] = []
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        legacy,
+    )
+
+    result = run_projected(
+        bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert result.capture_replayed is False
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
+
+
+def test_dynamic_ineligibility_leaves_ledger_and_bundle_unchanged(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    baseline = _pregame_bundle("projected", _projected_game())
+    run_projected(baseline, ledger_path=ledger, bundle_root=bundles)
+    ledger_before = ledger.read_bytes()
+    bundles_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+    legacy = _complete_legacy_decision_mapping()
+    candidate = legacy["candidates"][0]
+    binding = legacy["review_bindings"][0]
+    candidate["evidence_paths"] = [
+        "starter_suppression",
+        "late_bullpen_exposure",
+    ]
+    binding["principal_paths"].append(
+        {
+            "evidence_path": "late_bullpen_exposure",
+            "component_ids": [
+                "home_bullpen_segment_missing_exposed",
+                "home_pitcher_chain_workload_outs",
+            ],
+            "contradiction_rule": "late_bullpen_exposure",
+        }
+    )
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        legacy,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="recommended review comparison is ineligible",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert ledger.read_bytes() == ledger_before
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == bundles_before
+
+
+def test_historical_invalid_recommended_command_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _invalid_recommended_legacy_mapping(),
+    )
+
+    with monkeypatch.context() as gates:
+        gates.setattr(
+            service_module,
+            "validate_recommended_review_contract",
+            lambda *args, **kwargs: None,
+        )
+        gates.setattr(
+            service_module,
+            "require_recommended_review_eligibility",
+            lambda *args, **kwargs: None,
+        )
+        gates.setattr(
+            shadow_module,
+            "require_recommended_review_eligibility",
+            lambda *args, **kwargs: None,
+        )
+        historical = run_projected(
+            bundle,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    replay = run_projected(
+        bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert replay.capture == historical.capture
+    assert replay.forecast == historical.forecast
+    assert replay.link == historical.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
 
 
 def _rewrite_forecast_outputs(
@@ -640,7 +879,7 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
                         replace(
                             starter_path,
                             component_ids=(
-                                "home_pitcher_chain_workload_outs",
+                                "away_pitcher_chain_runs_allowed",
                             ),
                         ),
                         *first_binding.principal_paths[1:],

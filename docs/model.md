@@ -49,6 +49,12 @@ Keep these output concepts separate:
 
 The operator derives capture idempotency intrinsically from the bundle schema version, stage, and exact capture command content except the supersession target. It searches that key before resolving lineage, so an exact replay returns the original immutable capture, forecast, link, and supersession target. New state appends a new capture and explicit supersession relationship; no prior ledger record is edited. Lower-level `record_shadow_run` remains an append-only API whose direct callers supply the capture key.
 
+- every new projected or confirmed `play`/`lean` candidate must be review-eligible;
+- `pass` candidates are excluded from the hard gate;
+- static validation runs before simulation and dynamic validation before append;
+- exact replay of historical immutable commands remains available;
+- a rejection writes no pregame ledger or managed-bundle artifact.
+
 Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
 See `docs/shadow-operator.md` for bundle roles, path overrides, frozen-ID handoff, replay recovery, exit codes, and report publication paths.
 

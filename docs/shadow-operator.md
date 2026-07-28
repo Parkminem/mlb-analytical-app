@@ -22,6 +22,14 @@ Shadow Operator는 외부에서 준비한 버전 고정 JSON 번들을 받아 �
 
 Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.json`의 완전한 불변 설정을 선택합니다. CLI에서 임의 설정 override나 precomputed forecast를 주입할 수 없습니다.
 
+## Recommended Review Eligibility Gate
+
+- every new projected or confirmed `play`/`lean` candidate must be review-eligible;
+- `pass` candidates are excluded from the hard gate;
+- static validation runs before simulation and dynamic validation before append;
+- exact replay of historical immutable commands remains available;
+- a rejection writes no pregame ledger or managed-bundle artifact.
+
 ## 경로와 Override
 
 경로는 저장소 루트 기준이며 실제 출력에는 해석된 경로가 표시됩니다.

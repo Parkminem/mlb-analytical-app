@@ -51,10 +51,13 @@ from analysis.shadow import (
     ShadowRunIdempotencyKeys,
     build_shadow_capture_command,
     canonical_legacy_decision_payload,
+    compare_shadow_forecast,
     deserialize_forecast_context,
     deserialize_shadow_comparison,
     record_shadow_run,
+    require_recommended_review_eligibility,
     validate_frozen_market_output_binding,
+    validate_recommended_review_contract,
     validate_shadow_forecast_context,
 )
 
@@ -582,6 +585,15 @@ def _run_pregame(
         )
     )
 
+    if not Path(ledger_path).exists():
+        try:
+            validate_recommended_review_contract(
+                bundle.payload.legacy_decision,
+                bundle.payload.game_input.markets,
+            )
+        except ValueError as error:
+            raise OperatorPreconditionError(str(error)) from error
+
     store = _open_ledger(ledger_path)
     capture_replayed: bool | None = None
     forecast_replayed: bool | None = None
@@ -624,9 +636,25 @@ def _run_pregame(
                 link_replayed=True,
             )
 
+        try:
+            validate_recommended_review_contract(
+                bundle.payload.legacy_decision,
+                bundle.payload.game_input.markets,
+            )
+        except ValueError as error:
+            raise OperatorPreconditionError(str(error)) from error
+
         forecast = _pregame_operation(
             lambda: run_forecast(bundle.payload.game_input, config)
         )
+        comparison = compare_shadow_forecast(
+            bundle.payload.legacy_decision,
+            forecast,
+        )
+        try:
+            require_recommended_review_eligibility(comparison)
+        except ValueError as error:
+            raise OperatorPreconditionError(str(error)) from error
         for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
             if attempt:
                 lookup = _ledger_operation(
