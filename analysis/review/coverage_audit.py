@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Final
 
@@ -19,14 +20,56 @@ from analysis.ledger import (
     CaptureForecastLink,
     CaptureRecord,
     ForecastRecord,
-    LedgerStore,
     OfficialResultRecord,
+    RecordEnvelope,
     linked_shadow_comparison,
 )
-from analysis.ledger.store import LedgerCorruptionError
+from analysis.ledger.store import (
+    LedgerCorruptionError,
+    _deserialize_record,
+    _logical_payload,
+    _parse_datetime,
+    _payload_hash,
+    _reject_duplicate_keys,
+    _reject_json_constant,
+)
+from analysis.review.calibration import (
+    CalibrationGroup,
+    CalibrationMetrics,
+    CalibrationReport,
+)
 from analysis.shadow import deserialize_shadow_comparison
 
 
+_LEDGER_RECORD_KINDS: Final = frozenset(
+    (
+        "capture",
+        "forecast",
+        "capture_forecast_link",
+        "market_observation",
+        "official_result",
+        "review",
+    )
+)
+_LEDGER_ENVELOPE_KEYS: Final = frozenset(
+    (
+        "record_id",
+        "record_kind",
+        "idempotency_key",
+        "payload_hash",
+        "appended_at",
+    )
+)
+_FORECAST_RECORD_KEYS: Final = frozenset(
+    (
+        "envelope",
+        "forecast_run_id",
+        "model_version",
+        "simulation_config_hash",
+        "normalized_input_hash",
+        "outputs",
+    )
+)
 _MANIFEST_KEYS: Final = frozenset(("schema_version", "audit_id", "entries"))
 _ENTRY_KEYS: Final = frozenset(
     (
@@ -50,6 +93,18 @@ _CALIBRATION_KEYS: Final = frozenset(
     )
 )
 _LEDGER_REVISION_KEYS: Final = frozenset(("record_count", "state_hash"))
+_GROUP_KEYS: Final = frozenset(("dimensions", "metrics"))
+_MIGRATION_KEYS: Final = frozenset(("confirmed_games", "market_types"))
+_PROGRESS_KEYS: Final = frozenset(
+    (
+        "count",
+        "threshold",
+        "completed",
+        "remaining",
+        "progress",
+        "threshold_met",
+    )
+)
 _OVERALL_METRIC_KEYS: Final = frozenset(
     (
         "sample_size",
@@ -84,6 +139,7 @@ _SEMANTIC_MARKET_KEYS: Final = frozenset(
     )
 )
 _RECOMMENDED_RATINGS: Final = frozenset(("play", "lean"))
+_INPUT_ERROR_EXIT_CODE: Final = 2
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, object]:
@@ -140,18 +196,28 @@ def _require_finite_number(value: object, name: str) -> float:
 
 def _load_json(path: Path, name: str) -> Mapping[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
     except FileNotFoundError as error:
-        raise ValueError(f"{name} does not exist: {path}") from error
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{name} is not valid JSON: {path}") from error
+        raise ValueError(f"{name} does not exist") from error
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(f"{name} is not valid JSON") from error
     return _require_mapping(value, name)
 
 
 def _load_manifest(path: Path) -> tuple[str, tuple[Mapping[str, object], ...]]:
     manifest = _load_json(path, "manifest")
     _require_exact_keys(manifest, _MANIFEST_KEYS, "manifest")
-    if manifest["schema_version"] != 1:
+    if (
+        _require_positive_integer(
+            manifest["schema_version"],
+            "manifest schema_version",
+        )
+        != 1
+    ):
         raise ValueError("manifest schema_version must be 1")
     audit_id = _require_nonempty_string(manifest["audit_id"], "audit_id")
     entries_value = manifest["entries"]
@@ -180,83 +246,371 @@ def _load_manifest(path: Path) -> tuple[str, tuple[Mapping[str, object], ...]]:
     return audit_id, tuple(entries)
 
 
+def _calibration_metrics(value: object, name: str) -> CalibrationMetrics:
+    metrics = _require_mapping(value, name)
+    _require_exact_keys(metrics, _OVERALL_METRIC_KEYS, name)
+    try:
+        return CalibrationMetrics(**dict(metrics))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} is invalid: {error}") from error
+
+
+def _calibration_groups(
+    value: object,
+    group_by: tuple[str, ...],
+) -> tuple[CalibrationGroup, ...]:
+    if not isinstance(value, list):
+        raise ValueError("groups must be a JSON array")
+    groups: list[CalibrationGroup] = []
+    for index, group_value in enumerate(value):
+        group = _require_mapping(group_value, f"groups[{index}]")
+        _require_exact_keys(group, _GROUP_KEYS, f"groups[{index}]")
+        dimensions = _require_mapping(
+            group["dimensions"],
+            f"groups[{index}].dimensions",
+        )
+        _require_exact_keys(
+            dimensions,
+            frozenset(group_by),
+            f"groups[{index}].dimensions",
+        )
+        try:
+            groups.append(
+                CalibrationGroup(
+                    # JSON object ordering is not semantic; group_by is authoritative.
+                    dimensions=tuple((name, dimensions[name]) for name in group_by),
+                    metrics=_calibration_metrics(
+                        group["metrics"],
+                        f"groups[{index}].metrics",
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"groups[{index}] is invalid: {error}") from error
+    return tuple(groups)
+
+
+def _validate_progress(value: object, name: str) -> None:
+    progress = _require_mapping(value, name)
+    _require_exact_keys(progress, _PROGRESS_KEYS, name)
+    count = _require_nonnegative_integer(progress["count"], f"{name}.count")
+    threshold = _require_positive_integer(
+        progress["threshold"],
+        f"{name}.threshold",
+    )
+    completed = _require_nonnegative_integer(
+        progress["completed"],
+        f"{name}.completed",
+    )
+    remaining = _require_nonnegative_integer(
+        progress["remaining"],
+        f"{name}.remaining",
+    )
+    if completed != min(count, threshold):
+        raise ValueError(f"{name}.completed must equal min(count, threshold)")
+    if remaining != max(threshold - count, 0):
+        raise ValueError(f"{name}.remaining must equal max(threshold - count, 0)")
+    if progress["threshold_met"] is not (count >= threshold):
+        raise ValueError(f"{name}.threshold_met must match count and threshold")
+    expected_progress = completed / threshold
+    if not math.isclose(
+        _require_finite_number(progress["progress"], f"{name}.progress"),
+        expected_progress,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            f"{name}.progress must equal completed divided by threshold"
+        )
+
+
+def _validate_migration(value: object) -> None:
+    migration = _require_mapping(value, "migration")
+    _require_exact_keys(migration, _MIGRATION_KEYS, "migration")
+    _validate_progress(migration["confirmed_games"], "migration.confirmed_games")
+    market_types = _require_mapping(
+        migration["market_types"],
+        "migration.market_types",
+    )
+    expected_market_types = frozenset(
+        market_type.value for market_type in MarketType
+    )
+    _require_exact_keys(
+        market_types,
+        expected_market_types,
+        "migration.market_types",
+    )
+    for market_type in sorted(expected_market_types):
+        _validate_progress(
+            market_types[market_type],
+            f"migration.market_types.{market_type}",
+        )
+
+
 def _load_calibration(path: Path) -> Mapping[str, object]:
     calibration = _load_json(path, "calibration")
     _require_exact_keys(calibration, _CALIBRATION_KEYS, "calibration")
-    if calibration["schema_version"] != 1:
+    if _require_positive_integer(
+        calibration["schema_version"],
+        "calibration schema_version",
+    ) != 1:
         raise ValueError("calibration schema_version must be 1")
+    ledger_as_of = calibration["ledger_as_of"]
+    if ledger_as_of is not None:
+        _parse_datetime(ledger_as_of, "ledger_as_of")
+    _require_nonempty_string(calibration["ledger_path"], "ledger_path")
     revision = _require_mapping(calibration["ledger_revision"], "ledger_revision")
     _require_exact_keys(revision, _LEDGER_REVISION_KEYS, "ledger_revision")
     _require_nonnegative_integer(revision["record_count"], "record_count")
     _require_nonempty_string(revision["state_hash"], "state_hash")
-    overall = _require_mapping(calibration["overall"], "overall metrics")
-    _require_exact_keys(overall, _OVERALL_METRIC_KEYS, "overall metrics")
-    for field_name in (
-        "sample_size",
-        "wins",
-        "losses",
-        "pushes",
-        "binary_sample_size",
-        "multiclass_sample_size",
-        "priced_stake_count",
-        "probability_clv_sample_size",
-        "price_clv_sample_size",
-    ):
-        _require_nonnegative_integer(overall.get(field_name), f"overall.{field_name}")
-    for field_name in (
-        "hit_rate",
-        "push_rate",
-        "binary_brier",
-        "multiclass_brier",
-        "log_loss",
-        "profit_units",
-        "roi",
-        "mean_probability_clv",
-        "mean_price_clv",
-    ):
-        if overall.get(field_name) is not None:
-            _require_finite_number(overall[field_name], f"overall.{field_name}")
+    overall = _calibration_metrics(calibration["overall"], "overall metrics")
+    group_by_value = calibration["group_by"]
+    if not isinstance(group_by_value, list):
+        raise ValueError("group_by must be a JSON array")
+    if any(not isinstance(dimension, str) for dimension in group_by_value):
+        raise ValueError("group_by must contain strings")
+    group_by = tuple(group_by_value)
+    groups = _calibration_groups(calibration["groups"], group_by)
+    try:
+        CalibrationReport(
+            overall=overall,
+            groups=groups,
+            group_by=group_by,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"calibration grouping is invalid: {error}") from error
+    _validate_migration(calibration["migration"])
     return calibration
 
 
-def _ledger_index(records: tuple[object, ...]) -> tuple[
+def _ledger_envelope(
+    value: object,
+    line_number: int,
+) -> tuple[Mapping[str, object], RecordEnvelope]:
+    row = _require_mapping(value, f"ledger row {line_number}")
+    envelope_value = _require_mapping(
+        row.get("envelope"),
+        f"ledger row {line_number} envelope",
+    )
+    _require_exact_keys(
+        envelope_value,
+        _LEDGER_ENVELOPE_KEYS,
+        f"ledger row {line_number} envelope",
+    )
+    envelope_data = dict(envelope_value)
+    envelope_data["appended_at"] = _parse_datetime(
+        envelope_data["appended_at"],
+        "appended_at",
+    )
+    envelope = RecordEnvelope(**envelope_data)
+    if envelope.record_kind not in _LEDGER_RECORD_KINDS:
+        raise ValueError(f"unknown record kind: {envelope.record_kind}")
+    return row, envelope
+
+
+def _validated_record(
+    value: object,
+    line_number: int,
+) -> object:
+    try:
+        record = _deserialize_record(value)
+        if _payload_hash(_logical_payload(record)) != record.envelope.payload_hash:
+            raise ValueError("record payload hash mismatch")
+        return record
+    except (KeyError, RecursionError, TypeError, ValueError) as error:
+        raise LedgerCorruptionError(
+            f"invalid ledger row at line {line_number}: {error}"
+        ) from error
+
+
+def _validate_unselected_forecast(
+    row: Mapping[str, object],
+    line_number: int,
+) -> None:
+    _require_exact_keys(
+        row,
+        _FORECAST_RECORD_KEYS,
+        f"ledger row {line_number} forecast",
+    )
+    for field_name in (
+        "forecast_run_id",
+        "model_version",
+        "simulation_config_hash",
+        "normalized_input_hash",
+    ):
+        _require_nonempty_string(
+            row[field_name],
+            f"ledger row {line_number} forecast.{field_name}",
+        )
+    _require_mapping(
+        row["outputs"],
+        f"ledger row {line_number} forecast.outputs",
+    )
+
+
+def _slim_forecast(
+    forecast: ForecastRecord,
+    market_keys: frozenset[str],
+) -> ForecastRecord:
+    outputs = _require_mapping(forecast.outputs, "forecast outputs")
+    market_inputs = _require_mapping(
+        outputs.get("market_inputs"),
+        "forecast market_inputs",
+    )
+    slim_outputs: dict[str, object] = {
+        "market_inputs": {
+            market_key: market_inputs[market_key]
+            for market_key in market_keys
+            if market_key in market_inputs
+        }
+    }
+    if "shadow_comparison" in outputs:
+        slim_outputs["shadow_comparison"] = outputs["shadow_comparison"]
+    return ForecastRecord(
+        envelope=forecast.envelope,
+        forecast_run_id=forecast.forecast_run_id,
+        model_version=forecast.model_version,
+        simulation_config_hash=forecast.simulation_config_hash,
+        normalized_input_hash=forecast.normalized_input_hash,
+        outputs=slim_outputs,
+    )
+
+
+def _resolve_ledger_records(
+    ledger_path: Path,
+    manifest_entries: Sequence[Mapping[str, object]],
+) -> tuple[
     Mapping[str, CaptureRecord],
     Mapping[str, ForecastRecord],
     Mapping[str, CaptureForecastLink],
     Mapping[int, OfficialResultRecord],
 ]:
+    required_capture_ids = frozenset(
+        _require_nonempty_string(entry["capture_id"], "capture_id")
+        for entry in manifest_entries
+    )
+    required_forecast_ids = frozenset(
+        _require_nonempty_string(entry["forecast_run_id"], "forecast_run_id")
+        for entry in manifest_entries
+    )
+    required_link_ids = frozenset(
+        _require_nonempty_string(
+            entry["capture_forecast_link_record_id"],
+            "capture_forecast_link_record_id",
+        )
+        for entry in manifest_entries
+    )
+    required_game_pks = frozenset(
+        _require_positive_integer(entry["game_pk"], "game_pk")
+        for entry in manifest_entries
+    )
+    market_keys_by_forecast: dict[str, set[str]] = {}
+    for entry in manifest_entries:
+        forecast_run_id = _require_nonempty_string(
+            entry["forecast_run_id"],
+            "forecast_run_id",
+        )
+        market_keys_by_forecast.setdefault(forecast_run_id, set()).add(
+            _require_nonempty_string(entry["market_key"], "market_key")
+        )
+
     captures: dict[str, CaptureRecord] = {}
     forecasts: dict[str, ForecastRecord] = {}
     links: dict[str, CaptureForecastLink] = {}
-    results_by_game: dict[int, list[OfficialResultRecord]] = {}
-    for record in records:
-        if isinstance(record, CaptureRecord):
-            if captures.setdefault(record.capture_id, record) is not record:
-                raise LedgerCorruptionError("duplicate capture_id in ledger")
-        elif isinstance(record, ForecastRecord):
-            if forecasts.setdefault(record.forecast_run_id, record) is not record:
-                raise LedgerCorruptionError("duplicate forecast_run_id in ledger")
-        elif isinstance(record, CaptureForecastLink):
-            record_id = record.envelope.record_id
-            if links.setdefault(record_id, record) is not record:
-                raise LedgerCorruptionError("duplicate link record_id in ledger")
-        elif isinstance(record, OfficialResultRecord):
-            results_by_game.setdefault(record.game_pk, []).append(record)
     latest_results: dict[int, OfficialResultRecord] = {}
-    for game_pk, results in results_by_game.items():
-        superseded = {
-            result.supersedes_record_id
-            for result in results
-            if result.supersedes_record_id is not None
-        }
-        latest = [
-            result for result in results if result.envelope.record_id not in superseded
-        ]
-        if len(latest) != 1:
-            raise LedgerCorruptionError(
-                "official result corrections do not have one latest record"
-            )
-        latest_results[game_pk] = latest[0]
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(ledger_path, flags)
+    except FileNotFoundError as error:
+        raise ValueError(f"ledger does not exist: {ledger_path}") from error
+    except OSError as error:
+        raise LedgerCorruptionError(
+            f"ledger cannot be opened read-only: {ledger_path}"
+        ) from error
+
+    with os.fdopen(descriptor, "rb") as ledger:
+        for line_number, raw_line in enumerate(ledger, start=1):
+            if not raw_line.endswith(b"\n"):
+                raise LedgerCorruptionError(
+                    "ledger must end with a newline byte (ASCII LF)"
+                )
+            if raw_line.endswith(b"\r\n"):
+                raise LedgerCorruptionError(
+                    f"ledger row {line_number} uses CRLF framing; ASCII LF is required"
+                )
+            try:
+                line = raw_line[:-1].decode("utf-8")
+                if not line:
+                    raise ValueError("empty ledger row")
+                value = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_json_constant,
+                )
+                row, envelope = _ledger_envelope(value, line_number)
+                if (
+                    envelope.record_kind == "forecast"
+                    and row.get("forecast_run_id") not in required_forecast_ids
+                ):
+                    _validate_unselected_forecast(row, line_number)
+                    continue
+                record = _validated_record(value, line_number)
+            except LedgerCorruptionError:
+                raise
+            except (
+                KeyError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
+                raise LedgerCorruptionError(
+                    f"invalid ledger row at line {line_number}: {error}"
+                ) from error
+
+            if (
+                isinstance(record, CaptureRecord)
+                and record.capture_id in required_capture_ids
+            ):
+                if record.capture_id in captures:
+                    raise LedgerCorruptionError("duplicate required capture_id")
+                captures[record.capture_id] = record
+            elif (
+                isinstance(record, ForecastRecord)
+                and record.forecast_run_id in required_forecast_ids
+            ):
+                if record.forecast_run_id in forecasts:
+                    raise LedgerCorruptionError("duplicate required forecast_run_id")
+                forecasts[record.forecast_run_id] = _slim_forecast(
+                    record,
+                    frozenset(market_keys_by_forecast[record.forecast_run_id]),
+                )
+            elif (
+                isinstance(record, CaptureForecastLink)
+                and record.envelope.record_id in required_link_ids
+            ):
+                if record.envelope.record_id in links:
+                    raise LedgerCorruptionError("duplicate required link record_id")
+                links[record.envelope.record_id] = record
+            elif (
+                isinstance(record, OfficialResultRecord)
+                and record.game_pk in required_game_pks
+            ):
+                previous = latest_results.get(record.game_pk)
+                if previous is None:
+                    if record.supersedes_record_id is not None:
+                        raise LedgerCorruptionError(
+                            "first official result cannot supersede a record"
+                        )
+                elif (
+                    record.supersedes_record_id
+                    != previous.envelope.record_id
+                ):
+                    raise LedgerCorruptionError(
+                        "official result must supersede the latest result"
+                    )
+                latest_results[record.game_pk] = record
     return captures, forecasts, links, latest_results
 
 
@@ -367,16 +721,18 @@ def _audit_only_metrics(
     official_metrics: Mapping[str, object],
     entries: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
-    metrics = dict(official_metrics)
-    wins = _require_nonnegative_integer(metrics["wins"], "official wins")
-    losses = _require_nonnegative_integer(metrics["losses"], "official losses")
-    pushes = _require_nonnegative_integer(metrics["pushes"], "official pushes")
-    sample_size = _require_nonnegative_integer(metrics["sample_size"], "official sample_size")
+    wins = _require_nonnegative_integer(official_metrics["wins"], "official wins")
+    losses = _require_nonnegative_integer(official_metrics["losses"], "official losses")
+    pushes = _require_nonnegative_integer(official_metrics["pushes"], "official pushes")
+    sample_size = _require_nonnegative_integer(
+        official_metrics["sample_size"],
+        "official sample_size",
+    )
     priced = _require_nonnegative_integer(
-        metrics["priced_stake_count"],
+        official_metrics["priced_stake_count"],
         "official priced_stake_count",
     )
-    profit = metrics.get("profit_units")
+    profit = official_metrics.get("profit_units")
     if profit is not None:
         profit = _require_finite_number(profit, "official profit_units")
     for entry in entries:
@@ -399,18 +755,15 @@ def _audit_only_metrics(
                 entry_profit,
                 "entry profit_units",
             )
-    metrics.update(
-        {
-            "sample_size": sample_size,
-            "wins": wins,
-            "losses": losses,
-            "pushes": pushes,
-            "priced_stake_count": priced,
-            "profit_units": profit,
-            "roi": None if profit is None or priced == 0 else profit / priced,
-        }
-    )
-    return metrics
+    return {
+        "sample_size": sample_size,
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "priced_stake_count": priced,
+        "profit_units": profit,
+        "roi": None if profit is None or priced == 0 else profit / priced,
+    }
 
 
 def build_coverage_audit(
@@ -424,8 +777,10 @@ def build_coverage_audit(
         raise TypeError("ledger_path, calibration_path, and manifest_path must be Paths")
     audit_id, manifest_entries = _load_manifest(manifest_path)
     calibration = _load_calibration(calibration_path)
-    records = tuple(LedgerStore(ledger_path).iter_records())
-    captures, forecasts, links, latest_results = _ledger_index(records)
+    captures, forecasts, links, latest_results = _resolve_ledger_records(
+        ledger_path,
+        manifest_entries,
+    )
     entries = tuple(
         _audit_entry(entry, captures, forecasts, links, latest_results)
         for entry in manifest_entries
@@ -506,6 +861,8 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the audit; expected input errors return exit code 2."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ledger", type=Path, default=Path("data/ledger/shadow.jsonl"))
     parser.add_argument(
@@ -524,9 +881,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("reports/private/shadow/audits/2026-07-28-review-coverage"),
     )
     args = parser.parse_args(argv)
-    audit = build_coverage_audit(args.ledger, args.calibration, args.manifest)
-    _atomic_write(args.output_dir / "audit.json", canonical_json(audit) + "\n")
-    _atomic_write(args.output_dir / "audit.md", render_coverage_audit_markdown(audit))
+    try:
+        audit = build_coverage_audit(args.ledger, args.calibration, args.manifest)
+        _atomic_write(args.output_dir / "audit.json", canonical_json(audit) + "\n")
+        _atomic_write(args.output_dir / "audit.md", render_coverage_audit_markdown(audit))
+    except (LedgerCorruptionError, ValueError) as error:
+        print(f"coverage-audit: {error}", file=sys.stderr)
+        return _INPUT_ERROR_EXIT_CODE
     return 0
 
 

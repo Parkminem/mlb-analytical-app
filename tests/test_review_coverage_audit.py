@@ -9,10 +9,13 @@ import sys
 
 import pytest
 
+import analysis.review.coverage_audit as coverage_audit_module
 from analysis.forecasting.identity import canonical_json
+from analysis.forecasting.inputs import MarketType
 from analysis.ledger import (
     CaptureCommand,
     ForecastCommand,
+    LedgerCorruptionError,
     LedgerStore,
     OfficialResultCommand,
     ReviewCommand,
@@ -79,7 +82,13 @@ def _write_calibration(path: Path) -> None:
                     "record_count": 7,
                     "state_hash": "frozen-state-hash",
                 },
-                "migration": {},
+                "migration": {
+                    "confirmed_games": _progress(0, 30),
+                    "market_types": {
+                        market_type.value: _progress(0, 25)
+                        for market_type in MarketType
+                    },
+                },
                 "overall": _official_metrics(),
                 "group_by": [],
                 "groups": [],
@@ -87,6 +96,17 @@ def _write_calibration(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _progress(count: int, threshold: int) -> dict[str, object]:
+    return {
+        "count": count,
+        "threshold": threshold,
+        "completed": min(count, threshold),
+        "remaining": max(threshold - count, 0),
+        "progress": min(count, threshold) / threshold,
+        "threshold_met": count >= threshold,
+    }
 
 
 def _comparison_payload(
@@ -377,7 +397,7 @@ def test_coverage_audit_resolves_only_recommended_ineligible_entries(tmp_path: P
         == latest_result.envelope.record_id
     )
     assert audit["entries"][1]["status"] == "unresolved"
-    adjusted_fields = {
+    assert set(audit["audit_only_metrics"]) == {
         "sample_size",
         "wins",
         "losses",
@@ -385,15 +405,6 @@ def test_coverage_audit_resolves_only_recommended_ineligible_entries(tmp_path: P
         "priced_stake_count",
         "profit_units",
         "roi",
-    }
-    assert {
-        key: value
-        for key, value in audit["audit_only_metrics"].items()
-        if key not in adjusted_fields
-    } == {
-        key: value
-        for key, value in audit["official_metrics"].items()
-        if key not in adjusted_fields
     }
     assert _sha256(ledger_path) == ledger_hash
     assert _sha256(calibration_path) == calibration_hash
@@ -443,6 +454,165 @@ def test_coverage_audit_rejects_a_mismatched_exact_link(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="link relationship does not resolve"):
         build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda calibration: calibration.update({"migration": 7}),
+            "migration must be a JSON object",
+        ),
+        (
+            lambda calibration: calibration.update({"group_by": "market_type"}),
+            "group_by must be a JSON array",
+        ),
+        (
+            lambda calibration: calibration.update({"groups": {"bad": "shape"}}),
+            "groups must be a JSON array",
+        ),
+        (
+            lambda calibration: calibration["overall"].update({"losses": 1}),
+            "outcome counts must sum to sample_size",
+        ),
+        (
+            lambda calibration: calibration.update({"schema_version": True}),
+            "calibration schema_version must be a positive integer",
+        ),
+    ),
+)
+def test_coverage_audit_rejects_invalid_calibration_schema_and_invariants(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    mutation(calibration)
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("path_name", "contents"),
+    (
+        ("manifest.json", '{"schema_version":1,"schema_version":1}'),
+        ("calibration-latest.json", '{"schema_version":NaN}'),
+        ("calibration-latest.json", '{"schema_version":Infinity}'),
+    ),
+)
+def test_coverage_audit_rejects_duplicate_and_nonfinite_json(
+    tmp_path: Path,
+    path_name: str,
+    contents: str,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    path = {
+        "manifest.json": manifest_path,
+        "calibration-latest.json": calibration_path,
+    }[path_name]
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="is not valid JSON"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+def test_coverage_audit_accepts_serialized_group_dimensions_out_of_order(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["group_by"] = ["model_version", "market_type"]
+    calibration["groups"] = [
+        {
+            "dimensions": {
+                "market_type": "full_total",
+                "model_version": "shadow-forecast-v1",
+            },
+            "metrics": _official_metrics(),
+        }
+    ]
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    assert build_coverage_audit(ledger_path, calibration_path, manifest_path)[
+        "official_metrics"
+    ] == _official_metrics()
+
+
+def test_coverage_audit_retains_only_exact_manifest_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    retained_sizes: list[tuple[int, int, int, int]] = []
+    original = coverage_audit_module._audit_entry
+
+    def inspect_retained_records(
+        entry,
+        captures,
+        forecasts,
+        links,
+        latest_results,
+    ):
+        retained_sizes.append(
+            (
+                len(captures),
+                len(forecasts),
+                len(links),
+                len(latest_results),
+            )
+        )
+        return original(entry, captures, forecasts, links, latest_results)
+
+    monkeypatch.setattr(
+        coverage_audit_module,
+        "_audit_entry",
+        inspect_retained_records,
+    )
+
+    build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+    assert retained_sizes == [(2, 2, 2, 1), (2, 2, 2, 1)]
+
+
+def test_coverage_audit_does_not_use_ledger_store_iterator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+
+    def fail_if_materialized(*args, **kwargs):
+        raise AssertionError("coverage audit must stream the ledger directly")
+
+    monkeypatch.setattr(LedgerStore, "iter_records", fail_if_materialized)
+
+    assert build_coverage_audit(ledger_path, calibration_path, manifest_path)[
+        "resolved_omission_count"
+    ] == 1
+
+
+def test_missing_ledger_does_not_create_parent_or_sidecars(tmp_path: Path) -> None:
+    _, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    ledger_path = tmp_path / "missing" / "shadow.jsonl"
+
+    with pytest.raises(ValueError, match="ledger does not exist"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+    assert not ledger_path.parent.exists()
+
+
+def test_invalid_ledger_does_not_create_lock_or_checkpoint(tmp_path: Path) -> None:
+    _, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    ledger_path = tmp_path / "invalid" / "shadow.jsonl"
+    ledger_path.parent.mkdir()
+    ledger_path.write_bytes(b"{invalid-json}\n")
+
+    with pytest.raises(LedgerCorruptionError, match="invalid ledger row"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+    assert tuple(ledger_path.parent.iterdir()) == (ledger_path,)
 
 
 @pytest.mark.parametrize(
@@ -528,6 +698,40 @@ def test_coverage_audit_module_cli_writes_exact_bytes_without_warning(
     assert (output_dir / "audit.md").read_bytes() == (
         render_coverage_audit_markdown(expected).encode()
     )
+
+
+def test_coverage_audit_module_cli_reports_validation_error_without_output(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    manifest_path.write_text("{invalid-json}", encoding="utf-8")
+    output_dir = tmp_path / "audit-output"
+
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "analysis.review.coverage_audit",
+            "--ledger",
+            str(ledger_path),
+            "--calibration",
+            str(calibration_path),
+            "--manifest",
+            str(manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ),
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "coverage-audit: manifest is not valid JSON\n"
+    assert "Traceback" not in result.stderr
+    assert not output_dir.exists()
 
 
 def test_july_28_manifest_has_exact_frozen_relationships() -> None:
