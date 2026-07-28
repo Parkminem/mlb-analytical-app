@@ -10,6 +10,7 @@ import unittest
 import zlib
 
 import analysis.shadow as shadow_module
+import pytest
 from analysis.ledger.forecast_codec import (
     compact_forecast_outputs,
     expand_component_distributions,
@@ -49,6 +50,8 @@ from analysis.shadow import (
     build_shadow_capture_command,
     compare_shadow_forecast,
     record_shadow_run,
+    require_recommended_review_eligibility,
+    validate_recommended_review_contract,
 )
 from tests.test_forecasting_engine import (
     _complete_game,
@@ -56,6 +59,7 @@ from tests.test_forecasting_engine import (
     _market,
     forecast_engine_module,
 )
+from tests.test_forecasting_inputs import complete_forecast_game
 
 
 deserialize_shadow_comparison = getattr(
@@ -230,22 +234,243 @@ def binding(
 def legacy_snapshot(
     *,
     candidates: tuple[PriorityMarketCandidate, ...] | None = None,
+    final_priority: tuple[str, ...] | None = None,
     review_bindings: tuple[CandidateReviewBinding, ...] | None = None,
 ) -> LegacyDecisionSnapshot:
     resolved_candidates = (candidate(),) if candidates is None else candidates
     resolved_bindings = (binding(),) if review_bindings is None else review_bindings
-    final_priority = tuple(
-        item.market
-        for item in resolved_candidates
-        if isinstance(item, PriorityMarketCandidate)
+    resolved_final_priority = (
+        tuple(
+            item.market
+            for item in resolved_candidates
+            if isinstance(item, PriorityMarketCandidate)
+        )
+        if final_priority is None
+        else final_priority
     )
     return LegacyDecisionSnapshot(
         model_version="legacy-fixed-v1",
         candidates=resolved_candidates,
-        final_priority=final_priority,
+        final_priority=resolved_final_priority,
         review_bindings=resolved_bindings,
         notes=("legacy remains authoritative",),
     )
+
+
+def test_recommended_contract_rejects_missing_lean_binding() -> None:
+    legacy = legacy_snapshot(
+        candidates=(candidate(rating="lean"),),
+        review_bindings=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"candidate\[0\] ml \(lean\): missing_pregame_binding",
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            complete_forecast_game().markets,
+        )
+
+
+def test_recommended_contract_allows_unbound_pass() -> None:
+    legacy = legacy_snapshot(
+        candidates=(candidate(rating="pass"),),
+        final_priority=(),
+        review_bindings=(),
+    )
+
+    validate_recommended_review_contract(
+        legacy,
+        complete_forecast_game().markets,
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    (
+        (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+                component_ids=("home_pitcher_chain_runs_allowed",),
+                contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+            ),
+            "invalid binding shape for starter_collapse",
+        ),
+        (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+                component_ids=(
+                    "away_pitcher_chain_runs_allowed",
+                    "home_pitcher_chain_runs_allowed",
+                ),
+                contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+            ),
+            "invalid binding shape for starter_suppression",
+        ),
+    ),
+)
+def test_recommended_contract_rejects_invalid_principal_path_shape(
+    path: PrincipalPathBinding,
+    expected: str,
+) -> None:
+    market = complete_forecast_game().markets[0]
+    legacy = legacy_snapshot(
+        candidates=(
+            candidate(
+                market="full_total",
+                evidence_paths=frozenset((path.evidence_path,)),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market="full_total",
+                paths=(path,),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+def test_recommended_contract_rejects_unknown_market_key() -> None:
+    legacy = legacy_snapshot(
+        review_bindings=(binding(market_key="unknown_market"),),
+    )
+
+    with pytest.raises(ValueError, match=r"candidate\[0\] ml \(play\): unknown_market_key unknown_market"):
+        validate_recommended_review_contract(
+            legacy,
+            complete_forecast_game().markets,
+        )
+
+
+def test_recommended_contract_rejects_candidate_market_mismatch() -> None:
+    legacy = legacy_snapshot(
+        review_bindings=(binding(legacy_market="full_total"),),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"candidate\[0\] ml \(play\): candidate_market_mismatch",
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            complete_forecast_game().markets,
+        )
+
+
+def test_recommended_contract_rejects_final_priority_without_candidate() -> None:
+    legacy = legacy_snapshot(final_priority=("full_total",))
+
+    with pytest.raises(
+        ValueError,
+        match="final_priority full_total: requires one play or lean candidate",
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            complete_forecast_game().markets,
+        )
+
+
+def test_recommended_contract_rejects_pass_in_final_priority() -> None:
+    legacy = legacy_snapshot(
+        candidates=(candidate(rating="pass"),),
+        final_priority=("ml",),
+        review_bindings=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="final_priority ml: requires one play or lean candidate",
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            complete_forecast_game().markets,
+        )
+
+
+def test_recommended_review_eligibility_allows_ineligible_pass() -> None:
+    forecast = run_forecast(_complete_game(), _fast_config())
+    legacy = legacy_snapshot(
+        candidates=(
+            candidate(),
+            candidate(market="full_total", rating="pass"),
+        ),
+        review_bindings=(binding(),),
+    )
+
+    comparison = compare_shadow_forecast(legacy, forecast)
+
+    assert require_recommended_review_eligibility(comparison) is None
+
+
+def test_recommended_review_eligibility_rejects_lean_invalid_path_count() -> None:
+    invalid_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+        component_ids=("home_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+    )
+    legacy = legacy_snapshot(
+        candidates=(
+            candidate(
+                rating="lean",
+                evidence_paths=frozenset((invalid_path.evidence_path,)),
+            ),
+        ),
+        review_bindings=(binding(paths=(invalid_path,)),),
+    )
+
+    comparison = compare_shadow_forecast(
+        legacy,
+        run_forecast(_complete_game(), _fast_config()),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"candidate\[0\] ml \(lean\) sea_ml: invalid_path_count"
+        ),
+    ):
+        require_recommended_review_eligibility(comparison)
+
+
+def test_recommended_review_eligibility_rejects_play_missing_distribution() -> None:
+    missing_distribution_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+        component_ids=(
+            "home_bullpen_segment_missing_exposed",
+            "home_pitcher_chain_workload_outs",
+        ),
+        contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
+    )
+    paths = (principal_paths()[0], missing_distribution_path)
+    legacy = legacy_snapshot(
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(
+                    path.evidence_path for path in paths
+                ),
+            ),
+        ),
+        review_bindings=(binding(paths=paths),),
+    )
+
+    comparison = compare_shadow_forecast(
+        legacy,
+        run_forecast(_complete_game(), _fast_config()),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"candidate\[0\] ml \(play\) sea_ml: "
+            r"missing_component_distribution"
+        ),
+    ):
+        require_recommended_review_eligibility(comparison)
 
 
 def three_way_f5_scenario():
@@ -1012,28 +1237,23 @@ class ShadowRecordingTests(unittest.TestCase):
                 expected_active_capture_id=None,
             )
 
-    def test_recording_preserves_candidate_market_mismatch_state(self) -> None:
+    def test_recording_blocks_candidate_market_mismatch(self) -> None:
         mismatched_binding = replace(
             binding(),
             legacy_market="full_total",
         )
         legacy = legacy_snapshot(review_bindings=(mismatched_binding,))
 
-        result = self.record(
-            legacy=legacy,
-            keys=self.keys("candidate-market-mismatch"),
-        )
-        market = result.forecast.outputs["shadow_comparison"][
-            "market_comparisons"
-        ][0]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"candidate\[0\] ml \(play\) sea_ml: candidate_market_mismatch",
+        ):
+            self.record(
+                legacy=legacy,
+                keys=self.keys("candidate-market-mismatch"),
+            )
 
-        self.assertFalse(market["review_eligible"])
-        self.assertEqual(
-            market["review_ineligibility_flags"],
-            ("candidate_market_mismatch",),
-        )
-        self.assertEqual(market["market_key"], mismatched_binding.market_key)
-        self.assertEqual(market["principal_paths"], ())
+        self.assertEqual(tuple(self.store.iter_records()), ())
 
     def test_recorded_payload_reconstructs_the_full_immutable_comparison(
         self,
@@ -1372,17 +1592,13 @@ class ShadowRecordingTests(unittest.TestCase):
             }.issubset(self.forecast.component_distributions)
         )
 
-        result = self.record(legacy=legacy, keys=self.keys("wrong-shape"))
-        market = result.forecast.outputs["shadow_comparison"][
-            "market_comparisons"
-        ][0]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"candidate\[0\] ml \(play\) sea_ml: invalid_path_count",
+        ):
+            self.record(legacy=legacy, keys=self.keys("wrong-shape"))
 
-        self.assertFalse(market["review_eligible"])
-        self.assertEqual(market["principal_paths"], ())
-        self.assertEqual(
-            market["review_ineligibility_flags"],
-            ("invalid_path_count",),
-        )
+        self.assertEqual(tuple(self.store.iter_records()), ())
 
     def test_market_input_type_rejects_wrong_horizon_despite_misleading_key(self) -> None:
         misleading_key = "looks:like:f5_total"
@@ -1414,21 +1630,18 @@ class ShadowRecordingTests(unittest.TestCase):
             ),
         )
 
-        result = self.record(
-            game=game,
-            legacy=legacy,
-            forecast=forecast,
-            keys=self.keys("wrong-horizon"),
-        )
-        market = result.forecast.outputs["shadow_comparison"][
-            "market_comparisons"
-        ][0]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"candidate\[0\] ml \(play\) looks:like:f5_total: invalid_path_count",
+        ):
+            self.record(
+                game=game,
+                legacy=legacy,
+                forecast=forecast,
+                keys=self.keys("wrong-horizon"),
+            )
 
-        self.assertFalse(market["review_eligible"])
-        self.assertEqual(
-            market["review_ineligibility_flags"],
-            ("invalid_path_count",),
-        )
+        self.assertEqual(tuple(self.store.iter_records()), ())
 
     def test_same_side_starter_paths_are_review_ineligible(self) -> None:
         same_side_paths = (
@@ -1457,16 +1670,13 @@ class ShadowRecordingTests(unittest.TestCase):
             review_bindings=(binding(paths=same_side_paths),),
         )
 
-        result = self.record(legacy=legacy, keys=self.keys("same-side"))
-        market = result.forecast.outputs["shadow_comparison"][
-            "market_comparisons"
-        ][0]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"candidate\[0\] ml \(play\) sea_ml: invalid_path_count",
+        ):
+            self.record(legacy=legacy, keys=self.keys("same-side"))
 
-        self.assertFalse(market["review_eligible"])
-        self.assertEqual(
-            market["review_ineligibility_flags"],
-            ("invalid_path_count",),
-        )
+        self.assertEqual(tuple(self.store.iter_records()), ())
 
     def test_retry_after_forecast_append_failure_completes_missing_link(self) -> None:
         failing_store = FailOnceAfterAppendStore(self.store, "forecast")

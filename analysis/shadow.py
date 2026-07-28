@@ -34,6 +34,7 @@ from analysis.forecasting.starter import (
     deserialize_pitcher_chain_forecast,
 )
 from analysis.forecasting.inputs import (
+    MarketInput,
     MarketType,
     NormalizedGameInput,
     SettlementFormat,
@@ -78,6 +79,7 @@ _INELIGIBILITY_FLAG_ORDER = (
     "missing_component_distribution",
 )
 _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
+_RECOMMENDED_DECISION_RATINGS = frozenset(("play", "lean"))
 _EVIDENCE_PATH_ORDER = {
     path: index for index, path in enumerate(PriorityEvidencePath)
 }
@@ -353,6 +355,79 @@ class LegacyDecisionSnapshot:
                     "evidence_paths"
                 )
         _require_string_tuple(self.notes, "notes")
+
+
+def validate_recommended_review_contract(
+    legacy: LegacyDecisionSnapshot,
+    markets: tuple[MarketInput, ...],
+) -> None:
+    if not isinstance(legacy, LegacyDecisionSnapshot):
+        raise TypeError("legacy must be LegacyDecisionSnapshot")
+    if not isinstance(markets, tuple) or any(
+        not isinstance(market, MarketInput) for market in markets
+    ):
+        raise TypeError("markets must be a tuple of MarketInput values")
+
+    markets_by_key = {market.market_key: market for market in markets}
+    bindings_by_index = {
+        binding.legacy_candidate_index: binding
+        for binding in legacy.review_bindings
+    }
+    errors: list[str] = []
+    recommended_markets: dict[str, int] = {}
+
+    for index, candidate in enumerate(legacy.candidates):
+        if candidate.decision_rating not in _RECOMMENDED_DECISION_RATINGS:
+            continue
+        if candidate.market in recommended_markets:
+            errors.append(
+                f"candidate[{index}] {candidate.market} "
+                f"({candidate.decision_rating}): duplicate_recommended_market"
+            )
+            continue
+        recommended_markets[candidate.market] = index
+        binding = bindings_by_index.get(index)
+        if binding is None:
+            errors.append(
+                f"candidate[{index}] {candidate.market} "
+                f"({candidate.decision_rating}): missing_pregame_binding"
+            )
+            continue
+        prefix = (
+            f"candidate[{index}] {candidate.market} "
+            f"({candidate.decision_rating})"
+        )
+        if binding.legacy_market != candidate.market:
+            errors.append(f"{prefix}: candidate_market_mismatch")
+            continue
+        market = markets_by_key.get(binding.market_key)
+        if market is None:
+            errors.append(f"{prefix}: unknown_market_key {binding.market_key}")
+            continue
+        if market.market_type.value != candidate.market:
+            errors.append(
+                f"{prefix}: market_type_mismatch {market.market_type.value}"
+            )
+            continue
+        try:
+            validate_principal_path_bindings(
+                market.market_type,
+                binding.principal_paths,
+            )
+        except ValueError as error:
+            errors.append(f"{prefix}: {error}")
+
+    for market in legacy.final_priority:
+        index = recommended_markets.get(market)
+        if index is None:
+            errors.append(
+                f"final_priority {market}: requires one play or lean candidate"
+            )
+
+    if errors:
+        raise ValueError(
+            "recommended review contract is invalid: " + "; ".join(errors)
+        )
 
 
 @dataclass(frozen=True)
@@ -1655,6 +1730,34 @@ def compare_shadow_forecast(
     )
 
 
+def require_recommended_review_eligibility(
+    comparison: ShadowComparison,
+) -> None:
+    if not isinstance(comparison, ShadowComparison):
+        raise TypeError("comparison must be ShadowComparison")
+    errors = []
+    for candidate, market in zip(
+        comparison.legacy.candidates,
+        comparison.market_comparisons,
+        strict=True,
+    ):
+        if candidate.decision_rating not in _RECOMMENDED_DECISION_RATINGS:
+            continue
+        if market.review_eligible:
+            continue
+        flags = ",".join(market.review_ineligibility_flags)
+        errors.append(
+            f"candidate[{market.legacy_candidate_index}] "
+            f"{candidate.market} ({candidate.decision_rating}) "
+            f"{market.market_key}: {flags}"
+        )
+    if errors:
+        raise ValueError(
+            "recommended review comparison is ineligible: "
+            + "; ".join(errors)
+        )
+
+
 def _principal_path_payload(path: PrincipalPathBinding) -> dict[str, object]:
     return {
         "evidence_path": path.evidence_path.value,
@@ -1872,6 +1975,7 @@ def record_shadow_run(
             "forecast market_inputs do not match canonical game_input markets"
         )
     comparison = compare_shadow_forecast(legacy, forecast)
+    require_recommended_review_eligibility(comparison)
     input_hash = capture_command.normalized_input_hash
     forecast_command = ForecastCommand(
         forecast_run_id=forecast.forecast_run_id,
@@ -1927,6 +2031,8 @@ __all__ = (
     "deserialize_forecast_context",
     "deserialize_shadow_comparison",
     "record_shadow_run",
+    "require_recommended_review_eligibility",
+    "validate_recommended_review_contract",
     "validate_frozen_market_output_binding",
     "validate_shadow_forecast_context",
 )
