@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -141,6 +143,12 @@ _SEMANTIC_MARKET_KEYS: Final = frozenset(
 )
 _RECOMMENDED_RATINGS: Final = frozenset(("play", "lean"))
 _INPUT_ERROR_EXIT_CODE: Final = 2
+_CANONICAL_JSON_ENCODER: Final = json.JSONEncoder(
+    allow_nan=False,
+    ensure_ascii=False,
+    separators=(",", ":"),
+    sort_keys=True,
+)
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, object]:
@@ -424,8 +432,48 @@ def _validated_record(
         ) from error
 
 
+def _canonical_json_chunks(value: object):
+    """Stream canonical JSON for JSON-decoded values without copying large rows."""
+
+    def validate(item: object) -> None:
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("canonical floats must be finite")
+            if item.is_integer():
+                raise ValueError("canonical JSON must not contain integral floats")
+        elif isinstance(item, Mapping):
+            for key, nested_item in item.items():
+                if not isinstance(key, str):
+                    raise TypeError("canonical mapping keys must be strings")
+                validate(nested_item)
+        elif isinstance(item, list):
+            for nested_item in item:
+                validate(nested_item)
+
+    validate(value)
+    yield from _CANONICAL_JSON_ENCODER.iterencode(value)
+
+
+def _has_canonical_json_framing(raw_line: bytes, value: object) -> bool:
+    offset = 0
+    for chunk in _canonical_json_chunks(value):
+        encoded = chunk.encode("utf-8")
+        if raw_line[offset : offset + len(encoded)] != encoded:
+            return False
+        offset += len(encoded)
+    return raw_line[offset:] == b"\n"
+
+
+def _payload_hash_from_canonical_chunks(value: object) -> str:
+    digest = hashlib.sha256()
+    for chunk in _canonical_json_chunks(value):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _validate_unselected_forecast(
     row: Mapping[str, object],
+    envelope: RecordEnvelope,
     line_number: int,
 ) -> None:
     _require_exact_keys(
@@ -447,6 +495,62 @@ def _validate_unselected_forecast(
         row["outputs"],
         f"ledger row {line_number} forecast.outputs",
     )
+    logical_payload = {
+        field_name: row[field_name]
+        for field_name in _FORECAST_RECORD_KEYS - {"envelope"}
+    }
+    if _payload_hash_from_canonical_chunks(logical_payload) != envelope.payload_hash:
+        raise ValueError("record payload hash mismatch")
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("ledger appended_at must be timezone-aware")
+    normalized = value.astimezone(timezone.utc).isoformat()
+    return f"{normalized[:-6]}Z"
+
+
+def _streamed_ledger_revision() -> tuple[
+    Callable[[RecordEnvelope], None],
+    Callable[[], tuple[Mapping[str, object], str | None]],
+]:
+    """Accumulate reporting's canonical ledger revision without retaining rows."""
+
+    state_hash = hashlib.sha256()
+    state_hash.update(b"[")
+    record_count = 0
+    latest_appended_at: datetime | None = None
+
+    def append(envelope: RecordEnvelope) -> None:
+        nonlocal record_count, latest_appended_at
+        if record_count:
+            state_hash.update(b",")
+        state_hash.update(
+            canonical_json(
+                {
+                    "record_kind": envelope.record_kind,
+                    "record_id": envelope.record_id,
+                    "idempotency_key": envelope.idempotency_key,
+                    "payload_hash": envelope.payload_hash,
+                    "appended_at": _utc_iso(envelope.appended_at),
+                }
+            ).encode("utf-8")
+        )
+        record_count += 1
+        if latest_appended_at is None or envelope.appended_at > latest_appended_at:
+            latest_appended_at = envelope.appended_at
+
+    def finish() -> tuple[Mapping[str, object], str | None]:
+        state_hash.update(b"]")
+        return (
+            {
+                "record_count": record_count,
+                "state_hash": state_hash.hexdigest(),
+            },
+            None if latest_appended_at is None else _utc_iso(latest_appended_at),
+        )
+
+    return append, finish
 
 
 def _slim_forecast(
@@ -485,6 +589,8 @@ def _resolve_ledger_records(
     Mapping[str, ForecastRecord],
     Mapping[str, CaptureForecastLink],
     Mapping[int, OfficialResultRecord],
+    Mapping[str, object],
+    str | None,
 ]:
     required_capture_ids = frozenset(
         _require_nonempty_string(entry["capture_id"], "capture_id")
@@ -525,6 +631,7 @@ def _resolve_ledger_records(
     pending_forecasts: dict[str, ForecastRecord] = {}
     links: dict[str, CaptureForecastLink] = {}
     latest_results: dict[int, OfficialResultRecord] = {}
+    append_revision, finish_revision = _streamed_ledger_revision()
 
     def retain_bound_forecast(forecast_run_id: str) -> None:
         forecast = pending_forecasts.get(forecast_run_id)
@@ -579,13 +686,17 @@ def _resolve_ledger_records(
                     parse_constant=_reject_json_constant,
                 )
                 row, envelope = _ledger_envelope(value, line_number)
+                if not _has_canonical_json_framing(raw_line, value):
+                    raise ValueError("ledger row must use canonical JSON")
                 if (
                     envelope.record_kind == "forecast"
                     and row.get("forecast_run_id") not in required_forecast_ids
                 ):
-                    _validate_unselected_forecast(row, line_number)
+                    _validate_unselected_forecast(row, envelope, line_number)
+                    append_revision(envelope)
                     continue
                 record = _validated_record(value, line_number)
+                append_revision(envelope)
             except LedgerCorruptionError:
                 raise
             except (
@@ -647,7 +758,27 @@ def _resolve_ledger_records(
                 latest_results[record.game_pk] = record
     for forecast_run_id in tuple(pending_forecasts):
         retain_bound_forecast(forecast_run_id)
-    return captures, forecasts, links, latest_results
+    revision, ledger_as_of = finish_revision()
+    return captures, forecasts, links, latest_results, revision, ledger_as_of
+
+
+def _validate_calibration_ledger_revision(
+    calibration: Mapping[str, object],
+    ledger_path: Path,
+    ledger_revision: Mapping[str, object],
+    ledger_as_of: str | None,
+) -> None:
+    if calibration["ledger_path"] != str(ledger_path.expanduser().resolve(strict=False)):
+        raise ValueError("calibration ledger_path does not match ledger")
+    calibration_revision = _require_mapping(
+        calibration["ledger_revision"],
+        "ledger_revision",
+    )
+    for field_name in ("record_count", "state_hash"):
+        if calibration_revision[field_name] != ledger_revision[field_name]:
+            raise ValueError(f"calibration {field_name} does not match ledger")
+    if calibration["ledger_as_of"] != ledger_as_of:
+        raise ValueError("calibration ledger_as_of does not match ledger")
 
 
 def _semantic_market(forecast: ForecastRecord, market_key: str) -> SemanticMarketInput:
@@ -813,9 +944,22 @@ def build_coverage_audit(
         raise TypeError("ledger_path, calibration_path, and manifest_path must be Paths")
     audit_id, manifest_entries = _load_manifest(manifest_path)
     calibration = _load_calibration(calibration_path)
-    captures, forecasts, links, latest_results = _resolve_ledger_records(
+    (
+        captures,
+        forecasts,
+        links,
+        latest_results,
+        ledger_revision,
+        ledger_as_of,
+    ) = _resolve_ledger_records(
         ledger_path,
         manifest_entries,
+    )
+    _validate_calibration_ledger_revision(
+        calibration,
+        ledger_path,
+        ledger_revision,
+        ledger_as_of,
     )
     entries = tuple(
         _audit_entry(entry, captures, forecasts, links, latest_results)

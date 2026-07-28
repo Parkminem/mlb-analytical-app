@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+import analysis.operator.reporting as reporting_module
 import analysis.review.coverage_audit as coverage_audit_module
 from analysis.forecasting.identity import canonical_json
 from analysis.forecasting.inputs import MarketType
@@ -76,17 +77,21 @@ def _official_metrics() -> dict[str, object]:
     }
 
 
-def _write_calibration(path: Path) -> None:
+def _write_calibration(path: Path, ledger_path: Path) -> None:
+    ledger_revision, appended_at_values = reporting_module._ledger_revision_mapping(
+        tuple(LedgerStore(ledger_path).iter_records())
+    )
     path.write_text(
         canonical_json(
             {
                 "schema_version": 1,
-                "ledger_as_of": "2026-07-28T12:00:00Z",
-                "ledger_path": "frozen-ledger.jsonl",
-                "ledger_revision": {
-                    "record_count": 7,
-                    "state_hash": "frozen-state-hash",
-                },
+                "ledger_as_of": (
+                    None
+                    if not appended_at_values
+                    else reporting_module._utc_iso(max(appended_at_values))
+                ),
+                "ledger_path": str(ledger_path.expanduser().resolve(strict=False)),
+                "ledger_revision": ledger_revision,
                 "migration": {
                     "confirmed_games": _progress(0, 30),
                     "market_types": {
@@ -393,7 +398,7 @@ def _audit_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         ],
     )
     calibration_path = tmp_path / "calibration-latest.json"
-    _write_calibration(calibration_path)
+    _write_calibration(calibration_path, ledger_path)
     return ledger_path, calibration_path, manifest_path
 
 
@@ -516,6 +521,103 @@ def test_coverage_audit_rejects_rehashed_required_forecast_cross_binding(
 
     with pytest.raises(LedgerCorruptionError, match=message):
         build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+def test_coverage_audit_rejects_tampered_unselected_forecast_payload_hash(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected_forecast_ids = {
+        entry["forecast_run_id"] for entry in manifest["entries"]
+    }
+    rows = [
+        json.loads(line)
+        for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in rows:
+        if (
+            row.get("envelope", {}).get("record_kind") == "forecast"
+            and row["forecast_run_id"] not in selected_forecast_ids
+        ):
+            market = next(iter(row["outputs"]["market_inputs"].values()))
+            market["line"] = 9.5
+            break
+    else:
+        raise AssertionError("unselected forecast row was not found")
+    ledger_path.write_text(
+        "".join(f"{canonical_json(row)}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LedgerCorruptionError, match="record payload hash mismatch"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    (
+        ("ledger_path", lambda calibration: calibration.update({"ledger_path": "unrelated-ledger.jsonl"})),
+        (
+            "record_count",
+            lambda calibration: calibration["ledger_revision"].update(
+                {"record_count": calibration["ledger_revision"]["record_count"] + 1}
+            ),
+        ),
+        (
+            "state_hash",
+            lambda calibration: calibration["ledger_revision"].update(
+                {"state_hash": "0" * 64}
+            ),
+        ),
+        (
+            "ledger_as_of",
+            lambda calibration: calibration.update(
+                {"ledger_as_of": "1999-01-01T00:00:00Z"}
+            ),
+        ),
+    ),
+)
+def test_coverage_audit_cli_rejects_unrelated_calibration_revision_without_output(
+    tmp_path: Path,
+    field: str,
+    mutation,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    mutation(calibration)
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+    ledger_hash = _sha256(ledger_path)
+    calibration_hash = _sha256(calibration_path)
+    output_dir = tmp_path / "audit-output"
+
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "analysis.review.coverage_audit",
+            "--ledger",
+            str(ledger_path),
+            "--calibration",
+            str(calibration_path),
+            "--manifest",
+            str(manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ),
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == f"coverage-audit: calibration {field} does not match ledger\n"
+    assert "Traceback" not in result.stderr
+    assert not output_dir.exists()
+    assert _sha256(ledger_path) == ledger_hash
+    assert _sha256(calibration_path) == calibration_hash
 
 
 @pytest.mark.parametrize(
@@ -714,7 +816,7 @@ def test_coverage_audit_requires_recommended_ineligible_comparison(
         ],
     )
     calibration_path = tmp_path / "calibration-latest.json"
-    _write_calibration(calibration_path)
+    _write_calibration(calibration_path, ledger_path)
 
     with pytest.raises(ValueError, match=message):
         build_coverage_audit(ledger_path, calibration_path, manifest_path)

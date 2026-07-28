@@ -286,6 +286,100 @@ def test_recommended_contract_allows_unbound_pass() -> None:
     )
 
 
+def _additional_valid_full_game_paths() -> tuple[PrincipalPathBinding, ...]:
+    return (
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.RECENT_RUN_CONVERSION,
+            component_ids=(
+                "away_full_runs",
+                "away_full_traffic",
+                "away_full_extra_base_hits",
+            ),
+            contradiction_rule=(
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+        ),
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+            component_ids=(
+                "away_full_runs",
+                "away_full_traffic",
+                "away_full_extra_base_hits",
+            ),
+            contradiction_rule=(
+                ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+            ),
+        ),
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+            component_ids=(
+                "home_bullpen_segment_missing_exposed",
+                "home_pitcher_chain_workload_outs",
+            ),
+            contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    (
+        (principal_paths()[0],),
+        principal_paths() + _additional_valid_full_game_paths(),
+        (principal_paths()[0], principal_paths()[0]),
+    ),
+    ids=("one_path", "more_than_four_paths", "duplicate_evidence_path"),
+)
+def test_recommended_contract_rejects_invalid_static_path_cardinality_or_identity(
+    paths: tuple[PrincipalPathBinding, ...],
+) -> None:
+    market = complete_forecast_game().markets[0]
+    legacy = legacy_snapshot(
+        candidates=(
+            candidate(
+                market="full_total",
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market="full_total",
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"candidate\[0\] full_total \(play\): invalid_path_count",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+def test_recommended_contract_rejects_duplicate_final_priority_market() -> None:
+    market = complete_forecast_game().markets[0]
+    legacy = legacy_snapshot(
+        candidates=(candidate(market="full_total"),),
+        final_priority=("full_total", "full_total"),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market="full_total",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"final_priority\[1\] full_total: "
+            "duplicate_final_priority_market"
+        ),
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     (

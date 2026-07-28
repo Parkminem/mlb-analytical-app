@@ -416,8 +416,19 @@ def validate_recommended_review_contract(
             )
         except ValueError as error:
             errors.append(f"{prefix}: {error}")
+            continue
+        if not _paths_have_valid_count_and_identity(binding.principal_paths):
+            errors.append(f"{prefix}: invalid_path_count")
 
-    for market in legacy.final_priority:
+    seen_final_priority_markets: set[str] = set()
+    for priority_index, market in enumerate(legacy.final_priority):
+        if market in seen_final_priority_markets:
+            errors.append(
+                f"final_priority[{priority_index}] {market}: "
+                "duplicate_final_priority_market"
+            )
+            continue
+        seen_final_priority_markets.add(market)
         index = recommended_markets.get(market)
         if index is None:
             errors.append(

@@ -255,6 +255,38 @@ def test_invalid_recommended_contract_before_forecast(
     assert not bundles.exists()
 
 
+def test_invalid_static_path_count_rejects_before_forecast_without_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    legacy = _complete_legacy_decision_mapping()
+    candidate = legacy["candidates"][0]
+    binding = legacy["review_bindings"][0]
+    candidate["evidence_paths"] = ["starter_suppression"]
+    binding["principal_paths"] = binding["principal_paths"][:1]
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        legacy,
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("forecast must not run")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match=r"candidate\[0\] ml \(play\): invalid_path_count",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.parent.exists()
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
 def test_exact_replay_wins_over_a_stale_fresh_ledger_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
