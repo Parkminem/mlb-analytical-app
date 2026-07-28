@@ -690,6 +690,7 @@ class LedgerStore:
         path: Path | str,
         *,
         _resolve_path_aliases: bool = True,
+        _create: bool = True,
     ) -> None:
         candidate_path = Path(path)
         self.path = (
@@ -697,7 +698,9 @@ class LedgerStore:
             if _resolve_path_aliases
             else Path(os.path.abspath(os.fspath(candidate_path)))
         )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._create = _create
+        if self._create:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         self.checkpoint_path = checkpoint_path_for(self.path)
         self._parent_path = self.path.parent
@@ -716,12 +719,13 @@ class LedgerStore:
         )
         try:
             self._reject_existing_hard_links()
-            descriptor = self._open_no_follow(
-                self._lock_name,
-                os.O_CREAT | os.O_RDWR,
-                "ledger lock",
-            )
-            os.close(descriptor)
+            if self._create:
+                descriptor = self._open_no_follow(
+                    self._lock_name,
+                    os.O_CREAT | os.O_RDWR,
+                    "ledger lock",
+                )
+                os.close(descriptor)
         except Exception:
             self._parent_descriptor_finalizer()
             raise
@@ -733,6 +737,12 @@ class LedgerStore:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(self._parent_path, flags)
+        except FileNotFoundError:
+            if not self._create:
+                raise
+            raise LedgerCorruptionError(
+                "ledger parent directory cannot be opened safely"
+            ) from None
         except OSError as error:
             raise LedgerCorruptionError(
                 "ledger parent directory cannot be opened safely"
@@ -2004,6 +2014,26 @@ class LedgerStore:
 
         with PregameLedgerSession(self, exclusive=False) as session:
             return session.lookup(capture_key, forecast_run_id, game_pk)
+
+    @classmethod
+    def lookup_existing_shadow_pregame(
+        cls,
+        path: Path | str,
+        capture_key: str,
+        forecast_run_id: str,
+        game_pk: int,
+    ) -> "PregameLookup | None":
+        """Read an existing pregame relationship without materializing files."""
+
+        try:
+            store = cls(path, _create=False)
+            return store.lookup_shadow_pregame(
+                capture_key,
+                forecast_run_id,
+                game_pk,
+            )
+        except FileNotFoundError:
+            return None
 
     def append_shadow_run_atomic(
         self,

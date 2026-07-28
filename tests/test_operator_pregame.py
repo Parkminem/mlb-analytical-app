@@ -255,6 +255,128 @@ def test_invalid_recommended_contract_before_forecast(
     assert not bundles.exists()
 
 
+def test_exact_replay_wins_over_a_stale_fresh_ledger_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _invalid_recommended_legacy_mapping(),
+    )
+
+    with monkeypatch.context() as gates:
+        gates.setattr(
+            service_module,
+            "validate_recommended_review_contract",
+            lambda *args, **kwargs: None,
+        )
+        gates.setattr(
+            service_module,
+            "require_recommended_review_eligibility",
+            lambda *args, **kwargs: None,
+        )
+        gates.setattr(
+            shadow_module,
+            "require_recommended_review_eligibility",
+            lambda *args, **kwargs: None,
+        )
+        historical = run_projected(
+            bundle,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    path_exists = Path.exists
+
+    def stale_exists(path: Path) -> bool:
+        if path == ledger:
+            return False
+        return path_exists(path)
+
+    monkeypatch.setattr(Path, "exists", stale_exists)
+
+    replay = run_projected(
+        bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert replay.capture == historical.capture
+    assert replay.forecast == historical.forecast
+    assert replay.link == historical.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+
+
+def test_fresh_dynamic_rejection_creates_no_ledger_artifacts(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    legacy = _complete_legacy_decision_mapping()
+    candidate = legacy["candidates"][0]
+    binding = legacy["review_bindings"][0]
+    candidate["evidence_paths"] = [
+        "starter_suppression",
+        "late_bullpen_exposure",
+    ]
+    binding["principal_paths"].append(
+        {
+            "evidence_path": "late_bullpen_exposure",
+            "component_ids": [
+                "home_bullpen_segment_missing_exposed",
+                "home_pitcher_chain_workload_outs",
+            ],
+            "contradiction_rule": "late_bullpen_exposure",
+        }
+    )
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        legacy,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="recommended review comparison is ineligible",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.parent.exists()
+    assert not ledger.exists()
+    assert not ledger.with_name(f"{ledger.name}.lock").exists()
+    assert not ledger.with_name(f"{ledger.name}.checkpoint-v1.json").exists()
+    assert not bundles.exists()
+
+
+def test_successful_operator_run_constructs_one_shadow_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _valid_recommended_legacy_mapping(),
+    )
+    real_compare = shadow_module.compare_shadow_forecast
+    calls = 0
+
+    def compare_spy(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_compare(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "compare_shadow_forecast", compare_spy)
+    monkeypatch.setattr(shadow_module, "compare_shadow_forecast", compare_spy)
+
+    run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("stage", "runner", "game_factory"),
     (

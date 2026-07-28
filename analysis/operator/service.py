@@ -496,6 +496,68 @@ def _exact_pregame_replay(
     return capture, forecast, link
 
 
+def _existing_exact_pregame_replay(
+    ledger_path: str | Path,
+    bundle: _Bundle,
+    *,
+    expected_stage: str,
+    command: CaptureCommand,
+    capture_key: str,
+    forecast_run_id: str,
+    config: SimulationConfig,
+) -> tuple[CaptureRecord, ForecastRecord, CaptureForecastLink] | None:
+    lookup_existing = getattr(
+        LedgerStore,
+        "lookup_existing_shadow_pregame",
+        None,
+    )
+    if not callable(lookup_existing):
+        return None
+    lookup = _ledger_operation(
+        "unable to look up existing shadow pregame replay",
+        lambda: lookup_existing(
+            ledger_path,
+            capture_key,
+            forecast_run_id,
+            bundle.game_pk,
+        ),
+    )
+    if lookup is None:
+        return None
+    return _exact_pregame_replay(
+        lookup,
+        bundle,
+        expected_stage=expected_stage,
+        command=command,
+        capture_key=capture_key,
+        forecast_run_id=forecast_run_id,
+        config=config,
+    )
+
+
+def _replayed_pregame_result(
+    bundle: _Bundle,
+    *,
+    expected_stage: str,
+    exact_replay: tuple[CaptureRecord, ForecastRecord, CaptureForecastLink],
+    bundle_root: str | Path,
+) -> PregameRunResult:
+    capture, stored_forecast, link = exact_replay
+    managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+    return PregameRunResult(
+        stage=expected_stage,
+        game_pk=bundle.game_pk,
+        lineup_state=capture.lineup_state,
+        capture=capture,
+        forecast=stored_forecast,
+        link=link,
+        managed_bundle=managed_bundle,
+        capture_replayed=True,
+        forecast_replayed=True,
+        link_replayed=True,
+    )
+
+
 def _pregame_partial_progress(
     store: LedgerStore,
     bundle: _Bundle,
@@ -585,14 +647,74 @@ def _run_pregame(
         )
     )
 
-    if not Path(ledger_path).exists():
-        try:
-            validate_recommended_review_contract(
-                bundle.payload.legacy_decision,
-                bundle.payload.game_input.markets,
+    exact_replay = _existing_exact_pregame_replay(
+        ledger_path,
+        bundle,
+        expected_stage=expected_stage,
+        command=command,
+        capture_key=capture_key,
+        forecast_run_id=forecast_run_id,
+        config=config,
+    )
+    if exact_replay is not None:
+        return _replayed_pregame_result(
+            bundle,
+            expected_stage=expected_stage,
+            exact_replay=exact_replay,
+            bundle_root=bundle_root,
+        )
+
+    try:
+        validate_recommended_review_contract(
+            bundle.payload.legacy_decision,
+            bundle.payload.game_input.markets,
+        )
+    except ValueError as error:
+        exact_replay = _existing_exact_pregame_replay(
+            ledger_path,
+            bundle,
+            expected_stage=expected_stage,
+            command=command,
+            capture_key=capture_key,
+            forecast_run_id=forecast_run_id,
+            config=config,
+        )
+        if exact_replay is not None:
+            return _replayed_pregame_result(
+                bundle,
+                expected_stage=expected_stage,
+                exact_replay=exact_replay,
+                bundle_root=bundle_root,
             )
-        except ValueError as error:
-            raise OperatorPreconditionError(str(error)) from error
+        raise OperatorPreconditionError(str(error)) from error
+
+    forecast = _pregame_operation(
+        lambda: run_forecast(bundle.payload.game_input, config)
+    )
+    comparison = compare_shadow_forecast(
+        bundle.payload.legacy_decision,
+        forecast,
+    )
+    try:
+        require_recommended_review_eligibility(comparison)
+    except ValueError as error:
+        exact_replay = _existing_exact_pregame_replay(
+            ledger_path,
+            bundle,
+            expected_stage=expected_stage,
+            command=command,
+            capture_key=capture_key,
+            forecast_run_id=forecast_run_id,
+            config=config,
+        )
+        if exact_replay is not None:
+            return _replayed_pregame_result(
+                bundle,
+                expected_stage=expected_stage,
+                exact_replay=exact_replay,
+                bundle_root=bundle_root,
+            )
+        raise OperatorPreconditionError(str(error)) from error
 
     store = _open_ledger(ledger_path)
     capture_replayed: bool | None = None
@@ -618,43 +740,15 @@ def _run_pregame(
             config=config,
         )
         if exact_replay is not None:
-            capture, stored_forecast, link = exact_replay
             capture_replayed = True
             forecast_replayed = True
             link_replayed = True
-            managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
-            return PregameRunResult(
-                stage=expected_stage,
-                game_pk=bundle.game_pk,
-                lineup_state=capture.lineup_state,
-                capture=capture,
-                forecast=stored_forecast,
-                link=link,
-                managed_bundle=managed_bundle,
-                capture_replayed=True,
-                forecast_replayed=True,
-                link_replayed=True,
+            return _replayed_pregame_result(
+                bundle,
+                expected_stage=expected_stage,
+                exact_replay=exact_replay,
+                bundle_root=bundle_root,
             )
-
-        try:
-            validate_recommended_review_contract(
-                bundle.payload.legacy_decision,
-                bundle.payload.game_input.markets,
-            )
-        except ValueError as error:
-            raise OperatorPreconditionError(str(error)) from error
-
-        forecast = _pregame_operation(
-            lambda: run_forecast(bundle.payload.game_input, config)
-        )
-        comparison = compare_shadow_forecast(
-            bundle.payload.legacy_decision,
-            forecast,
-        )
-        try:
-            require_recommended_review_eligibility(comparison)
-        except ValueError as error:
-            raise OperatorPreconditionError(str(error)) from error
         for attempt in range(_HEAD_CAS_MAX_ATTEMPTS):
             if attempt:
                 lookup = _ledger_operation(
@@ -693,6 +787,7 @@ def _run_pregame(
                             bundle.payload.legacy_decision,
                             forecast,
                             ShadowRunIdempotencyKeys(capture=capture_key),
+                            comparison=comparison,
                             supersedes_capture_id=supersedes_capture_id,
                             expected_active_capture_id=(
                                 None

@@ -1934,6 +1934,7 @@ def record_shadow_run(
     forecast: ForecastOutput,
     idempotency_keys: ShadowRunIdempotencyKeys,
     *,
+    comparison: ShadowComparison | None = None,
     supersedes_capture_id: str | None = None,
     expected_active_capture_id: (
         str | None | _ExpectedActiveCaptureIdUnset
@@ -1974,7 +1975,16 @@ def record_shadow_run(
         raise ValueError(
             "forecast market_inputs do not match canonical game_input markets"
         )
-    comparison = compare_shadow_forecast(legacy, forecast)
+    if comparison is None:
+        comparison = compare_shadow_forecast(legacy, forecast)
+    elif (
+        not isinstance(comparison, ShadowComparison)
+        or comparison.legacy != legacy
+        or comparison.forecast_run_id != forecast.forecast_run_id
+    ):
+        raise ValueError(
+            "comparison must match the supplied legacy decision and forecast"
+        )
     require_recommended_review_eligibility(comparison)
     input_hash = capture_command.normalized_input_hash
     forecast_command = ForecastCommand(

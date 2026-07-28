@@ -89,8 +89,12 @@ class PregameLedgerSession:
                 self._store._lock_name,
                 "ledger lock",
             )
-            ledger_flags = os.O_RDWR | (os.O_APPEND if self._exclusive else 0)
-            if self._store._ledger_identity is None:
+            ledger_flags = (
+                os.O_RDWR | (os.O_APPEND if self._exclusive else 0)
+                if self._exclusive
+                else os.O_RDONLY
+            )
+            if self._store._create and self._store._ledger_identity is None:
                 ledger_flags |= os.O_CREAT
             self._ledger_descriptor = self._store._open_no_follow(
                 self._store._ledger_name,
