@@ -20,6 +20,11 @@ from analysis.ledger import (
     OfficialResultCommand,
     ReviewCommand,
 )
+from analysis.ledger.store import (
+    _deserialize_record,
+    _logical_payload,
+    _payload_hash,
+)
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.review.classification import (
     ContradictionRule,
@@ -269,6 +274,30 @@ def _write_manifest(path: Path, entries: list[dict[str, object]]) -> None:
     )
 
 
+def _rewrite_forecast_with_valid_payload_hash(
+    ledger_path: Path,
+    forecast_run_id: str,
+    mutate,
+) -> None:
+    rows = [
+        json.loads(line)
+        for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in rows:
+        if row.get("forecast_run_id") != forecast_run_id:
+            continue
+        mutate(row)
+        record = _deserialize_record(row)
+        row["envelope"]["payload_hash"] = _payload_hash(_logical_payload(record))
+        break
+    else:
+        raise AssertionError("required forecast row was not found")
+    ledger_path.write_text(
+        "".join(f"{canonical_json(row)}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
 def _audit_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     ledger_path = tmp_path / "shadow.jsonl"
     store = LedgerStore(ledger_path)
@@ -453,6 +482,39 @@ def test_coverage_audit_rejects_a_mismatched_exact_link(tmp_path: Path) -> None:
     manifest_path.write_text(canonical_json(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="link relationship does not resolve"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (
+            lambda row: row.update({"normalized_input_hash": "tampered-input"}),
+            "capture and forecast normalized_input_hash must match",
+        ),
+        (
+            lambda row: row["outputs"]["market_inputs"]
+            [next(iter(row["outputs"]["market_inputs"]))].update({"line": 9.5}),
+            "forecast market_inputs must exactly match canonical capture markets",
+        ),
+    ),
+)
+def test_coverage_audit_rejects_rehashed_required_forecast_cross_binding(
+    tmp_path: Path,
+    mutate,
+    message: str,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forecast_run_id = manifest["entries"][0]["forecast_run_id"]
+
+    _rewrite_forecast_with_valid_payload_hash(
+        ledger_path,
+        forecast_run_id,
+        mutate,
+    )
+
+    with pytest.raises(LedgerCorruptionError, match=message):
         build_coverage_audit(ledger_path, calibration_path, manifest_path)
 
 

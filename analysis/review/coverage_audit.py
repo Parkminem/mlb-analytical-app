@@ -27,6 +27,7 @@ from analysis.ledger import (
 from analysis.ledger.store import (
     LedgerCorruptionError,
     _deserialize_record,
+    _forecast_markets_match_capture,
     _logical_payload,
     _parse_datetime,
     _payload_hash,
@@ -505,7 +506,10 @@ def _resolve_ledger_records(
         for entry in manifest_entries
     )
     market_keys_by_forecast: dict[str, set[str]] = {}
+    capture_ids_by_forecast: dict[str, set[str]] = {}
+    forecast_ids_by_capture: dict[str, set[str]] = {}
     for entry in manifest_entries:
+        capture_id = _require_nonempty_string(entry["capture_id"], "capture_id")
         forecast_run_id = _require_nonempty_string(
             entry["forecast_run_id"],
             "forecast_run_id",
@@ -513,11 +517,38 @@ def _resolve_ledger_records(
         market_keys_by_forecast.setdefault(forecast_run_id, set()).add(
             _require_nonempty_string(entry["market_key"], "market_key")
         )
+        capture_ids_by_forecast.setdefault(forecast_run_id, set()).add(capture_id)
+        forecast_ids_by_capture.setdefault(capture_id, set()).add(forecast_run_id)
 
     captures: dict[str, CaptureRecord] = {}
     forecasts: dict[str, ForecastRecord] = {}
+    pending_forecasts: dict[str, ForecastRecord] = {}
     links: dict[str, CaptureForecastLink] = {}
     latest_results: dict[int, OfficialResultRecord] = {}
+
+    def retain_bound_forecast(forecast_run_id: str) -> None:
+        forecast = pending_forecasts.get(forecast_run_id)
+        if forecast is None:
+            return
+        capture_ids = capture_ids_by_forecast[forecast_run_id]
+        if not all(capture_id in captures for capture_id in capture_ids):
+            return
+        for capture_id in capture_ids:
+            capture = captures[capture_id]
+            if capture.normalized_input_hash != forecast.normalized_input_hash:
+                raise LedgerCorruptionError(
+                    "capture and forecast normalized_input_hash must match"
+                )
+            if not _forecast_markets_match_capture(capture, forecast):
+                raise LedgerCorruptionError(
+                    "forecast market_inputs must exactly match canonical "
+                    "capture markets"
+                )
+        forecasts[forecast_run_id] = _slim_forecast(
+            forecast,
+            frozenset(market_keys_by_forecast[forecast_run_id]),
+        )
+        del pending_forecasts[forecast_run_id]
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(ledger_path, flags)
@@ -576,16 +607,19 @@ def _resolve_ledger_records(
                 if record.capture_id in captures:
                     raise LedgerCorruptionError("duplicate required capture_id")
                 captures[record.capture_id] = record
+                for forecast_run_id in forecast_ids_by_capture[record.capture_id]:
+                    retain_bound_forecast(forecast_run_id)
             elif (
                 isinstance(record, ForecastRecord)
                 and record.forecast_run_id in required_forecast_ids
             ):
-                if record.forecast_run_id in forecasts:
+                if (
+                    record.forecast_run_id in forecasts
+                    or record.forecast_run_id in pending_forecasts
+                ):
                     raise LedgerCorruptionError("duplicate required forecast_run_id")
-                forecasts[record.forecast_run_id] = _slim_forecast(
-                    record,
-                    frozenset(market_keys_by_forecast[record.forecast_run_id]),
-                )
+                pending_forecasts[record.forecast_run_id] = record
+                retain_bound_forecast(record.forecast_run_id)
             elif (
                 isinstance(record, CaptureForecastLink)
                 and record.envelope.record_id in required_link_ids
@@ -611,6 +645,8 @@ def _resolve_ledger_records(
                         "official result must supersede the latest result"
                     )
                 latest_results[record.game_pk] = record
+    for forecast_run_id in tuple(pending_forecasts):
+        retain_bound_forecast(forecast_run_id)
     return captures, forecasts, links, latest_results
 
 

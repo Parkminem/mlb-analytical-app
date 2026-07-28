@@ -162,3 +162,45 @@ Generated audit hashes:
 f38f659e88e85505fa0deb87e1859975d5d4f96b04d144c4c70bb54358814be4  audit.json
 e7a48b2c2cab5b4aa593872bd84b87824685df34875002cbcdcd7699307f7a90  audit.md
 ```
+
+## Re-review Follow-up
+
+The final P1 re-review blocker was fixed in a second follow-up commit.
+
+- Required forecasts now remain pending only until their manifest-selected
+  captures are available. Before a forecast is slimmed or used for settlement,
+  the resolver requires equal `normalized_input_hash` values and invokes the
+  authoritative ledger canonical market-binding helper.
+- The canonical binding covers every frozen market term: market key, market
+  type, settlement format, selected side (including team-alias normalization),
+  line, selected decimal price, and opposing decimal price.
+- Focused RED regressions mutate a required forecast's normalized input hash
+  and line, recompute its envelope payload hash, and confirm both corruptions
+  are rejected before audit construction.
+
+### Verification
+
+```text
+.venv/bin/python -m pytest -q tests/test_review_coverage_audit.py
+25 passed in 0.47s
+
+.venv/bin/python -m pytest -q tests/test_review_*.py tests/test_operator_*.py
+438 passed, 174 subtests passed in 14.79s
+```
+
+The real immutable July 28 audit remained stable:
+
+```text
+/usr/bin/time -l ...
+2.44 real, 2.40 user, 0.02 sys
+62,308,352 maximum resident set size
+```
+
+The input and generated audit SHA-256 hashes remained unchanged:
+
+```text
+12d8d045ffbacd4b726318854ada9c660aab206b68113758fa265e39239e8692  data/ledger/shadow.jsonl
+926c8afc4f8d7a7395060afd9a14e9dcffa4ab64eae44d47d8695bdecb418a12  calibration-latest.json
+f38f659e88e85505fa0deb87e1859975d5d4f96b04d144c4c70bb54358814be4  audit.json
+e7a48b2c2cab5b4aa593872bd84b87824685df34875002cbcdcd7699307f7a90  audit.md
+```
