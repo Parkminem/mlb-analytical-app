@@ -1985,6 +1985,12 @@ def record_shadow_run(
         raise ValueError(
             "comparison must match the supplied legacy decision and forecast"
         )
+    validate_shadow_forecast_context(
+        comparison,
+        forecast.market_inputs,
+        forecast.markets,
+        forecast.component_distributions,
+    )
     require_recommended_review_eligibility(comparison)
     input_hash = capture_command.normalized_input_hash
     forecast_command = ForecastCommand(

@@ -165,6 +165,7 @@ class PregameLedgerSession:
                     self._store.path,
                     self._ledger_descriptor,
                     records,
+                    publish=self._store._create,
                 )
                 final_stat, final_sha256 = ledger_state(
                     self._ledger_descriptor

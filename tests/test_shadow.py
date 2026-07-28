@@ -1255,6 +1255,44 @@ class ShadowRecordingTests(unittest.TestCase):
 
         self.assertEqual(tuple(self.store.iter_records()), ())
 
+    def test_recording_rejects_spoofed_precomputed_comparison(self) -> None:
+        comparison = compare_shadow_forecast(self.legacy, self.forecast)
+        market = self.forecast.markets["sea_ml"]
+        spoofed_market = replace(
+            price_market(
+                OutcomeProbabilities(
+                    win=market.probabilities.win - 0.01,
+                    push=market.probabilities.push,
+                    loss=market.probabilities.loss + 0.01,
+                ),
+                market.selected_decimal_price,
+                market.opposing_decimal_price,
+            ),
+            semantic_fingerprint=market.semantic_fingerprint,
+        )
+        spoofed_forecast = replace(
+            self.forecast,
+            markets={
+                **self.forecast.markets,
+                "sea_ml": spoofed_market,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "shadow market evaluation model_win_probability must match",
+        ):
+            record_shadow_run(
+                self.store,
+                self.game,
+                self.legacy,
+                spoofed_forecast,
+                self.keys("spoofed-comparison"),
+                comparison=comparison,
+            )
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
     def test_recorded_payload_reconstructs_the_full_immutable_comparison(
         self,
     ) -> None:

@@ -618,6 +618,8 @@ def build_checkpoint_from_descriptor(
     ledger_path: Path,
     ledger_descriptor: int,
     records: Sequence[LedgerRecord],
+    *,
+    publish: bool = True,
 ) -> LedgerCheckpoint:
     """Build from a caller-locked authoritative ledger descriptor."""
 
@@ -645,11 +647,12 @@ def build_checkpoint_from_descriptor(
         ),
         records=indexed_records,
     )
-    try:
-        _publish_checkpoint(checkpoint)
-    except (CheckpointError, OSError):
-        # Publication is acceleration only; the validated in-memory index is usable.
-        pass
+    if publish:
+        try:
+            _publish_checkpoint(checkpoint)
+        except (CheckpointError, OSError):
+            # Publication is acceleration only; the validated in-memory index is usable.
+            pass
     return checkpoint
 
 

@@ -351,6 +351,84 @@ def test_fresh_dynamic_rejection_creates_no_ledger_artifacts(
     assert not bundles.exists()
 
 
+@pytest.mark.parametrize("rejection", ("static", "dynamic"))
+@pytest.mark.parametrize("checkpoint_state", ("missing", "stale"))
+def test_existing_rejection_does_not_update_checkpoint(
+    tmp_path: Path,
+    rejection: str,
+    checkpoint_state: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    run_projected(
+        _pregame_bundle("projected", _projected_game()),
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+    checkpoint = ledger.with_name(f"{ledger.name}.checkpoint-v1.json")
+    lock = ledger.with_name(f"{ledger.name}.lock")
+    assert checkpoint.exists()
+    if checkpoint_state == "missing":
+        checkpoint.unlink()
+        checkpoint_before = None
+    else:
+        ledger.touch()
+        checkpoint_before = checkpoint.read_bytes()
+    ledger_before = ledger.read_bytes()
+    lock_before = lock.read_bytes()
+    bundles_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    if rejection == "static":
+        bundle = _bundle_with_legacy(
+            "projected",
+            _projected_game(),
+            _invalid_recommended_legacy_mapping(),
+        )
+        expected = "recommended review contract is invalid"
+    else:
+        legacy = _complete_legacy_decision_mapping()
+        candidate = legacy["candidates"][0]
+        binding = legacy["review_bindings"][0]
+        candidate["evidence_paths"] = [
+            "starter_suppression",
+            "late_bullpen_exposure",
+        ]
+        binding["principal_paths"].append(
+            {
+                "evidence_path": "late_bullpen_exposure",
+                "component_ids": [
+                    "home_bullpen_segment_missing_exposed",
+                    "home_pitcher_chain_workload_outs",
+                ],
+                "contradiction_rule": "late_bullpen_exposure",
+            }
+        )
+        bundle = _bundle_with_legacy(
+            "projected",
+            _projected_game(),
+            legacy,
+        )
+        expected = "recommended review comparison is ineligible"
+
+    with pytest.raises(OperatorPreconditionError, match=expected):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert ledger.read_bytes() == ledger_before
+    assert lock.read_bytes() == lock_before
+    if checkpoint_before is None:
+        assert not checkpoint.exists()
+    else:
+        assert checkpoint.read_bytes() == checkpoint_before
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == bundles_before
+
+
 def test_successful_operator_run_constructs_one_shadow_comparison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
