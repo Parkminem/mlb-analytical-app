@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-13",
+  "version": "2026-08-02",
   "fixed_model": true,
   "forecasting": {
     "enabled": true,
@@ -160,6 +160,7 @@
   },
   "priority_admission": {
     "caps_only_no_positive_rescoring": true,
+    "require_ml_bullpen_review_path": true,
     "exclude_market_engine_pass_from_priority": true,
     "canonical_evidence_paths_only": true,
     "missing_evidence_blocks_multi_market_retention": true,

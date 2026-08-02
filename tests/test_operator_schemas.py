@@ -42,7 +42,7 @@ def test_partial_progress_is_not_rerun_safe_without_authoritative_state() -> Non
 
 def _legacy_decision_mapping() -> dict[str, object]:
     snapshot = LegacyDecisionSnapshot(
-        model_version="legacy-fixed-v1",
+        model_version="2026-08-02",
         candidates=(),
         final_priority=(),
         review_bindings=(),
@@ -53,13 +53,16 @@ def _legacy_decision_mapping() -> dict[str, object]:
 
 def _complete_legacy_decision_mapping() -> dict[str, object]:
     return {
-        "model_version": "legacy-fixed-v1",
+        "model_version": "2026-08-02",
         "candidates": [
             {
                 "market": "ml",
                 "score": 78,
                 "decision_rating": "play",
-                "evidence_paths": ["starter_suppression"],
+                "evidence_paths": [
+                    "starter_suppression",
+                    "bullpen_protection",
+                ],
             }
         ],
         "final_priority": ["ml"],
@@ -75,6 +78,14 @@ def _complete_legacy_decision_mapping() -> dict[str, object]:
                             "home_pitcher_chain_runs_allowed"
                         ],
                         "contradiction_rule": "starter_suppression",
+                    },
+                    {
+                        "evidence_path": "bullpen_protection",
+                        "component_ids": [
+                            "home_bullpen_runs_allowed",
+                            "home_protected_bullpen_close_entry",
+                        ],
+                        "contradiction_rule": "bullpen_protection",
                     }
                 ],
             }

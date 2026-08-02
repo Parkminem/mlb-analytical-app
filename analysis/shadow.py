@@ -80,6 +80,13 @@ _INELIGIBILITY_FLAG_ORDER = (
 )
 _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
 _RECOMMENDED_DECISION_RATINGS = frozenset(("play", "lean"))
+_ML_BULLPEN_REVIEW_BINDING_MODEL_VERSION = "2026-08-02"
+_ML_BULLPEN_REVIEW_PATHS = frozenset(
+    (
+        PriorityEvidencePath.BULLPEN_PROTECTION,
+        PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+    )
+)
 _EVIDENCE_PATH_ORDER = {
     path: index for index, path in enumerate(PriorityEvidencePath)
 }
@@ -397,6 +404,26 @@ def validate_recommended_review_contract(
             f"candidate[{index}] {candidate.market} "
             f"({candidate.decision_rating})"
         )
+        if (
+            legacy.model_version
+            == _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSION
+            and candidate.market == MarketType.ML.value
+        ):
+            if not candidate.evidence_paths.intersection(
+                _ML_BULLPEN_REVIEW_PATHS
+            ):
+                errors.append(
+                    f"{prefix}: missing_ml_bullpen_evidence_path"
+                )
+                continue
+            binding_paths = frozenset(
+                path.evidence_path for path in binding.principal_paths
+            )
+            if not binding_paths.intersection(_ML_BULLPEN_REVIEW_PATHS):
+                errors.append(
+                    f"{prefix}: missing_ml_bullpen_review_binding"
+                )
+                continue
         if binding.legacy_market != candidate.market:
             errors.append(f"{prefix}: candidate_market_mismatch")
             continue

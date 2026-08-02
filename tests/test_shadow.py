@@ -197,6 +197,28 @@ def principal_paths() -> tuple[PrincipalPathBinding, ...]:
     )
 
 
+def bullpen_protection_path() -> PrincipalPathBinding:
+    return PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.BULLPEN_PROTECTION,
+        component_ids=(
+            "home_bullpen_runs_allowed",
+            "home_protected_bullpen_close_entry",
+        ),
+        contradiction_rule=ContradictionRule.BULLPEN_PROTECTION,
+    )
+
+
+def late_bullpen_exposure_path() -> PrincipalPathBinding:
+    return PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+        component_ids=(
+            "home_bullpen_segment_missing_exposed",
+            "home_pitcher_chain_workload_outs",
+        ),
+        contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
+    )
+
+
 def candidate(
     *,
     market: str = "ml",
@@ -233,6 +255,7 @@ def binding(
 
 def legacy_snapshot(
     *,
+    model_version: str = "legacy-fixed-v1",
     candidates: tuple[PriorityMarketCandidate, ...] | None = None,
     final_priority: tuple[str, ...] | None = None,
     review_bindings: tuple[CandidateReviewBinding, ...] | None = None,
@@ -249,11 +272,82 @@ def legacy_snapshot(
         else final_priority
     )
     return LegacyDecisionSnapshot(
-        model_version="legacy-fixed-v1",
+        model_version=model_version,
         candidates=resolved_candidates,
         final_priority=resolved_final_priority,
         review_bindings=resolved_bindings,
         notes=("legacy remains authoritative",),
+    )
+
+
+def test_current_ml_bullpen_contract_rejects_candidate_without_bullpen_path(
+) -> None:
+    legacy = legacy_snapshot(model_version="2026-08-02")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"candidate\[0\] ml \(play\): "
+            "missing_ml_bullpen_evidence_path"
+        ),
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            _complete_game().markets,
+        )
+
+
+def test_current_ml_bullpen_contract_rejects_unbound_bullpen_path() -> None:
+    bullpen_path = bullpen_protection_path()
+    legacy = legacy_snapshot(
+        model_version="2026-08-02",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(
+                    path.evidence_path
+                    for path in principal_paths() + (bullpen_path,)
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"candidate\[0\] ml \(play\): "
+            "missing_ml_bullpen_review_binding"
+        ),
+    ):
+        validate_recommended_review_contract(
+            legacy,
+            _complete_game().markets,
+        )
+
+
+@pytest.mark.parametrize(
+    "bullpen_path",
+    (bullpen_protection_path(), late_bullpen_exposure_path()),
+    ids=("bullpen_protection", "late_bullpen_exposure"),
+)
+def test_current_ml_bullpen_contract_accepts_canonical_bullpen_path(
+    bullpen_path: PrincipalPathBinding,
+) -> None:
+    paths = principal_paths() + (bullpen_path,)
+    legacy = legacy_snapshot(
+        model_version="2026-08-02",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(
+                    path.evidence_path for path in paths
+                ),
+            ),
+        ),
+        review_bindings=(binding(paths=paths),),
+    )
+
+    validate_recommended_review_contract(
+        legacy,
+        _complete_game().markets,
     )
 
 

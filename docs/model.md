@@ -75,9 +75,12 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 - Freeze its `market_key` and exact legacy candidate identity. The current contract uses `legacy_candidate_index` plus `legacy_market`, pointing into the immutable `LegacyDecisionSnapshot` that also preserves the candidate score, `play`/`lean`/`pass` rating, evidence paths, and final priority.
 - Freeze two to four unique canonical principal evidence paths. For each path, freeze its exact component IDs and its applicable deterministic contradiction-rule binding.
+- In legacy model version `2026-08-02`, every recommended full-game ML candidate must declare and bind at least one of `bullpen_protection` or `late_bullpen_exposure`. Use the former when available late-inning protection supports the side and the latter when expected bullpen exposure limits or opposes it. Do not auto-inject a path that was not part of the pregame ML reasoning.
 - Freeze the `ComponentDistribution` for every referenced component ID, including its `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95` summary. These values fix the central 80% (`p10`-`p90`) and central 90% (`p05`-`p95`) predictive intervals. Every bound ID must exist in that forecast's component distributions.
 
 Postgame review may consume only these frozen bindings and intervals; it cannot invent, replace, or revise a path, component ID, rule, or interval after the outcome is known. A missing binding, candidate/market mismatch, unknown `market_key`, invalid path count or shape, or missing component distribution makes that market review-ineligible. Record the ineligibility reason rather than inferring a replacement review path.
+
+Fresh projected and confirmed captures must use the current legacy model version. The Operator resolves an exact immutable replay first, so an old capture can still be replayed byte-for-byte; a stale version cannot create a new capture, forecast, link, or managed bundle.
 
 ## 1. Data Integrity
 

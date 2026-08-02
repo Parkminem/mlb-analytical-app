@@ -28,10 +28,13 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 - Record the `market_key` and exact legacy candidate identity: the current contract uses `legacy_candidate_index` plus `legacy_market`, with the candidate's score and `play`/`lean`/`pass` rating and the final priority preserved in the snapshot.
 - Record two to four unique canonical principal evidence paths.
+- For every recommended full-game ML in model version `2026-08-02`, declare and bind `bullpen_protection` or `late_bullpen_exposure` according to the actual pregame ML reasoning. Never add a bullpen path after the result or merely to satisfy the contract.
 - Bind every path to exact component IDs and its exact deterministic contradiction rule.
 - Freeze each bound `ComponentDistribution`, including `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95`; these fix the central 80% and 90% predictive intervals.
 
 Postgame review cannot invent or change these paths, IDs, rules, or intervals. A missing/invalid binding, candidate/market mismatch, unknown market, invalid path count or shape, or missing component distribution makes that market review-ineligible; state the reason and do not infer a substitute. See [Pregame Principal-Path Binding](model.md#pregame-principal-path-binding) for the authoritative contract.
+
+Use the current legacy model version for every fresh projected or confirmed capture. A stale version is accepted only when the Operator finds and returns its exact immutable historical replay before fresh-capture validation.
 
 ## Game Review
 

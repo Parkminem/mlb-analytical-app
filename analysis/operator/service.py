@@ -42,6 +42,7 @@ from analysis.ledger import (
     ReviewRecord,
     linked_shadow_comparison,
 )
+from analysis.pipeline import LEGACY_MODEL_VERSION
 from analysis.review import build_and_record_review
 from analysis.review.calibration import (
     build_calibration_report,
@@ -662,6 +663,16 @@ def _run_pregame(
             expected_stage=expected_stage,
             exact_replay=exact_replay,
             bundle_root=bundle_root,
+        )
+
+    received_legacy_model_version = (
+        bundle.payload.legacy_decision.model_version
+    )
+    if received_legacy_model_version != LEGACY_MODEL_VERSION:
+        raise OperatorPreconditionError(
+            "fresh pregame legacy model_version must be "
+            f"{LEGACY_MODEL_VERSION}; received "
+            f"{received_legacy_model_version}"
         )
 
     try:

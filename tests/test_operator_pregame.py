@@ -125,6 +125,14 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
                 ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
             ),
         ),
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.BULLPEN_PROTECTION,
+            component_ids=(
+                "home_bullpen_runs_allowed",
+                "home_protected_bullpen_close_entry",
+            ),
+            contradiction_rule=ContradictionRule.BULLPEN_PROTECTION,
+        ),
     )
     candidates = (
         PriorityMarketCandidate(
@@ -145,7 +153,7 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
         ),
     )
     return LegacyDecisionSnapshot(
-        model_version="legacy-fixed-v1",
+        model_version="2026-08-02",
         candidates=candidates,
         final_priority=("ml", "full_total"),
         review_bindings=(
@@ -214,6 +222,7 @@ def _valid_recommended_legacy_mapping() -> dict[str, object]:
     candidate["evidence_paths"] = [
         "starter_suppression",
         "top_order_matchup",
+        "bullpen_protection",
     ]
     binding["principal_paths"].append(
         {
@@ -227,6 +236,38 @@ def _valid_recommended_legacy_mapping() -> dict[str, object]:
         }
     )
     return legacy
+
+
+def test_fresh_stale_legacy_model_version_rejects_before_forecast_without_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    legacy = _valid_recommended_legacy_mapping()
+    legacy["model_version"] = "2026-07-13"
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        legacy,
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("forecast must not run")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match=(
+            "fresh pregame legacy model_version must be 2026-08-02; "
+            "received 2026-07-13"
+        ),
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.parent.exists()
+    assert not ledger.exists()
+    assert not bundles.exists()
 
 
 def test_invalid_recommended_contract_before_forecast(
@@ -263,8 +304,8 @@ def test_invalid_static_path_count_rejects_before_forecast_without_artifacts(
     legacy = _complete_legacy_decision_mapping()
     candidate = legacy["candidates"][0]
     binding = legacy["review_bindings"][0]
-    candidate["evidence_paths"] = ["starter_suppression"]
-    binding["principal_paths"] = binding["principal_paths"][:1]
+    candidate["evidence_paths"] = ["bullpen_protection"]
+    binding["principal_paths"] = binding["principal_paths"][1:]
     bundle = _bundle_with_legacy(
         "projected",
         _projected_game(),
@@ -292,13 +333,20 @@ def test_exact_replay_wins_over_a_stale_fresh_ledger_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
+    legacy = _invalid_recommended_legacy_mapping()
+    legacy["model_version"] = "legacy-fixed-v1"
     bundle = _bundle_with_legacy(
         "projected",
         _projected_game(),
-        _invalid_recommended_legacy_mapping(),
+        legacy,
     )
 
     with monkeypatch.context() as gates:
+        gates.setattr(
+            service_module,
+            "LEGACY_MODEL_VERSION",
+            "legacy-fixed-v1",
+        )
         gates.setattr(
             service_module,
             "validate_recommended_review_contract",
@@ -352,6 +400,7 @@ def test_fresh_dynamic_rejection_creates_no_ledger_artifacts(
     binding = legacy["review_bindings"][0]
     candidate["evidence_paths"] = [
         "starter_suppression",
+        "bullpen_protection",
         "late_bullpen_exposure",
     ]
     binding["principal_paths"].append(
@@ -426,6 +475,7 @@ def test_existing_rejection_does_not_update_checkpoint(
         binding = legacy["review_bindings"][0]
         candidate["evidence_paths"] = [
             "starter_suppression",
+            "bullpen_protection",
             "late_bullpen_exposure",
         ]
         binding["principal_paths"].append(
@@ -560,6 +610,7 @@ def test_dynamic_ineligibility_leaves_ledger_and_bundle_unchanged(
     binding = legacy["review_bindings"][0]
     candidate["evidence_paths"] = [
         "starter_suppression",
+        "bullpen_protection",
         "late_bullpen_exposure",
     ]
     binding["principal_paths"].append(
@@ -597,13 +648,20 @@ def test_historical_invalid_recommended_command_replays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
+    legacy = _invalid_recommended_legacy_mapping()
+    legacy["model_version"] = "legacy-fixed-v1"
     bundle = _bundle_with_legacy(
         "projected",
         _projected_game(),
-        _invalid_recommended_legacy_mapping(),
+        legacy,
     )
 
     with monkeypatch.context() as gates:
+        gates.setattr(
+            service_module,
+            "LEGACY_MODEL_VERSION",
+            "legacy-fixed-v1",
+        )
         gates.setattr(
             service_module,
             "validate_recommended_review_contract",
@@ -768,7 +826,7 @@ def test_canonical_bundle_bytes_support_nonempty_legacy_evidence_paths(
 
     assert decoded["payload"]["legacy_decision"]["candidates"][0][
         "evidence_paths"
-    ] == ["starter_suppression"]
+    ] == ["bullpen_protection", "starter_suppression"]
     persisted = persist_managed_bundle(bundle, root=tmp_path)
     assert load_bundle(persisted.path) == bundle
 

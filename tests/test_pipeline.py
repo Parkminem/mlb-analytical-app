@@ -42,7 +42,7 @@ EXPECTED_FORECASTING_CONFIG = {
     "market_family_tuning_decisions": 300,
 }
 
-LEGACY_CONFIG_SHA256 = "7e981caaf826989612b421149d3dd5ebbfafe7b3cafff6f3bf5ce49b50d9cd7d"
+LEGACY_CONFIG_SHA256 = "c9e463ab59fd74e6379fd77123c60dba21e1273e71b19c762b94aff65b0fc602"
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -56,8 +56,13 @@ class ModelConfigTests(unittest.TestCase):
     def test_forecasting_block_matches_approved_shadow_configuration(self):
         config = load_model_config()
 
-        self.assertEqual(config["version"], "2026-07-13")
+        self.assertEqual(config["version"], "2026-08-02")
         self.assertEqual(config.get("forecasting"), EXPECTED_FORECASTING_CONFIG)
+        self.assertTrue(
+            config["priority_admission"][
+                "require_ml_bullpen_review_path"
+            ]
+        )
 
     def test_forecasting_addition_preserves_every_legacy_config_value(self):
         config = load_model_config()
@@ -386,7 +391,7 @@ class AnalysisManifestTests(unittest.TestCase):
             starter_confirmed=True,
         )
 
-        self.assertEqual(manifest["model_version"], "2026-07-13")
+        self.assertEqual(manifest["model_version"], "2026-08-02")
         self.assertTrue(manifest["fixed_model"])
         self.assertEqual(manifest["strength_adjustments"], [])
         self.assertNotIn("picks", manifest)
