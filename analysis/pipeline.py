@@ -13,7 +13,7 @@ from analysis.model import evaluate_pitch_velocity_sample
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "model.json"
-LEGACY_MODEL_VERSION = "2026-08-02"
+LEGACY_MODEL_VERSION = "2026-08-03"
 DECISION_AUTHORITY = "legacy_fixed_model"
 FORECASTING_MODEL_VERSION = "shadow-forecast-2026-07-14.1"
 

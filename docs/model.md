@@ -75,7 +75,8 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 - Freeze its `market_key` and exact legacy candidate identity. The current contract uses `legacy_candidate_index` plus `legacy_market`, pointing into the immutable `LegacyDecisionSnapshot` that also preserves the candidate score, `play`/`lean`/`pass` rating, evidence paths, and final priority.
 - Freeze two to four unique canonical principal evidence paths. For each path, freeze its exact component IDs and its applicable deterministic contradiction-rule binding.
-- In legacy model version `2026-08-02`, every recommended full-game ML candidate must declare and bind at least one of `bullpen_protection` or `late_bullpen_exposure`. Use the former when available late-inning protection supports the side and the latter when expected bullpen exposure limits or opposes it. Do not auto-inject a path that was not part of the pregame ML reasoning.
+- In legacy model versions `2026-08-02` and `2026-08-03`, every recommended full-game ML candidate must declare and bind at least one of `bullpen_protection` or `late_bullpen_exposure`. Use the former when available late-inning protection supports the side and the latter when expected bullpen exposure limits or opposes it. Do not auto-inject a path that was not part of the pregame ML reasoning.
+- In legacy model version `2026-08-03`, every recommended F5 or full-game under must declare and bind both `starter_suppression` and `lineup_suppression`. Their components must use the same away/home namespace so the two paths cover both scoring directions. Do not admit a one-sided under binding or infer the missing path after the result.
 - Freeze the `ComponentDistribution` for every referenced component ID, including its `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95` summary. These values fix the central 80% (`p10`-`p90`) and central 90% (`p05`-`p95`) predictive intervals. Every bound ID must exist in that forecast's component distributions.
 
 Postgame review may consume only these frozen bindings and intervals; it cannot invent, replace, or revise a path, component ID, rule, or interval after the outcome is known. A missing binding, candidate/market mismatch, unknown `market_key`, invalid path count or shape, or missing component distribution makes that market review-ineligible. Record the ineligibility reason rather than inferring a replacement review path.
@@ -237,6 +238,7 @@ Outputs:
 Rules:
 
 - Starter collapse risk downgrades F5 first.
+- Recent two- or three-start improvement cannot erase unresolved long-horizon WHIP, BB, HR, or collapse risk. Keep that baseline-risk flag separate from the recent-form score and block F5 under while it remains active.
 - Small-sample starters receive a command-risk penalty when walk shape is unstable.
 - A small sample alone is not a fade.
 - Strong recent run prevention can temper a lineup with many positive pitch-velocity slots.
@@ -286,6 +288,7 @@ Rules:
 - If only low, middle, or long relief absorbed a one-sided game while closer/setup/high-leverage arms rested, do not downgrade ML or `+1.5` for bullpen fatigue. Treat high-leverage availability as preserved.
 - A lower-bullpen blowup is only a conditional late-total or blowout-tail risk when starter length is weak or lower-bullpen exposure is likely. It is not automatic support for the opponent's handicap.
 - A weak closer or setup segment can cap full-game confidence even when the average bullpen score looks acceptable.
+- Availability alone is not bullpen protection. Before using a rested late-inning group to support ML or `+1.5`, verify that its current performance and role-specific quality also support the close-game path.
 - Lower-bullpen exposure matters for full-game totals and games where the starter is unlikely to work deep.
 - Do not count weak or tired lower relief as full-game over support until starter length, bridge quality, or opener/bulk timing makes that lower-bullpen segment likely to appear. If the starter or bulk pitcher can cover the middle innings, lower-bullpen risk is only a late-tail note.
 - The bullpen layer affects full-game ML, `+1.5`, and totals much more than F5.
@@ -358,6 +361,7 @@ Rules:
 - If the opponent lineup is neutral-heavy with limited `마이너스` volume, do not use the absence of `플러스` slots as strong ML support. Cap or downgrade the side because traffic can still build runs.
 - If the opponent has a `마이너스`-graded clear power bat, do not upgrade the model-side ML solely from that grade. Mark one-swing variance and reduce side confidence when the side is already thin.
 - If the clearest edge is starter-window only, keep the recommendation as F5. Do not duplicate the same game into full-game ML priority unless the bullpen score, segmented bullpen quality, and late path clearly support the same side.
+- Full-game ML requires an independent full-game margin path beyond the F5 edge. Without lineup conversion, starter length, or verified late protection capable of preserving or extending the margin, cap ML at `71` rather than promoting the first-five read.
 - If the expected path requires the starter to work into or through the sixth before exposing a limited or risky bullpen segment, downgrade full-game ML and review F5 or O/U first.
 - If the model-side starter is likely to exit before completing five innings or force four or more bullpen innings, cap full-game ML even when the high-leverage bullpen is rested. Keep F5 separate when the starter-window edge still holds.
 - If the model-side starter has clear walk or traffic risk, keep the side as F5-only unless the bullpen quality and late path are strong enough to absorb that traffic. A correct starter-lineup read should not automatically become ML.
@@ -403,7 +407,8 @@ F5 O/U is a separate decision engine that reuses the existing starter, lineup, p
 
 - Require a verified current F5 total and decimal price. Never infer an F5 line from the full-game total.
 - Exclude full-game bullpen availability and quality. Include a reliever only when a verified opener/bulk structure places that pitcher inside the first five innings.
-- F5 under requires two stable first-five pitching paths, controlled command and HR risk, muted early lineup paths, and no converted top-five matchup concentration.
+- F5 under requires explicitly verified two-sided run suppression, two stable first-five pitching paths, controlled command and HR risk, muted early lineup paths, and no converted top-five matchup concentration.
+- Unresolved long-horizon starter baseline risk blocks F5 under even when the latest two or three starts improved.
 - F5 over requires a credible early scoring path supported by recent power or walk conversion, or by opposing starter command, HR, first-inning, injury-return, or short-exit risk.
 - At F5 totals of `4.0` or lower, over requires credible early scoring paths for both teams.
 - If both starters have strong K/BB shape and realistic five-inning floors, pass a thin F5 over that lacks starter risk.
@@ -547,15 +552,17 @@ Final priority rules:
 - A market engine's `pass` decision is ineligible for the final priority stack regardless of its preliminary score. Do not convert a failed handicap or total validation back into a scored lean at the output stage.
 - The final priority stack may include multiple entries from one game when they are different markets and independently validated.
 - If F5 O/U and full-game O/U rely on the same scoring edge, keep only the higher-scoring market in the final priority stack. Keep both only when independent early and late paths are explicitly verified.
-- Assemble F5 side, F5 O/U, and full-game O/U in one same-game selection stage. Use canonical evidence paths already produced by the fixed layers: starter suppression, starter collapse, top-order matchup, recent run conversion, underdog run creation, late-bullpen exposure, and bullpen protection.
+- Assemble F5 side, F5 O/U, and full-game O/U in one same-game selection stage. Use canonical evidence paths already produced by the fixed layers: starter suppression, starter collapse, lineup suppression, top-order matchup, recent run conversion, underdog run creation, late-bullpen exposure, and bullpen protection. `lineup_suppression` is review-only and does not add a baseball score.
 - When same-game candidates share an evidence path, keep only the higher-scoring candidate. On an exact correlated tie, prefer F5 side, then F5 O/U, then full-game O/U.
 - Missing evidence paths do not prove independence. Multiple same-game markets may coexist only when every retained market has a distinct, non-empty evidence path.
 - Every entry in the final priority stack should include a `0-100` priority score. This score is an output-ranking expression of the existing model edge, market value, data confidence, and layer agreement; it does not create a new analysis layer or rescore baseball inputs.
 - Score guide: `80+` primary candidate, `72-79` playable candidate, `65-71` lean or price-dependent candidate, below `65` review-only unless the user asks for all leans.
 - Apply one final priority-admission gate after market value. This gate may only cap the existing priority score; it must not add points or score any baseball input again.
-- Cap a side at `74` when its edge is mainly projected traffic but neither recent run conversion nor a bullpen-quality edge supports that traffic becoming a win.
+- Cap a side at `74` when its edge is mainly pitch/velocity matchup or projected traffic and recent run conversion does not support that traffic becoming runs. A bullpen edge can protect a lead but cannot repair missing offensive conversion.
 - For opener, bulk, or bullpen-game sides, verify the opener-to-bulk-to-bridge-to-high-leverage chain. If that full chain is not verified, cap F5, ML, and `+1.5` at `74` rather than treating the named bulk matchup as the whole game.
-- For ML and `+1.5`, both high-leverage availability and actual late-inning quality must protect the edge. If either fails, cap the full-game side at `71`; rested arms are not automatically good arms.
+- For ML and `+1.5`, both high-leverage availability and current role-specific performance quality must protect the edge. If either fails, cap the full-game side at `71`; rested arms are not automatically reliable arms.
+- For ML, require an independent full-game margin path beyond the first-five edge. Without one, cap ML at `71`; do not automatically redirect the capped pick to another market.
+- Treat omitted bullpen-performance or full-game-margin verification as unverified, not as implicit support.
 - If an over relies on a lineup with at least five `마이너스` slots and zero `중립` slots, require an independent lower-order or walk path, or a verified bullpen-over path. Without one, cap the over at `69`.
 - Acceptable same-game combinations include side plus O/U and `+1.5` plus O/U.
 - In the summary table, do not show both ML and `+1.5` as active side-family recommendations for the same game. Apply each exact legacy candidate's admission decision, then pass the admitted `PriorityMarketCandidate` values through the legacy same-game assembler. Display the assembler-retained side-family candidate; if both survive as independent candidates but only one display slot is allowed, use the higher legacy `0-100` priority score. An exact-score tie uses the assembler's fixed order: `f5_side`, `f5_total`, `full_total`, `ml`, then `plus_1_5`, so ML precedes `+1.5`. Shadow probability, fair price, no-vig probability, or shadow edge cannot choose or break a tie for the displayed side-family market.
@@ -580,6 +587,7 @@ A principal path can be contradicted only when at least one component bound to t
 
 - **Starter suppression:** pitcher-chain runs allowed are above `p90`. Because this path binds only that component, the common gate also requires the observation to be above `p95`.
 - **Starter collapse:** pitcher-chain runs allowed are below `p10` and pitcher-chain workload is at or above its forecast median.
+- **Lineup suppression:** the applicable F5 or full-game team runs, traffic, or extra-base hits finish above `p95`. A lower-tail result in another component cannot activate an upper-tail contradiction.
 - **Top-order or recent conversion:** the applicable F5 or full-game team runs, traffic, and extra-base hits are all below `p10`.
 - **Late-bullpen exposure:** the bound bullpen segment was not exposed and pitcher-chain workload is at or above `p80`.
 - **Bullpen protection:** bullpen runs allowed are above `p90` and the game entered the protected close-game segment.

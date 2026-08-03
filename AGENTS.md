@@ -32,6 +32,10 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - If the over case is driven by volatility on both sides, prefer O/U and downgrade ML.
 - Evaluate F5 O/U independently from full-game O/U. Exclude full-game bullpen effects unless a verified opener/bulk arm is scheduled inside the first five innings.
 - Require a verified F5 total and decimal price. Never infer the F5 line from the full-game total.
+- Admit F5 under only after explicitly verifying both scoring directions. Unresolved long-horizon starter WHIP/BB/HR/collapse risk blocks F5 under even when recent starts improved.
+- Cap matchup-only or traffic-only side strength when recent run conversion is absent; bullpen quality cannot substitute for offensive conversion.
+- For ML, require an independent full-game margin path beyond the F5 edge. For ML and `+1.5`, rested bullpen availability must also have current role-specific performance support.
+- For fresh model-version `2026-08-03` F5 or full-game unders, bind same-namespace `starter_suppression` and `lineup_suppression` review paths before capture.
 
 ## Default Output
 

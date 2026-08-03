@@ -80,11 +80,20 @@ _INELIGIBILITY_FLAG_ORDER = (
 )
 _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
 _RECOMMENDED_DECISION_RATINGS = frozenset(("play", "lean"))
-_ML_BULLPEN_REVIEW_BINDING_MODEL_VERSION = "2026-08-02"
+_ML_BULLPEN_REVIEW_BINDING_MODEL_VERSIONS = frozenset(
+    ("2026-08-02", "2026-08-03")
+)
+_UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION = "2026-08-03"
 _ML_BULLPEN_REVIEW_PATHS = frozenset(
     (
         PriorityEvidencePath.BULLPEN_PROTECTION,
         PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+    )
+)
+_UNDER_TWO_SIDED_REVIEW_PATHS = frozenset(
+    (
+        PriorityEvidencePath.STARTER_SUPPRESSION,
+        PriorityEvidencePath.LINEUP_SUPPRESSION,
     )
 )
 _EVIDENCE_PATH_ORDER = {
@@ -405,8 +414,7 @@ def validate_recommended_review_contract(
             f"({candidate.decision_rating})"
         )
         if (
-            legacy.model_version
-            == _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSION
+            legacy.model_version in _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSIONS
             and candidate.market == MarketType.ML.value
         ):
             if not candidate.evidence_paths.intersection(
@@ -444,6 +452,51 @@ def validate_recommended_review_contract(
         except ValueError as error:
             errors.append(f"{prefix}: {error}")
             continue
+        binding_paths = frozenset(
+            path.evidence_path for path in binding.principal_paths
+        )
+        if (
+            PriorityEvidencePath.LINEUP_SUPPRESSION
+            in candidate.evidence_paths.union(binding_paths)
+            and market.selected_side != "under"
+        ):
+            errors.append(f"{prefix}: lineup_suppression_requires_under")
+            continue
+        if (
+            legacy.model_version
+            == _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION
+            and market.market_type
+            in (MarketType.F5_TOTAL, MarketType.FULL_TOTAL)
+            and market.selected_side == "under"
+        ):
+            if not _UNDER_TWO_SIDED_REVIEW_PATHS.issubset(
+                candidate.evidence_paths
+            ):
+                errors.append(
+                    f"{prefix}: missing_under_two_sided_evidence_paths"
+                )
+                continue
+            paths_by_evidence = {
+                path.evidence_path: path for path in binding.principal_paths
+            }
+            if not _UNDER_TWO_SIDED_REVIEW_PATHS.issubset(paths_by_evidence):
+                errors.append(
+                    f"{prefix}: missing_under_two_sided_review_binding"
+                )
+                continue
+            starter_path = paths_by_evidence[
+                PriorityEvidencePath.STARTER_SUPPRESSION
+            ]
+            lineup_path = paths_by_evidence[
+                PriorityEvidencePath.LINEUP_SUPPRESSION
+            ]
+            starter_side = starter_path.component_ids[0].split("_", 1)[0]
+            lineup_side = lineup_path.component_ids[0].split("_", 1)[0]
+            if starter_side != lineup_side:
+                errors.append(
+                    f"{prefix}: incomplete_under_two_sided_coverage"
+                )
+                continue
         if not _paths_have_valid_count_and_identity(binding.principal_paths):
             errors.append(f"{prefix}: invalid_path_count")
 
@@ -2013,6 +2066,8 @@ def record_shadow_run(
         raise ValueError(
             "forecast market_inputs do not match canonical game_input markets"
         )
+    if legacy.model_version == _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION:
+        validate_recommended_review_contract(legacy, resolved_game.markets)
     if comparison is None:
         comparison = compare_shadow_forecast(legacy, forecast)
     elif (

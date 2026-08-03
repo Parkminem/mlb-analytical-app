@@ -393,6 +393,8 @@ def _component_direction(
 ) -> str:
     if evidence_path is PriorityEvidencePath.STARTER_SUPPRESSION:
         return "low_is_supportive"
+    if evidence_path is PriorityEvidencePath.LINEUP_SUPPRESSION:
+        return "low_is_supportive"
     if evidence_path is PriorityEvidencePath.STARTER_COLLAPSE:
         return (
             "low_is_supportive"

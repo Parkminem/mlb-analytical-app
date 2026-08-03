@@ -1,5 +1,5 @@
 {
-  "version": "2026-08-02",
+  "version": "2026-08-03",
   "fixed_model": true,
   "forecasting": {
     "enabled": true,
@@ -140,7 +140,9 @@
     "independent_engine": true,
     "use_full_game_bullpen_inputs": false,
     "require_verified_market_line_and_price": true,
-    "deduplicate_correlated_full_game_total": true
+    "deduplicate_correlated_full_game_total": true,
+    "require_two_sided_run_suppression": true,
+    "block_under_on_long_horizon_starter_baseline_risk": true
   },
   "weather": {
     "included_by_default": false,
@@ -161,13 +163,17 @@
   "priority_admission": {
     "caps_only_no_positive_rescoring": true,
     "require_ml_bullpen_review_path": true,
+    "require_two_sided_under_review_path": true,
     "exclude_market_engine_pass_from_priority": true,
     "canonical_evidence_paths_only": true,
     "missing_evidence_blocks_multi_market_retention": true,
     "same_game_candidate_assembler": "assemble_same_game_priority",
     "traffic_only_side_cap": 74,
+    "matchup_only_side_requires_recent_run_conversion": true,
     "incomplete_pitching_chain_cap": 74,
     "late_bullpen_protection_cap": 71,
+    "full_game_bullpen_requires_performance_support": true,
+    "ml_requires_independent_full_game_margin_path": true,
     "discontinuous_lineup_over_cap": 69
   }
 }

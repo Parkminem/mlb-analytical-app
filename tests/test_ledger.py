@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 import uuid
 
+import analysis.ledger.store as ledger_store_module
+
 from analysis.ledger import (
     CaptureCommand,
     CaptureForecastLink,
@@ -2045,6 +2047,157 @@ class LedgerStoreTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "component shape"):
             review_command(component_reviews=component_reviews)
+
+    def test_review_component_shape_accepts_lineup_suppression(self) -> None:
+        component_reviews = list(review_command().component_reviews)
+        component_reviews[1] = {
+            **dict(component_reviews[1]),
+            "evidence_path": "lineup_suppression",
+        }
+
+        command = review_command(component_reviews=component_reviews)
+
+        self.assertEqual(
+            command.component_reviews[1]["evidence_path"],
+            "lineup_suppression",
+        )
+
+    def test_review_rejects_opposite_direction_shared_components(self) -> None:
+        component_reviews = list(review_command().component_reviews)
+        component_reviews[1] = {
+            **dict(component_reviews[1]),
+            "evidence_path": "lineup_suppression",
+        }
+        component_reviews.append(
+            {
+                **dict(component_reviews[1]),
+                "evidence_path": "top_order_matchup",
+            }
+        )
+        command = review_command(component_reviews=component_reviews)
+
+        error = ledger_store_module._review_market_compatibility_error(
+            command,
+            "full_total",
+            "under",
+        )
+
+        self.assertEqual(
+            error,
+            "opposite-direction evidence paths cannot share components",
+        )
+
+    def test_review_rejects_lineup_suppression_for_over(self) -> None:
+        component_reviews = list(review_command().component_reviews)
+        component_reviews[1] = {
+            **dict(component_reviews[1]),
+            "evidence_path": "lineup_suppression",
+        }
+        command = review_command(component_reviews=component_reviews)
+
+        error = ledger_store_module._review_market_compatibility_error(
+            command,
+            "full_total",
+            "over",
+        )
+
+        self.assertEqual(error, "lineup suppression requires an under market")
+
+    def test_lineup_suppression_review_persists_for_full_total(self) -> None:
+        market_key = "game:900001:full_total:under:8.5"
+        market_payload = {
+            "market_key": market_key,
+            "market_type": "full_total",
+            "settlement_format": "two_way",
+            "selected_side": "under",
+            "line": 8.5,
+            "selected_decimal_price": 1.91,
+            "opposing_decimal_price": 1.95,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "ledger.jsonl"
+            store = LedgerStore(ledger_path)
+            payload = json.loads(canonical_json(capture_command().payload))
+            payload["markets"] = [market_payload]
+            capture = store.append_capture(
+                "capture:lineup-suppression",
+                capture_command(payload=payload),
+            )
+            forecast = store.append_forecast(
+                forecast_command(
+                    outputs={
+                        "market_inputs": {market_key: market_payload},
+                        "markets": [
+                            {
+                                "market_key": market_key,
+                                "selected_probability": 0.55,
+                            }
+                        ],
+                    }
+                )
+            )
+            link = store.link_capture_forecast(
+                capture.capture_id,
+                forecast.forecast_run_id,
+            )
+            market = store.append_market_observation(
+                market_command(
+                    market_key=market_key,
+                    market_type="full_total",
+                    selected_side="under",
+                    line=8.5,
+                )
+            )
+            result = store.append_official_result(
+                result_command(
+                    component_values={
+                        "home_pitcher_chain_runs_allowed": 2.0,
+                        "home_full_runs": 3.0,
+                        "home_full_traffic": 9.0,
+                        "home_full_extra_base_hits": 2.0,
+                    }
+                )
+            )
+            review = store.append_review(
+                review_command(
+                    capture_forecast_link_record_id=link.envelope.record_id,
+                    capture_id=capture.capture_id,
+                    forecast_run_id=forecast.forecast_run_id,
+                    official_result_record_id=result.envelope.record_id,
+                    market_key=market.market_key,
+                    inside_80_ratio=1.0,
+                    component_reviews=(
+                        {
+                            "evidence_path": "starter_suppression",
+                            "component_ids": (
+                                "home_pitcher_chain_runs_allowed",
+                            ),
+                            "contradicted": False,
+                            "inside_80_count": 1,
+                            "component_count": 1,
+                            "notes": (),
+                        },
+                        {
+                            "evidence_path": "lineup_suppression",
+                            "component_ids": (
+                                "home_full_runs",
+                                "home_full_traffic",
+                                "home_full_extra_base_hits",
+                            ),
+                            "contradicted": False,
+                            "inside_80_count": 3,
+                            "component_count": 3,
+                            "notes": (),
+                        },
+                    ),
+                )
+            )
+
+            self.assertEqual(review.market_key, market_key)
+            reopened = LedgerStore(ledger_path)
+            persisted_reviews = tuple(reopened.iter_records("review"))
+            self.assertEqual(len(persisted_reviews), 1)
+            self.assertEqual(persisted_reviews[0].market_key, market_key)
 
     def test_review_source_ids_are_canonical_and_classification_bound(self) -> None:
         review_fields = {field.name for field in fields(ReviewCommand)}

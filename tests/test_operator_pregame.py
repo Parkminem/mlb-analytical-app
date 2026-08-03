@@ -108,12 +108,13 @@ def _pregame_bundle(stage: str, game):
 
 
 def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
-    paths = (
-        PrincipalPathBinding(
-            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
-            component_ids=("home_pitcher_chain_runs_allowed",),
-            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
-        ),
+    starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+        component_ids=("home_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+    )
+    ml_paths = (
+        starter_path,
         PrincipalPathBinding(
             evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
             component_ids=(
@@ -134,13 +135,25 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
             contradiction_rule=ContradictionRule.BULLPEN_PROTECTION,
         ),
     )
+    under_paths = (
+        starter_path,
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.LINEUP_SUPPRESSION,
+            component_ids=(
+                "home_full_runs",
+                "home_full_traffic",
+                "home_full_extra_base_hits",
+            ),
+            contradiction_rule=ContradictionRule.LINEUP_SUPPRESSION,
+        ),
+    )
     candidates = (
         PriorityMarketCandidate(
             market="ml",
             score=78,
             decision_rating="play",
             evidence_paths=frozenset(
-                path.evidence_path for path in paths
+                path.evidence_path for path in ml_paths
             ),
         ),
         PriorityMarketCandidate(
@@ -148,12 +161,12 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
             score=74,
             decision_rating="lean",
             evidence_paths=frozenset(
-                path.evidence_path for path in paths
+                path.evidence_path for path in under_paths
             ),
         ),
     )
     return LegacyDecisionSnapshot(
-        model_version="2026-08-02",
+        model_version="2026-08-03",
         candidates=candidates,
         final_priority=("ml", "full_total"),
         review_bindings=(
@@ -161,13 +174,13 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
                 market_key="sea_ml",
                 legacy_candidate_index=0,
                 legacy_market="ml",
-                principal_paths=paths,
+                principal_paths=ml_paths,
             ),
             CandidateReviewBinding(
                 market_key="full_under",
                 legacy_candidate_index=1,
                 legacy_market="full_total",
-                principal_paths=paths,
+                principal_paths=under_paths,
             ),
         ),
         notes=("canonical replay order",),
@@ -259,7 +272,7 @@ def test_fresh_stale_legacy_model_version_rejects_before_forecast_without_artifa
     with pytest.raises(
         OperatorPreconditionError,
         match=(
-            "fresh pregame legacy model_version must be 2026-08-02; "
+            "fresh pregame legacy model_version must be 2026-08-03; "
             "received 2026-07-13"
         ),
     ):

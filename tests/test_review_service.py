@@ -40,6 +40,7 @@ from analysis.ledger import (
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.review import ContradictionRule, PrincipalPathBinding
+from analysis.review import service as review_service_module
 from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
@@ -65,6 +66,13 @@ REVIEW_SERVICE_AVAILABLE = all(
     for value in (build_review_candidate, build_and_record_review)
 )
 MARKET_KEY = "sea_ml"
+
+
+def test_lineup_suppression_components_are_low_is_supportive() -> None:
+    assert review_service_module._component_direction(
+        PriorityEvidencePath.LINEUP_SUPPRESSION,
+        "home_full_runs",
+    ) == "low_is_supportive"
 
 
 def _principal_paths() -> tuple[PrincipalPathBinding, ...]:

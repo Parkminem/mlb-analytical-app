@@ -25,7 +25,8 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 ## Recommended Review Eligibility Gate
 
 - every new projected or confirmed `play`/`lean` candidate must be review-eligible;
-- the current legacy model version is `2026-08-02`, and every fresh recommended full-game ML must declare and bind `bullpen_protection` or `late_bullpen_exposure`;
+- the current legacy model version is `2026-08-03`, and every fresh recommended full-game ML must declare and bind `bullpen_protection` or `late_bullpen_exposure`;
+- every fresh recommended F5 or full-game under must bind same-namespace `starter_suppression` and `lineup_suppression` paths for two-sided review coverage;
 - the Operator does not infer or inject the required bullpen path;
 - `pass` candidates are excluded from the hard gate;
 - static validation runs before simulation and dynamic validation before append;

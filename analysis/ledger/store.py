@@ -98,8 +98,15 @@ _EXPECTED_LATEST_RECORD_ID_UNSET = _ExpectedLatestRecordIdUnset()
 
 _F5_MARKET_TYPES = frozenset(("f5_side", "f5_total"))
 _FULL_MARKET_TYPES = frozenset(("ml", "plus_1_5", "full_total"))
-_CONVERSION_PATHS = frozenset(
-    ("top_order_matchup", "recent_run_conversion", "underdog_run_creation")
+_POSITIVE_CONVERSION_PATHS = frozenset(
+    (
+        "top_order_matchup",
+        "recent_run_conversion",
+        "underdog_run_creation",
+    )
+)
+_HORIZON_SCORING_PATHS = _POSITIVE_CONVERSION_PATHS.union(
+    ("lineup_suppression",)
 )
 _FULL_GAME_ONLY_PATHS = frozenset(
     ("late_bullpen_exposure", "bullpen_protection")
@@ -159,6 +166,7 @@ def _reject_json_constant(value: str) -> object:
 def _review_market_compatibility_error(
     command: ReviewCommand,
     market_type: str,
+    selected_side: str,
 ) -> str | None:
     if market_type in _F5_MARKET_TYPES:
         horizon = "f5"
@@ -168,16 +176,24 @@ def _review_market_compatibility_error(
         return "review market observation has an unsupported market_type"
 
     starter_sides: dict[str, str] = {}
+    lineup_component_sets: list[set[str]] = []
+    conversion_component_sets: list[set[str]] = []
     for component_review in command.component_reviews:
         evidence_path = component_review["evidence_path"]
         component_ids = tuple(component_review["component_ids"])
-        if evidence_path in _CONVERSION_PATHS and any(
+        if evidence_path in _HORIZON_SCORING_PATHS and any(
             f"_{horizon}_" not in component_id
             for component_id in component_ids
         ):
-            return "review conversion components must match the market horizon"
+            return "review scoring components must match the market horizon"
         if horizon == "f5" and evidence_path in _FULL_GAME_ONLY_PATHS:
             return "F5 reviews cannot use full-game bullpen evidence paths"
+        if evidence_path == "lineup_suppression":
+            if selected_side != "under":
+                return "lineup suppression requires an under market"
+            lineup_component_sets.append(set(component_ids))
+        elif evidence_path in _POSITIVE_CONVERSION_PATHS:
+            conversion_component_sets.append(set(component_ids))
         if evidence_path not in ("starter_suppression", "starter_collapse"):
             continue
         starter_sides[evidence_path] = next(
@@ -188,6 +204,12 @@ def _review_market_compatibility_error(
                 for component_id in component_ids
             )
         )
+    if any(
+        lineup_components.intersection(conversion_components)
+        for lineup_components in lineup_component_sets
+        for conversion_components in conversion_component_sets
+    ):
+        return "opposite-direction evidence paths cannot share components"
     if (
         len(starter_sides) == 2
         and len(set(starter_sides.values())) == 1
@@ -214,6 +236,24 @@ def _forecast_market_type(
     if not isinstance(market_type, str) or not market_type.strip():
         return None
     return market_type
+
+
+def _forecast_market_selected_side(
+    forecast: ForecastRecord,
+    market_key: str,
+) -> str | None:
+    market_inputs = forecast.outputs.get("market_inputs")
+    if not isinstance(market_inputs, Mapping):
+        return None
+    market_input = market_inputs.get(market_key)
+    if not isinstance(market_input, Mapping):
+        return None
+    if market_input.get("market_key") != market_key:
+        return None
+    selected_side = market_input.get("selected_side")
+    if not isinstance(selected_side, str) or not selected_side.strip():
+        return None
+    return selected_side
 
 
 def _capture_team_aliases(
@@ -596,7 +636,11 @@ def _review_relationship_error(
         )
 
     market_type = _forecast_market_type(forecast, command.market_key)
-    if market_type is None:
+    selected_side = _forecast_market_selected_side(
+        forecast,
+        command.market_key,
+    )
+    if market_type is None or selected_side is None:
         return (
             "review market_key must reference the linked forecast semantic market"
         )
@@ -607,6 +651,7 @@ def _review_relationship_error(
     compatibility_error = _review_market_compatibility_error(
         command,
         market_type,
+        selected_side,
     )
     if compatibility_error is not None:
         return compatibility_error

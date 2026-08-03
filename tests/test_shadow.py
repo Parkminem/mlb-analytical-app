@@ -219,6 +219,22 @@ def late_bullpen_exposure_path() -> PrincipalPathBinding:
     )
 
 
+def lineup_suppression_path(
+    *,
+    side: str = "home",
+    horizon: str = "full",
+) -> PrincipalPathBinding:
+    return PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.LINEUP_SUPPRESSION,
+        component_ids=(
+            f"{side}_{horizon}_runs",
+            f"{side}_{horizon}_traffic",
+            f"{side}_{horizon}_extra_base_hits",
+        ),
+        contradiction_rule=ContradictionRule.LINEUP_SUPPRESSION,
+    )
+
+
 def candidate(
     *,
     market: str = "ml",
@@ -349,6 +365,233 @@ def test_current_ml_bullpen_contract_accepts_canonical_bullpen_path(
         legacy,
         _complete_game().markets,
     )
+
+
+@pytest.mark.parametrize(
+    ("market_type", "horizon", "line"),
+    (
+        (MarketType.F5_TOTAL, "f5", 4.5),
+        (MarketType.FULL_TOTAL, "full", 8.5),
+    ),
+)
+def test_current_under_contract_accepts_two_sided_suppression_binding(
+    market_type: MarketType,
+    horizon: str,
+    line: float,
+) -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key=f"under:{market_type.value}",
+        market_type=market_type,
+        selected_side="under",
+        line=line,
+    )
+    starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+        component_ids=("home_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+    )
+    lineup_path = lineup_suppression_path(side="home", horizon=horizon)
+    paths = (starter_path, lineup_path)
+    legacy = legacy_snapshot(
+        model_version="2026-08-03",
+        candidates=(
+            candidate(
+                market=market_type.value,
+                evidence_paths=frozenset(
+                    path.evidence_path for path in paths
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=market_type.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    validate_recommended_review_contract(legacy, (market,))
+
+
+def test_current_under_contract_rejects_missing_lineup_suppression_path() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="under:full",
+        selected_side="under",
+        line=8.5,
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-03",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(
+                    path.evidence_path for path in principal_paths()
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=principal_paths(),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing_under_two_sided_evidence_paths",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+def test_current_under_contract_rejects_unbound_lineup_suppression_path() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="under:full",
+        selected_side="under",
+        line=8.5,
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-03",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(
+                    (
+                        PriorityEvidencePath.STARTER_SUPPRESSION,
+                        PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                        PriorityEvidencePath.LINEUP_SUPPRESSION,
+                    )
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=principal_paths(),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing_under_two_sided_review_binding",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+def test_historical_under_contract_remains_replay_compatible() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="under:full",
+        selected_side="under",
+        line=8.5,
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-02",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(
+                    path.evidence_path for path in principal_paths()
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=principal_paths(),
+            ),
+        ),
+    )
+
+    validate_recommended_review_contract(legacy, (market,))
+
+
+def test_current_under_contract_rejects_duplicated_scoring_direction() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="under:full",
+        selected_side="under",
+        line=8.5,
+    )
+    starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+        component_ids=("home_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+    )
+    lineup_path = lineup_suppression_path(side="away")
+    paths = (starter_path, lineup_path)
+    legacy = legacy_snapshot(
+        model_version="2026-08-03",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(
+                    path.evidence_path for path in paths
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="incomplete_under_two_sided_coverage",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+def test_lineup_suppression_contract_rejects_over_direction() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="over:full",
+        selected_side="over",
+        line=8.5,
+    )
+    starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+        component_ids=("home_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+    )
+    lineup_path = lineup_suppression_path(side="home")
+    paths = (starter_path, lineup_path)
+    legacy = legacy_snapshot(
+        model_version="2026-08-03",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(
+                    path.evidence_path for path in paths
+                ),
+            ),
+        ),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="lineup_suppression_requires_under",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
 
 
 def test_recommended_contract_rejects_missing_lean_binding() -> None:
@@ -1297,6 +1540,87 @@ class ShadowRecordingTests(unittest.TestCase):
         )
         self.assertEqual(result.capture.payload, command.payload)
         self.assertIsNone(command.supersedes_capture_id)
+
+    def test_recording_enforces_current_under_review_contract(self) -> None:
+        market = replace(
+            self.game.markets[0],
+            market_key="record:under:full",
+            market_type=MarketType.FULL_TOTAL,
+            selected_side="under",
+            line=8.5,
+        )
+        game = replace(self.game, markets=(market,))
+        forecast = run_forecast(game, _fast_config())
+        legacy = legacy_snapshot(
+            model_version="2026-08-03",
+            candidates=(
+                candidate(
+                    market=MarketType.FULL_TOTAL.value,
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in principal_paths()
+                    ),
+                ),
+            ),
+            review_bindings=(
+                binding(
+                    market_key=market.market_key,
+                    legacy_market=MarketType.FULL_TOTAL.value,
+                    paths=principal_paths(),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing_under_two_sided_evidence_paths",
+        ):
+            self.record(
+                game=game,
+                legacy=legacy,
+                forecast=forecast,
+                keys=self.keys("current-under-contract"),
+            )
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
+    def test_recording_preserves_historical_under_contract(self) -> None:
+        market = replace(
+            self.game.markets[0],
+            market_key="record:historical:under:full",
+            market_type=MarketType.FULL_TOTAL,
+            selected_side="under",
+            line=8.5,
+        )
+        game = replace(self.game, markets=(market,))
+        forecast = run_forecast(game, _fast_config())
+        legacy = legacy_snapshot(
+            model_version="2026-08-02",
+            candidates=(
+                candidate(
+                    market=MarketType.FULL_TOTAL.value,
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in principal_paths()
+                    ),
+                ),
+            ),
+            review_bindings=(
+                binding(
+                    market_key=market.market_key,
+                    legacy_market=MarketType.FULL_TOTAL.value,
+                    paths=principal_paths(),
+                ),
+            ),
+        )
+
+        result = self.record(
+            game=game,
+            legacy=legacy,
+            forecast=forecast,
+            keys=self.keys("historical-under-contract"),
+        )
+
+        self.assertEqual(result.capture.game_pk, game.identity.game_pk)
+        self.assertEqual(result.forecast.forecast_run_id, forecast.forecast_run_id)
 
     def test_recording_supports_explicit_supersession_and_retry(self) -> None:
         first = self.record(keys=self.keys("superseded"))

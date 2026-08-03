@@ -42,7 +42,7 @@ EXPECTED_FORECASTING_CONFIG = {
     "market_family_tuning_decisions": 300,
 }
 
-LEGACY_CONFIG_SHA256 = "c9e463ab59fd74e6379fd77123c60dba21e1273e71b19c762b94aff65b0fc602"
+LEGACY_CONFIG_SHA256 = "273b503c953867c148832412fff66dfcbec74f36891f4121ec0332098924c839"
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -56,11 +56,41 @@ class ModelConfigTests(unittest.TestCase):
     def test_forecasting_block_matches_approved_shadow_configuration(self):
         config = load_model_config()
 
-        self.assertEqual(config["version"], "2026-08-02")
+        self.assertEqual(config["version"], "2026-08-03")
         self.assertEqual(config.get("forecasting"), EXPECTED_FORECASTING_CONFIG)
         self.assertTrue(
             config["priority_admission"][
                 "require_ml_bullpen_review_path"
+            ]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "require_two_sided_under_review_path"
+            ]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "matchup_only_side_requires_recent_run_conversion"
+            ]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "full_game_bullpen_requires_performance_support"
+            ]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "ml_requires_independent_full_game_margin_path"
+            ]
+        )
+        self.assertTrue(
+            config["f5_total_priority"][
+                "require_two_sided_run_suppression"
+            ]
+        )
+        self.assertTrue(
+            config["f5_total_priority"][
+                "block_under_on_long_horizon_starter_baseline_risk"
             ]
         )
 
@@ -391,7 +421,7 @@ class AnalysisManifestTests(unittest.TestCase):
             starter_confirmed=True,
         )
 
-        self.assertEqual(manifest["model_version"], "2026-08-02")
+        self.assertEqual(manifest["model_version"], "2026-08-03")
         self.assertTrue(manifest["fixed_model"])
         self.assertEqual(manifest["strength_adjustments"], [])
         self.assertNotIn("picks", manifest)

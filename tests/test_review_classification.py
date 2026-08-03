@@ -197,6 +197,51 @@ class PrincipalPathBindingValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same pitching side"):
             validator(MarketType.ML, same_side)
 
+    def test_lineup_suppression_requires_total_horizon_components(self):
+        validator = classification_module.validate_principal_path_bindings
+        path = binding(
+            PriorityEvidencePath.LINEUP_SUPPRESSION,
+            ContradictionRule.LINEUP_SUPPRESSION,
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+        )
+
+        validator(MarketType.FULL_TOTAL, (path,))
+
+        with self.assertRaisesRegex(ValueError, "total markets"):
+            validator(MarketType.ML, (path,))
+
+        wrong_horizon = binding(
+            PriorityEvidencePath.LINEUP_SUPPRESSION,
+            ContradictionRule.LINEUP_SUPPRESSION,
+            "home_f5_runs",
+            "home_f5_traffic",
+            "home_f5_extra_base_hits",
+        )
+        with self.assertRaisesRegex(ValueError, "binding shape"):
+            validator(MarketType.FULL_TOTAL, (wrong_horizon,))
+
+    def test_lineup_suppression_cannot_share_conversion_components(self):
+        validator = classification_module.validate_principal_path_bindings
+        lineup_path = binding(
+            PriorityEvidencePath.LINEUP_SUPPRESSION,
+            ContradictionRule.LINEUP_SUPPRESSION,
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+        )
+        conversion_path = binding(
+            PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+        )
+
+        with self.assertRaisesRegex(ValueError, "opposite-direction"):
+            validator(MarketType.FULL_TOTAL, (lineup_path, conversion_path))
+
 
 class ReviewClassificationTests(unittest.TestCase):
     def test_a_requires_win_and_at_least_seventy_five_percent_inside_80(self):
@@ -561,6 +606,83 @@ class ContradictionRuleTests(unittest.TestCase):
         self.assertTrue(all_low_with_tail.path_reviews[1].contradicted)
         self.assertFalse(all_low_inside_90.path_reviews[1].contradicted)
         self.assertFalse(one_not_low.path_reviews[1].contradicted)
+
+    def test_lineup_suppression_is_contradicted_by_an_upper_tail_result(self):
+        paths = (
+            binding(
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                ContradictionRule.STARTER_SUPPRESSION,
+                "home_pitcher_chain_runs_allowed",
+            ),
+            binding(
+                PriorityEvidencePath.LINEUP_SUPPRESSION,
+                ContradictionRule.LINEUP_SUPPRESSION,
+                "home_full_runs",
+                "home_full_traffic",
+                "home_full_extra_base_hits",
+            ),
+        )
+        result = classify_review(
+            candidate(
+                values={
+                    "home_pitcher_chain_runs_allowed": 3.0,
+                    "home_full_runs": 7.0,
+                    "home_full_traffic": 3.0,
+                    "home_full_extra_base_hits": 3.0,
+                },
+                principal_paths=paths,
+                market_key="game:1:full_total:under:8.0",
+                market_result="loss",
+            )
+        )
+
+        self.assertFalse(result.path_reviews[0].contradicted)
+        self.assertTrue(result.path_reviews[1].contradicted)
+        self.assertEqual(
+            result.contradicted_paths,
+            (PriorityEvidencePath.LINEUP_SUPPRESSION,),
+        )
+
+    def test_lineup_suppression_requires_its_own_upper_95_tail(self):
+        paths = (
+            binding(
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                ContradictionRule.STARTER_SUPPRESSION,
+                "home_pitcher_chain_runs_allowed",
+            ),
+            binding(
+                PriorityEvidencePath.LINEUP_SUPPRESSION,
+                ContradictionRule.LINEUP_SUPPRESSION,
+                "home_full_runs",
+                "home_full_traffic",
+                "home_full_extra_base_hits",
+            ),
+        )
+        result = classify_review(
+            candidate(
+                values={
+                    "home_pitcher_chain_runs_allowed": 3.0,
+                    "home_full_runs": 7.0,
+                    "home_full_traffic": 0.0,
+                    "home_full_extra_base_hits": 3.0,
+                },
+                intervals={
+                    "home_full_runs": POSITIVE_COUNT_INTERVAL,
+                    "home_full_traffic": POSITIVE_COUNT_INTERVAL,
+                    "home_full_extra_base_hits": POSITIVE_COUNT_INTERVAL,
+                },
+                principal_paths=paths,
+                market_key="game:1:full_total:under:8.0",
+                market_result="loss",
+            )
+        )
+
+        lineup_review = next(
+            review
+            for review in result.path_reviews
+            if review.evidence_path is PriorityEvidencePath.LINEUP_SUPPRESSION
+        )
+        self.assertFalse(lineup_review.contradicted)
 
     def test_late_bullpen_exposure_requires_nonexposure_and_p80_workload(self):
         paths = (

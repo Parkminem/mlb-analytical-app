@@ -275,6 +275,7 @@ class F5TotalTests(unittest.TestCase):
                 projected_total=3.9,
                 starter_stability_a=78,
                 starter_stability_b=76,
+                two_sided_run_suppression_verified=True,
                 lineup_muted_a=True,
                 lineup_muted_b=True,
                 both_starters_five_inning_floor=True,
@@ -282,6 +283,48 @@ class F5TotalTests(unittest.TestCase):
         )
 
         self.assertEqual(result.rating, "under")
+
+    def test_f5_under_requires_explicit_two_sided_run_suppression(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=3.9,
+                starter_stability_a=78,
+                starter_stability_b=76,
+                lineup_muted_a=True,
+                lineup_muted_b=True,
+                both_starters_five_inning_floor=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "F5 under requires verified two-sided run suppression",
+            result.notes,
+        )
+
+    def test_long_horizon_starter_baseline_risk_blocks_f5_under(self):
+        result = evaluate_f5_total(
+            F5TotalContext(
+                market_total=4.5,
+                decimal_odds=1.91,
+                projected_total=3.9,
+                starter_stability_a=78,
+                starter_stability_b=76,
+                two_sided_run_suppression_verified=True,
+                starter_long_horizon_baseline_risk_a=True,
+                lineup_muted_a=True,
+                lineup_muted_b=True,
+                both_starters_five_inning_floor=True,
+            )
+        )
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "long-horizon starter baseline risk blocks F5 under",
+            result.notes,
+        )
 
     def test_starter_risk_and_converted_early_path_support_f5_over(self):
         result = evaluate_f5_total(
@@ -319,20 +362,41 @@ class F5TotalTests(unittest.TestCase):
 
 
 class PriorityAdmissionTests(unittest.TestCase):
-    def test_traffic_only_side_without_conversion_or_bullpen_edge_is_capped(self):
+    def test_traffic_only_side_without_conversion_is_capped(self):
         result = evaluate_priority_admission(
             PriorityAdmissionContext(
                 market="ml",
                 proposed_score=84,
                 traffic_only_edge=True,
                 recent_run_conversion_support=False,
-                bullpen_quality_edge=False,
+                bullpen_performance_support_ok=True,
+                full_game_margin_path=True,
             )
         )
 
         self.assertEqual(result.score, 74)
         self.assertEqual(result.tier, "playable")
-        self.assertIn("traffic-only side lacks run-conversion or bullpen-quality support", result.notes)
+        self.assertIn(
+            "matchup-only side lacks recent run-conversion support",
+            result.notes,
+        )
+
+    def test_matchup_only_side_without_conversion_is_capped_despite_bullpen_edge(self):
+        result = evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="f5",
+                proposed_score=84,
+                matchup_only_edge=True,
+                recent_run_conversion_support=False,
+            )
+        )
+
+        self.assertEqual(result.score, 74)
+        self.assertEqual(result.tier, "playable")
+        self.assertIn(
+            "matchup-only side lacks recent run-conversion support",
+            result.notes,
+        )
 
     def test_incomplete_opener_bulk_pitching_chain_caps_side(self):
         result = evaluate_priority_admission(
@@ -354,12 +418,69 @@ class PriorityAdmissionTests(unittest.TestCase):
                 proposed_score=83,
                 bullpen_availability_ok=True,
                 bullpen_late_quality_ok=False,
+                bullpen_performance_support_ok=True,
+                full_game_margin_path=True,
             )
         )
 
         self.assertEqual(result.score, 71)
         self.assertEqual(result.tier, "lean")
         self.assertIn("full-game side lacks late-bullpen quality protection", result.notes)
+
+    def test_ml_requires_independent_full_game_margin_path(self):
+        result = evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="ml",
+                proposed_score=83,
+                bullpen_performance_support_ok=True,
+                full_game_margin_path=False,
+            )
+        )
+
+        self.assertEqual(result.score, 71)
+        self.assertEqual(result.tier, "lean")
+        self.assertIn(
+            "ML lacks an independent full-game margin path",
+            result.notes,
+        )
+
+    def test_full_game_side_rejects_availability_only_bullpen_protection(self):
+        result = evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="ml",
+                proposed_score=83,
+                bullpen_availability_ok=True,
+                bullpen_late_quality_ok=True,
+                bullpen_performance_support_ok=False,
+                full_game_margin_path=True,
+            )
+        )
+
+        self.assertEqual(result.score, 71)
+        self.assertEqual(result.tier, "lean")
+        self.assertIn(
+            "bullpen availability lacks current performance support",
+            result.notes,
+        )
+
+    def test_unverified_full_game_support_fails_closed(self):
+        result = evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="ml",
+                proposed_score=83,
+            )
+        )
+
+        self.assertEqual(result.score, 71)
+        self.assertEqual(result.tier, "lean")
+        self.assertIn(
+            "bullpen availability lacks current performance support",
+            result.notes,
+        )
+        self.assertIn(
+            "ML lacks an independent full-game margin path",
+            result.notes,
+        )
 
     def test_discontinuous_lineup_blocks_priority_over(self):
         result = evaluate_priority_admission(
@@ -383,7 +504,6 @@ class PriorityAdmissionTests(unittest.TestCase):
                 market="over",
                 proposed_score=82,
                 recent_run_conversion_support=True,
-                bullpen_quality_edge=True,
                 lineup_minus_slots=5,
                 lineup_neutral_slots=0,
                 lower_order_or_walk_path=True,

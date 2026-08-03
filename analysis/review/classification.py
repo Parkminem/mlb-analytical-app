@@ -48,6 +48,14 @@ _MARKET_HORIZONS = {
     MarketType.FULL_TOTAL: "full",
 }
 _F5_MARKET_TYPES = frozenset((MarketType.F5_SIDE, MarketType.F5_TOTAL))
+_TOTAL_MARKET_TYPES = frozenset((MarketType.F5_TOTAL, MarketType.FULL_TOTAL))
+_CONVERSION_EVIDENCE_PATHS = frozenset(
+    (
+        PriorityEvidencePath.TOP_ORDER_MATCHUP,
+        PriorityEvidencePath.RECENT_RUN_CONVERSION,
+        PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+    )
+)
 _FULL_GAME_ONLY_EVIDENCE_PATHS = frozenset(
     (
         PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
@@ -223,6 +231,7 @@ class ExogenousEvent:
 class ContradictionRule(str, Enum):
     STARTER_SUPPRESSION = "starter_suppression"
     STARTER_COLLAPSE = "starter_collapse"
+    LINEUP_SUPPRESSION = "lineup_suppression"
     TOP_ORDER_OR_RECENT_CONVERSION = "top_order_or_recent_conversion"
     LATE_BULLPEN_EXPOSURE = "late_bullpen_exposure"
     BULLPEN_PROTECTION = "bullpen_protection"
@@ -233,6 +242,9 @@ _CONTRADICTION_RULE_BY_EVIDENCE_PATH = {
         ContradictionRule.STARTER_SUPPRESSION
     ),
     PriorityEvidencePath.STARTER_COLLAPSE: ContradictionRule.STARTER_COLLAPSE,
+    PriorityEvidencePath.LINEUP_SUPPRESSION: (
+        ContradictionRule.LINEUP_SUPPRESSION
+    ),
     PriorityEvidencePath.TOP_ORDER_MATCHUP: (
         ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
     ),
@@ -343,6 +355,13 @@ def _shape_matches_conversion(
     )
 
 
+def _shape_matches_lineup_suppression(
+    component_ids: set[str],
+    market_type: MarketType,
+) -> bool:
+    return _shape_matches_conversion(component_ids, market_type)
+
+
 def _shape_matches_late_exposure(component_ids: set[str]) -> bool:
     if len(component_ids) != 2:
         return False
@@ -387,6 +406,9 @@ def _validate_binding_shape(
         ContradictionRule.STARTER_COLLAPSE: (
             _shape_matches_starter_collapse(component_ids)
         ),
+        ContradictionRule.LINEUP_SUPPRESSION: (
+            _shape_matches_lineup_suppression(component_ids, market_type)
+        ),
         ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION: (
             _shape_matches_conversion(component_ids, market_type)
         ),
@@ -411,6 +433,31 @@ def _validate_candidate_path_compatibility(
     ):
         raise ValueError(
             "F5 markets cannot bind late bullpen exposure or bullpen protection"
+        )
+
+    if market_type not in _TOTAL_MARKET_TYPES and any(
+        path.evidence_path is PriorityEvidencePath.LINEUP_SUPPRESSION
+        for path in principal_paths
+    ):
+        raise ValueError("lineup suppression is available only for total markets")
+
+    lineup_component_sets = tuple(
+        set(path.component_ids)
+        for path in principal_paths
+        if path.evidence_path is PriorityEvidencePath.LINEUP_SUPPRESSION
+    )
+    conversion_component_sets = tuple(
+        set(path.component_ids)
+        for path in principal_paths
+        if path.evidence_path in _CONVERSION_EVIDENCE_PATHS
+    )
+    if any(
+        lineup_components.intersection(conversion_components)
+        for lineup_components in lineup_component_sets
+        for conversion_components in conversion_component_sets
+    ):
+        raise ValueError(
+            "opposite-direction evidence paths cannot share components"
         )
 
     starter_sides = {}
@@ -740,6 +787,12 @@ def _contradicts_path(
         return (
             runs_observation.value < runs_forecast.interval.p10
             and workload_observation.value >= workload_forecast.interval.median
+        )
+
+    if rule is ContradictionRule.LINEUP_SUPPRESSION:
+        return any(
+            observation.value > forecast.interval.p95
+            for forecast, observation in components
         )
 
     if rule is ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION:

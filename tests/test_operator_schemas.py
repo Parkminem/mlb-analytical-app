@@ -42,7 +42,7 @@ def test_partial_progress_is_not_rerun_safe_without_authoritative_state() -> Non
 
 def _legacy_decision_mapping() -> dict[str, object]:
     snapshot = LegacyDecisionSnapshot(
-        model_version="2026-08-02",
+        model_version="2026-08-03",
         candidates=(),
         final_priority=(),
         review_bindings=(),
@@ -53,7 +53,7 @@ def _legacy_decision_mapping() -> dict[str, object]:
 
 def _complete_legacy_decision_mapping() -> dict[str, object]:
     return {
-        "model_version": "2026-08-02",
+        "model_version": "2026-08-03",
         "candidates": [
             {
                 "market": "ml",

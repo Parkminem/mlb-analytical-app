@@ -24,8 +24,9 @@ _COMPONENT_REVIEW_KEYS = frozenset(
 _PRIORITY_EVIDENCE_PATHS = frozenset(
     evidence_path.value for evidence_path in PriorityEvidencePath
 )
-_CONVERSION_EVIDENCE_PATHS = frozenset(
+_HORIZON_SCORING_EVIDENCE_PATHS = frozenset(
     (
+        PriorityEvidencePath.LINEUP_SUPPRESSION.value,
         PriorityEvidencePath.TOP_ORDER_MATCHUP.value,
         PriorityEvidencePath.RECENT_RUN_CONVERSION.value,
         PriorityEvidencePath.UNDERDOG_RUN_CREATION.value,
@@ -405,7 +406,7 @@ def _valid_component_review_shape(
             }
             for side in ("away", "home")
         )
-    if evidence_path in _CONVERSION_EVIDENCE_PATHS:
+    if evidence_path in _HORIZON_SCORING_EVIDENCE_PATHS:
         return any(
             component_ids
             == {

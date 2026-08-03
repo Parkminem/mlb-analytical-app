@@ -198,6 +198,7 @@ class F5TotalContext:
     projected_total: float
     starter_stability_a: int
     starter_stability_b: int
+    two_sided_run_suppression_verified: bool = False
     lineup_muted_a: bool = False
     lineup_muted_b: bool = False
     lineup_early_scoring_path_a: bool = False
@@ -212,6 +213,8 @@ class F5TotalContext:
     starter_first_inning_collapse_risk_b: bool = False
     starter_injury_or_short_exit_risk_a: bool = False
     starter_injury_or_short_exit_risk_b: bool = False
+    starter_long_horizon_baseline_risk_a: bool = False
+    starter_long_horizon_baseline_risk_b: bool = False
     both_starters_five_inning_floor: bool = False
     opener_bulk_structure: bool = False
     first_five_pitching_chain_verified: bool = True
@@ -328,12 +331,14 @@ class PriorityAdmissionContext:
     market: str
     proposed_score: int
     traffic_only_edge: bool = False
+    matchup_only_edge: bool = False
     recent_run_conversion_support: bool = True
-    bullpen_quality_edge: bool = True
     opener_bulk_structure: bool = False
     full_pitching_chain_verified: bool = True
     bullpen_availability_ok: bool = True
     bullpen_late_quality_ok: bool = True
+    bullpen_performance_support_ok: bool = False
+    full_game_margin_path: bool = False
     lineup_minus_slots: int = 0
     lineup_neutral_slots: int = 0
     lower_order_or_walk_path: bool = True
@@ -364,6 +369,7 @@ class TotalMarketPrioritySelection:
 class PriorityEvidencePath(str, Enum):
     STARTER_SUPPRESSION = "starter_suppression"
     STARTER_COLLAPSE = "starter_collapse"
+    LINEUP_SUPPRESSION = "lineup_suppression"
     TOP_ORDER_MATCHUP = "top_order_matchup"
     RECENT_RUN_CONVERSION = "recent_run_conversion"
     UNDERDOG_RUN_CREATION = "underdog_run_creation"
@@ -462,12 +468,11 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
 
     if (
         side_market
-        and context.traffic_only_edge
+        and (context.traffic_only_edge or context.matchup_only_edge)
         and not context.recent_run_conversion_support
-        and not context.bullpen_quality_edge
     ):
         score = min(score, 74)
-        notes.append("traffic-only side lacks run-conversion or bullpen-quality support")
+        notes.append("matchup-only side lacks recent run-conversion support")
 
     if (
         side_market
@@ -482,6 +487,17 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
     ):
         score = min(score, 71)
         notes.append("full-game side lacks late-bullpen quality protection")
+
+    if (
+        context.market in {"ml", "plus_1_5"}
+        and not context.bullpen_performance_support_ok
+    ):
+        score = min(score, 71)
+        notes.append("bullpen availability lacks current performance support")
+
+    if context.market == "ml" and not context.full_game_margin_path:
+        score = min(score, 71)
+        notes.append("ML lacks an independent full-game margin path")
 
     discontinuous_over_path = (
         context.market == "over"
@@ -1051,6 +1067,15 @@ def evaluate_f5_total(context: F5TotalContext) -> TotalDecision:
 
     under_edge = context.market_total - context.projected_total
     if under_edge >= 0.3:
+        if not context.two_sided_run_suppression_verified:
+            notes.append("F5 under requires verified two-sided run suppression")
+            return TotalDecision(rating="pass", notes=notes)
+        if (
+            context.starter_long_horizon_baseline_risk_a
+            or context.starter_long_horizon_baseline_risk_b
+        ):
+            notes.append("long-horizon starter baseline risk blocks F5 under")
+            return TotalDecision(rating="pass", notes=notes)
         if risk_a or risk_b:
             notes.append("starter command, HR, or early-exit risk blocks F5 under")
             return TotalDecision(rating="pass", notes=notes)
