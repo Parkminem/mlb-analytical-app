@@ -2,9 +2,9 @@
 
 ## Goal
 
-Allow one full-game side-family recommendation and one full-game total-family
-recommendation from the same game to appear as separate entries in the final
-priority stack when both are independently playable and directionally coherent.
+Allow one side-family recommendation and one total-family recommendation per
+game horizon to appear as separate entries in the final priority stack when
+both are independently playable and directionally coherent.
 
 For example, an Atlanta ML candidate scored at 77 and an over candidate scored
 at 83 must both remain in the priority stack when both market engines pass them
@@ -12,12 +12,15 @@ and their game scripts can coexist.
 
 ## Scope
 
-- The side family contains `ML` and `+1.5` or `-1.5` markets.
+- The F5 side family contains the selected F5 side market.
+- The F5 total family contains the selected F5 `under` or `over` market.
+- The full-game side family contains `ML` and `+1.5` or `-1.5` markets.
 - The full-game total family contains `under` and `over` markets.
-- At most one candidate from each family may remain for a game.
-- A game may therefore contribute zero, one, or two full-game priority entries.
-- F5 side and F5 total selection retain their current independent evaluation and
-  correlation-deduplication rules.
+- At most one candidate from each horizon-specific family may remain for a game.
+- A game may therefore contribute zero to four priority entries before
+  cross-horizon correlation deduplication.
+- F5 market-engine evaluation remains unchanged, but F5 side and F5 total use
+  the same final family, threshold, evidence, and coherence policy.
 - This change does not alter baseball input scoring, market-engine validation,
   score caps, source hierarchy, or Shadow authority.
 
@@ -48,17 +51,18 @@ The same-game assembler applies these steps in order:
 2. Exclude every candidate below the existing playable priority threshold of
    72.
 3. Exclude candidates with empty or non-canonical evidence paths.
-4. Select the highest-scoring candidate in the side family. On a tied score,
-   prefer the candidate with the higher model probability when available, then
-   use the existing deterministic market order.
-5. Select the highest-scoring candidate in the full-game total family. An over
-   and an under can never both remain.
+4. Select the highest-scoring candidate in each horizon-specific side family.
+   On a tied score, use the existing deterministic legacy market order; Shadow
+   probability cannot break the tie.
+5. Select the highest-scoring candidate in each horizon-specific total family.
+   An over and an under for the same horizon can never both remain.
 6. Retain both family winners only when directional coherence has been
    explicitly validated. Otherwise retain the higher-scoring candidate; use the
    existing deterministic order on an exact tie.
 
-The candidate interface will carry explicit family and directional-coherence
-metadata rather than attempting to infer compatibility from free-form review
+The candidate interface will carry explicit directional-coherence metadata,
+while the assembler derives the fixed horizon-specific family from the market
+identifier rather than attempting to infer compatibility from free-form review
 text. Existing canonical evidence paths remain required and are reused; no
 baseball evidence is rescored.
 
@@ -76,9 +80,11 @@ Valid combinations include:
 - `+1.5/-1.5 + under` when a close or controlled low-scoring game supports both
   markets.
 
-An upstream analysis must mark the pair incompatible when one recommendation
+These rules apply to F5 side-total pairs and full-game side-total pairs. An
+upstream analysis must mark the pair incompatible when one recommendation
 depends on a game script that materially weakens the other. Missing coherence
-validation does not count as compatibility.
+validation does not count as compatibility. Cross-horizon candidates continue
+to require distinct canonical evidence paths so the same edge is not repeated.
 
 ## Output Behavior
 
@@ -97,19 +103,22 @@ The fixed model configuration and pipeline manifest will expose:
 - one-winner-per-family behavior;
 - cross-family coexistence when coherence is validated;
 - unchanged pass exclusion and canonical-evidence requirements;
-- unchanged F5 correlation handling.
+- the same family policy for F5 candidates while preserving the F5 market
+  engine and verified-line requirements.
 
 ## Testing
 
 Tests will prove that:
 
 - `ATL ML 77` and `ATL over 83` are both retained when validated as compatible;
+- a compatible F5 side and F5 total are both retained at 72 or higher;
 - ML and `+1.5` from the same game do not both remain;
-- over and under from the same game do not both remain;
+- over and under from the same horizon do not both remain;
 - an incompatible side-total pair keeps only the higher score;
 - a candidate below 72, a `pass`, or a candidate without canonical evidence is
   excluded;
-- existing F5 correlation and pass-exclusion behavior remains unchanged;
+- existing F5 market evaluation remains unchanged while final admission uses
+  the new family policy;
 - the model configuration, manifest, authoritative documentation, and output
   template expose the new policy consistently.
 

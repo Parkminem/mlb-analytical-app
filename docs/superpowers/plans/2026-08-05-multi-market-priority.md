@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Retain one independently validated full-game side and one directionally compatible full-game total from the same game when each scores at least 72.
+**Goal:** Retain one independently validated side and one directionally compatible total per game horizon when each scores at least 72.
 
-**Architecture:** Extend the existing legacy `PriorityMarketCandidate` with explicit full-game pair-coherence metadata, then change `assemble_same_game_priority` to filter invalid candidates, choose one winner per full-game market family, and run the existing canonical-evidence correlation checks. Keep F5 selection and Shadow authority unchanged, and expose the policy through fixed configuration, the pipeline manifest, and authoritative output documentation.
+**Architecture:** Extend the existing legacy `PriorityMarketCandidate` with explicit side-total pair-coherence metadata, then change `assemble_same_game_priority` to filter invalid candidates, choose one winner per horizon-specific family, and run the existing canonical-evidence correlation checks. Keep F5 market-engine evaluation and Shadow authority unchanged, and expose the shared F5/full-game assembly policy through fixed configuration, the pipeline manifest, and authoritative output documentation.
 
 **Tech Stack:** Python 3.11+, frozen dataclasses, `unittest`, JSON configuration, Markdown model documentation.
 
@@ -12,10 +12,11 @@
 
 - A market-engine `pass` never enters the priority stack.
 - The playable multi-market threshold is exactly 72.
-- At most one of `ml`, `plus_1_5`, or `minus_1_5` may remain from the side family.
-- At most one `full_total` direction may remain from the total family.
+- At most one `f5_side` candidate and one `f5_total` direction may remain for F5.
+- At most one of `ml`, `plus_1_5`, or `minus_1_5` and one `full_total` direction may remain for the full game.
 - A side and a full-game total may coexist only when both carry explicit directional-coherence validation and have distinct non-empty canonical evidence paths.
-- F5 side and F5 O/U keep their current independent evaluation and correlation rules.
+- An F5 side and F5 total may coexist under the same coherence and evidence rules.
+- F5 market-engine evaluation and verified-line requirements remain unchanged.
 - Shadow probability cannot select, remove, reorder, or break a tie among legacy candidates.
 - Baseball inputs, market-engine scores, priority caps, and model version remain unchanged.
 
@@ -30,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: existing `PriorityEvidencePath`, legacy candidate scores, and market-engine `decision_rating` values.
-- Produces: `PriorityMarketCandidate(..., full_game_pair_compatible: bool = False)` and `assemble_same_game_priority(candidates, playable_min_score=72) -> SameGamePrioritySelection`.
+- Produces: `PriorityMarketCandidate(..., same_game_pair_compatible: bool = False)` and `assemble_same_game_priority(candidates, playable_min_score=72) -> SameGamePrioritySelection`.
 
 - [ ] **Step 1: Write failing tests for compatible side and total retention**
 
@@ -50,7 +51,7 @@ def test_compatible_atlanta_ml_and_over_both_enter_priority(self):
                         model.PriorityEvidencePath.BULLPEN_PROTECTION,
                     }
                 ),
-                full_game_pair_compatible=True,
+                same_game_pair_compatible=True,
             ),
             model.PriorityMarketCandidate(
                 "full_total",
@@ -62,7 +63,7 @@ def test_compatible_atlanta_ml_and_over_both_enter_priority(self):
                         model.PriorityEvidencePath.RECENT_RUN_CONVERSION,
                     }
                 ),
-                full_game_pair_compatible=True,
+                same_game_pair_compatible=True,
             ),
         ]
     )
@@ -104,7 +105,7 @@ Run:
   tests.test_model.SameGamePriorityTests.test_incompatible_side_and_total_keep_only_higher_score -v
 ```
 
-Expected: FAIL because `PriorityMarketCandidate` does not accept `full_game_pair_compatible` and the assembler does not implement the new family policy.
+Expected: FAIL because `PriorityMarketCandidate` does not accept `same_game_pair_compatible` and the assembler does not implement the new family policy.
 
 - [ ] **Step 3: Add failing tests for family deduplication and admission threshold**
 
@@ -155,6 +156,31 @@ def test_over_and_under_keep_only_higher_scoring_total_family_candidate(self):
         [("over", 83)],
     )
 
+def test_compatible_f5_side_and_f5_total_both_enter_priority(self):
+    result = model.assemble_same_game_priority(
+        [
+            model.PriorityMarketCandidate(
+                "f5_side",
+                77,
+                "play",
+                frozenset({model.PriorityEvidencePath.TOP_ORDER_MATCHUP}),
+                same_game_pair_compatible=True,
+            ),
+            model.PriorityMarketCandidate(
+                "f5_total",
+                75,
+                "under",
+                frozenset({model.PriorityEvidencePath.STARTER_SUPPRESSION}),
+                same_game_pair_compatible=True,
+            ),
+        ]
+    )
+
+    self.assertEqual(
+        [candidate.market for candidate in result.included],
+        ["f5_side", "f5_total"],
+    )
+
 def test_below_72_and_missing_evidence_are_not_priority_eligible(self):
     result = model.assemble_same_game_priority(
         [
@@ -196,23 +222,25 @@ class PriorityMarketCandidate:
     score: int
     decision_rating: str
     evidence_paths: frozenset[PriorityEvidencePath] = field(default_factory=frozenset)
-    full_game_pair_compatible: bool = False
+    same_game_pair_compatible: bool = False
 ```
 
 Add fixed family constants and helpers near the assembler:
 
 ```python
 PLAYABLE_PRIORITY_MIN_SCORE = 72
-FULL_GAME_SIDE_MARKETS = frozenset({"ml", "plus_1_5", "minus_1_5"})
-FULL_GAME_TOTAL_MARKETS = frozenset({"full_total"})
+PRIORITY_MARKET_FAMILIES = {
+    "f5_side": "f5_side",
+    "f5_total": "f5_total",
+    "ml": "full_side",
+    "plus_1_5": "full_side",
+    "minus_1_5": "full_side",
+    "full_total": "full_total",
+}
 
 
-def _full_game_family(candidate: PriorityMarketCandidate) -> str | None:
-    if candidate.market in FULL_GAME_SIDE_MARKETS:
-        return "side"
-    if candidate.market in FULL_GAME_TOTAL_MARKETS:
-        return "total"
-    return None
+def _priority_market_family(candidate: PriorityMarketCandidate) -> str | None:
+    return PRIORITY_MARKET_FAMILIES.get(candidate.market)
 ```
 
 Update `assemble_same_game_priority` to:
@@ -225,13 +253,13 @@ def assemble_same_game_priority(
     # Validate canonical paths first.
     # Exclude pass, score < playable_min_score, and empty evidence.
     # Sort by score and the existing deterministic tie order. Shadow is not read.
-    # Keep only the first eligible full-game side and first eligible full-game total.
+    # Keep only the first eligible candidate in each horizon-specific family.
     # Apply the existing disjoint-evidence check to every retained pair.
-    # For a side-total pair, additionally require full_game_pair_compatible=True
+    # For a side-total pair, additionally require same_game_pair_compatible=True
     # on both candidates; otherwise retain the higher-scoring candidate only.
 ```
 
-Keep the existing F5 tie order and canonical-path correlation behavior. Add `minus_1_5` immediately after `plus_1_5` in the deterministic tie order.
+Keep the existing F5 market-engine behavior and canonical-path correlation behavior. Update the former independent-F5 test to set `same_game_pair_compatible=True` on both candidates. Add `minus_1_5` immediately after `plus_1_5` in the deterministic tie order.
 
 - [ ] **Step 6: Run model tests and verify GREEN**
 
@@ -275,7 +303,8 @@ self.assertEqual(config["priority_admission"]["multi_market_min_score"], 72)
 self.assertTrue(config["priority_admission"]["one_candidate_per_full_game_family"])
 self.assertTrue(config["priority_admission"]["allow_compatible_side_total_pair"])
 self.assertTrue(config["priority_admission"]["require_directional_coherence"])
-self.assertTrue(config["priority_admission"]["f5_selection_rules_unchanged"])
+self.assertTrue(config["priority_admission"]["apply_family_policy_to_f5"])
+self.assertTrue(config["priority_admission"]["f5_market_engine_unchanged"])
 ```
 
 Add to `AnalysisManifestTests`:
@@ -293,7 +322,8 @@ def test_manifest_exposes_multi_market_same_game_policy(self):
     self.assertTrue(policy["one_candidate_per_full_game_family"])
     self.assertTrue(policy["allow_compatible_side_total_pair"])
     self.assertTrue(policy["require_directional_coherence"])
-    self.assertTrue(policy["f5_selection_rules_unchanged"])
+    self.assertTrue(policy["apply_family_policy_to_f5"])
+    self.assertTrue(policy["f5_market_engine_unchanged"])
 ```
 
 - [ ] **Step 2: Run pipeline tests and verify RED**
@@ -315,7 +345,8 @@ Add these exact values to `config/model.json` under `priority_admission`:
 "one_candidate_per_full_game_family": true,
 "allow_compatible_side_total_pair": true,
 "require_directional_coherence": true,
-"f5_selection_rules_unchanged": true
+"apply_family_policy_to_f5": true,
+"f5_market_engine_unchanged": true
 ```
 
 In `build_analysis_manifest`, expose a copy without creating a second source of truth:
@@ -335,7 +366,7 @@ Retain both as separate priority entries when each is non-pass, scores at least
 explicitly validated as compatible. Show both in Final, for example ATL ML + O9.
 ```
 
-State that global ranking is score-sorted, ML and a handicap never both enter by default, over and under never both enter, and F5 rules are unchanged.
+State that global ranking is score-sorted, ML and a handicap never both enter by default, over and under for the same horizon never both enter, and F5 uses the same final family policy without changing its market engine.
 
 Correct the approved design document's tie language to say that an exact legacy-score tie uses the deterministic market order. Shadow probability must not break the tie because Shadow cannot change or reorder legacy decisions.
 
