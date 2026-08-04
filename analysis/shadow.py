@@ -112,7 +112,13 @@ _LEGACY_FIELDS = frozenset(
     )
 )
 _CANDIDATE_FIELDS = frozenset(
-    ("market", "score", "decision_rating", "evidence_paths")
+    (
+        "market",
+        "score",
+        "decision_rating",
+        "evidence_paths",
+        "same_game_pair_compatible",
+    )
 )
 _REVIEW_BINDING_FIELDS = frozenset(
     (
@@ -880,11 +886,17 @@ def _candidate_from_payload(value: object) -> PriorityMarketCandidate:
         raise ValueError(
             "legacy candidate evidence_paths must use canonical unique order"
         )
+    same_game_pair_compatible = payload["same_game_pair_compatible"]
+    if not isinstance(same_game_pair_compatible, bool):
+        raise ValueError(
+            "legacy candidate same_game_pair_compatible must be bool"
+        )
     return PriorityMarketCandidate(
         market=payload["market"],
         score=payload["score"],
         decision_rating=payload["decision_rating"],
         evidence_paths=frozenset(evidence_paths),
+        same_game_pair_compatible=same_game_pair_compatible,
     )
 
 
@@ -1904,6 +1916,7 @@ def canonical_legacy_decision_payload(
                     for evidence_path in PriorityEvidencePath
                     if evidence_path in candidate.evidence_paths
                 ],
+                "same_game_pair_compatible": candidate.same_game_pair_compatible,
             }
             for candidate in legacy.candidates
         ],

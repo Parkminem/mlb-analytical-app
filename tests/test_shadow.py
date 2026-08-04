@@ -1110,6 +1110,16 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(comparison, "replacement_candidates"))
 
+    def test_legacy_candidate_pair_compatibility_round_trips(self) -> None:
+        original = candidate()
+        original = replace(original, same_game_pair_compatible=True)
+        legacy = legacy_snapshot(candidates=(original,))
+
+        payload = shadow_module.canonical_legacy_decision_payload(legacy)
+
+        self.assertTrue(payload["candidates"][0]["same_game_pair_compatible"])
+        self.assertEqual(shadow_module._legacy_from_payload(payload), legacy)
+
     def test_forecast_probability_does_not_change_legacy_priority(self) -> None:
         legacy_candidate = candidate()
         legacy = legacy_snapshot(candidates=(legacy_candidate,))

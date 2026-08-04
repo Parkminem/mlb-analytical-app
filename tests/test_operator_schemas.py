@@ -63,6 +63,7 @@ def _complete_legacy_decision_mapping() -> dict[str, object]:
                     "starter_suppression",
                     "bullpen_protection",
                 ],
+                "same_game_pair_compatible": False,
             }
         ],
         "final_priority": ["ml"],
@@ -363,6 +364,7 @@ def test_parsing_does_not_run_pregame_service_preflight() -> None:
         (("candidates", 0), "score"),
         (("candidates", 0), "decision_rating"),
         (("candidates", 0), "evidence_paths"),
+        (("candidates", 0), "same_game_pair_compatible"),
         (("review_bindings", 0), "market_key"),
         (("review_bindings", 0), "legacy_candidate_index"),
         (("review_bindings", 0), "legacy_market"),
