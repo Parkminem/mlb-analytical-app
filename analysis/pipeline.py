@@ -185,6 +185,7 @@ def build_analysis_manifest(
         "confidence_flags": confidence_flags,
         "strength_adjustments": [],
         "priority_candidate_assembler": "assemble_same_game_priority",
+        "same_game_priority_policy": deepcopy(model_config["priority_admission"]),
         "required_outputs": ["F5", "F5 O/U", "ML", "+1.5", "O/U", "review"],
     }
 

@@ -52,13 +52,16 @@ The same-game assembler applies these steps in order:
    72.
 3. Exclude candidates with empty or non-canonical evidence paths.
 4. Select the highest-scoring candidate in each horizon-specific side family.
-   On a tied score, use the existing deterministic legacy market order; Shadow
-   probability cannot break the tie.
+   An exact legacy-score tie uses the deterministic market order. Shadow
+   probability must not break the tie because Shadow cannot change or reorder
+   legacy decisions.
 5. Select the highest-scoring candidate in each horizon-specific total family.
    An over and an under for the same horizon can never both remain.
 6. Retain both family winners only when directional coherence has been
    explicitly validated. Otherwise retain the higher-scoring candidate; use the
-   existing deterministic order on an exact tie.
+   deterministic market order on an exact legacy-score tie; Shadow probability
+   must not break the tie because Shadow cannot change or reorder legacy
+   decisions.
 
 The candidate interface will carry explicit directional-coherence metadata,
 while the assembler derives the fixed horizon-specific family from the market

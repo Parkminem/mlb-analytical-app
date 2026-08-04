@@ -42,7 +42,7 @@ EXPECTED_FORECASTING_CONFIG = {
     "market_family_tuning_decisions": 300,
 }
 
-LEGACY_CONFIG_SHA256 = "273b503c953867c148832412fff66dfcbec74f36891f4121ec0332098924c839"
+LEGACY_CONFIG_SHA256 = "4486ce5522974eca270654f94412d6224d708e996ab3f5a0f482f77ce58a867b"
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -348,6 +348,18 @@ class ModelConfigTests(unittest.TestCase):
             config["priority_admission"]["same_game_candidate_assembler"],
             "assemble_same_game_priority",
         )
+        self.assertEqual(config["priority_admission"]["multi_market_min_score"], 72)
+        self.assertTrue(
+            config["priority_admission"]["one_candidate_per_full_game_family"]
+        )
+        self.assertTrue(
+            config["priority_admission"]["allow_compatible_side_total_pair"]
+        )
+        self.assertTrue(
+            config["priority_admission"]["require_directional_coherence"]
+        )
+        self.assertTrue(config["priority_admission"]["apply_family_policy_to_f5"])
+        self.assertTrue(config["priority_admission"]["f5_market_engine_unchanged"])
         self.assertTrue(config["f5_total_priority"]["independent_engine"])
         self.assertFalse(
             config["f5_total_priority"]["use_full_game_bullpen_inputs"]
@@ -442,6 +454,7 @@ class AnalysisManifestTests(unittest.TestCase):
                 "confidence_flags",
                 "strength_adjustments",
                 "priority_candidate_assembler",
+                "same_game_priority_policy",
                 "required_outputs",
             },
         )
@@ -508,6 +521,21 @@ class AnalysisManifestTests(unittest.TestCase):
             manifest["priority_candidate_assembler"],
             "assemble_same_game_priority",
         )
+
+    def test_manifest_exposes_multi_market_same_game_policy(self):
+        manifest = build_analysis_manifest(
+            lineup_confirmed=True,
+            starter_confirmed=True,
+            include_weather=False,
+        )
+
+        policy = manifest["same_game_priority_policy"]
+        self.assertEqual(policy["multi_market_min_score"], 72)
+        self.assertTrue(policy["one_candidate_per_full_game_family"])
+        self.assertTrue(policy["allow_compatible_side_total_pair"])
+        self.assertTrue(policy["require_directional_coherence"])
+        self.assertTrue(policy["apply_family_policy_to_f5"])
+        self.assertTrue(policy["f5_market_engine_unchanged"])
 
     def test_weather_is_excluded_unless_requested(self):
         manifest = build_analysis_manifest(

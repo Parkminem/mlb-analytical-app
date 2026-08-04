@@ -12,11 +12,13 @@ Use decimal odds when prices are available.
 
 In the summary table, show only one side-family market per game. Apply legacy admission to the exact ML and `+1.5` candidates, then use the legacy same-game assembler. Display its retained side-family candidate; if both independent candidates survive but only one display slot is allowed, use the higher legacy `0-100` priority score. For an exact-score tie, the assembler's fixed order places `ml` before `plus_1_5`. Mark the other side-family column as `pass` or `review only` and explain it when useful. Shadow probability, fair price, no-vig probability, and shadow edge cannot choose or break a tie for the displayed side-family market.
 
-The final priority stack may include more than one market from the same game when the edges are independently validated, such as ML plus O/U or `+1.5` plus O/U. Do not duplicate the same side edge by listing both ML and `+1.5` unless the user asks for alternatives.
+Select at most one full-game side-family market and at most one full-game total. Retain both as separate priority entries when each is non-pass, scores at least 72, has non-empty canonical evidence, and the side-total game scripts are explicitly validated as compatible. Show both in Final, for example ATL ML + O9.
+
+The global priority list is score-sorted after same-game assembly. ML and a handicap never both enter by default, and over and under for the same horizon never both enter. F5 uses the same final family policy without changing its market engine.
 
 F5 O/U must use a verified F5 line and decimal price. Do not infer it from the full-game total. If F5 O/U and full-game O/U use the same scoring edge, list only the higher-scoring one in the final priority stack unless independent early and late paths are explicitly verified.
 
-Before building the final priority stack, remove every market whose own decision engine returned `pass`, regardless of its preliminary score. Then assemble F5 side, F5 O/U, and full-game O/U together. If candidates share starter suppression, starter collapse, top-order matchup, recent conversion, or another canonical evidence path, retain only the higher-scoring candidate. Missing evidence does not establish independence; keep multiple markets only when their distinct non-empty paths are explicitly verified.
+Before building the final priority stack, remove every market whose own decision engine returned `pass`, regardless of its preliminary score. Then apply the same family policy to F5 side, F5 O/U, full-game side, and full-game O/U. If candidates share starter suppression, starter collapse, top-order matchup, recent conversion, or another canonical evidence path, retain only the higher-scoring candidate. Missing evidence does not establish independence; keep multiple markets only when their distinct non-empty paths are explicitly verified.
 
 Add a `0-100` priority score to each final priority entry. The score expresses the existing model edge, price/value, data confidence, and agreement across layers. It is a legacy rank score, **not a probability**, and is not a separate baseball input. It must not double count evidence.
 
