@@ -58,10 +58,11 @@ The same-game assembler applies these steps in order:
 5. Select the highest-scoring candidate in each horizon-specific total family.
    An over and an under for the same horizon can never both remain.
 6. Retain both family winners only when directional coherence has been
-   explicitly validated. Otherwise retain the higher-scoring candidate; use the
-   deterministic market order on an exact legacy-score tie; Shadow probability
-   must not break the tie because Shadow cannot change or reorder legacy
-   decisions.
+   explicitly validated and each retained market has distinct, non-empty
+   canonical evidence paths. Otherwise retain the higher-scoring candidate; use
+   the deterministic market order on an exact legacy-score tie; Shadow
+   probability must not break the tie because Shadow cannot change or reorder
+   legacy decisions.
 
 The candidate interface will carry explicit directional-coherence metadata,
 while the assembler derives the fixed horizon-specific family from the market
@@ -86,8 +87,9 @@ Valid combinations include:
 These rules apply to F5 side-total pairs and full-game side-total pairs. An
 upstream analysis must mark the pair incompatible when one recommendation
 depends on a game script that materially weakens the other. Missing coherence
-validation does not count as compatibility. Cross-horizon candidates continue
-to require distinct canonical evidence paths so the same edge is not repeated.
+validation does not count as compatibility. Every same-game multi-market pair,
+whether same-horizon or cross-horizon, requires distinct non-empty canonical
+evidence paths so the same edge is not repeated.
 
 ## Output Behavior
 
@@ -105,7 +107,8 @@ The fixed model configuration and pipeline manifest will expose:
 - the playable multi-market threshold of 72;
 - one-winner-per-family behavior;
 - cross-family coexistence when coherence is validated;
-- unchanged pass exclusion and canonical-evidence requirements;
+- unchanged pass exclusion and distinct canonical-evidence requirements for
+  every retained multi-market combination;
 - the same family policy for F5 candidates while preserving the F5 market
   engine and verified-line requirements.
 

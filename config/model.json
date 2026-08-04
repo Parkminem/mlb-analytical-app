@@ -171,6 +171,7 @@
     "multi_market_min_score": 72,
     "one_candidate_per_full_game_family": true,
     "allow_compatible_side_total_pair": true,
+    "require_distinct_canonical_evidence_paths_for_multi_market_retention": true,
     "require_directional_coherence": true,
     "apply_family_policy_to_f5": true,
     "f5_market_engine_unchanged": true,

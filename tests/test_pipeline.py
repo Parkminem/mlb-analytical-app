@@ -42,7 +42,7 @@ EXPECTED_FORECASTING_CONFIG = {
     "market_family_tuning_decisions": 300,
 }
 
-LEGACY_CONFIG_SHA256 = "4486ce5522974eca270654f94412d6224d708e996ab3f5a0f482f77ce58a867b"
+LEGACY_CONFIG_SHA256 = "fc97c9d2bb0ae4fe3db42f9ddc6c0b0d8c31a297d520f7eb70f3f3cc8ef22ea4"
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -356,6 +356,11 @@ class ModelConfigTests(unittest.TestCase):
             config["priority_admission"]["allow_compatible_side_total_pair"]
         )
         self.assertTrue(
+            config["priority_admission"][
+                "require_distinct_canonical_evidence_paths_for_multi_market_retention"
+            ]
+        )
+        self.assertTrue(
             config["priority_admission"]["require_directional_coherence"]
         )
         self.assertTrue(config["priority_admission"]["apply_family_policy_to_f5"])
@@ -533,6 +538,11 @@ class AnalysisManifestTests(unittest.TestCase):
         self.assertEqual(policy["multi_market_min_score"], 72)
         self.assertTrue(policy["one_candidate_per_full_game_family"])
         self.assertTrue(policy["allow_compatible_side_total_pair"])
+        self.assertTrue(
+            policy[
+                "require_distinct_canonical_evidence_paths_for_multi_market_retention"
+            ]
+        )
         self.assertTrue(policy["require_directional_coherence"])
         self.assertTrue(policy["apply_family_policy_to_f5"])
         self.assertTrue(policy["f5_market_engine_unchanged"])
