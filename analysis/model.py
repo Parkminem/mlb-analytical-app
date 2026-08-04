@@ -383,6 +383,7 @@ class PriorityMarketCandidate:
     score: int
     decision_rating: str
     evidence_paths: frozenset[PriorityEvidencePath] = field(default_factory=frozenset)
+    same_game_pair_compatible: bool = False
 
 
 @dataclass(frozen=True)
@@ -568,16 +569,33 @@ def select_total_priority_markets(
     )
 
 
+PLAYABLE_PRIORITY_MIN_SCORE = 72
+PRIORITY_MARKET_FAMILIES = {
+    "f5_side": "f5_side",
+    "f5_total": "f5_total",
+    "ml": "full_side",
+    "plus_1_5": "full_side",
+    "minus_1_5": "full_side",
+    "full_total": "full_total",
+}
+
+
+def _priority_market_family(candidate: PriorityMarketCandidate) -> str | None:
+    return PRIORITY_MARKET_FAMILIES.get(candidate.market)
+
+
 def assemble_same_game_priority(
     candidates: list[PriorityMarketCandidate],
+    playable_min_score: int = PLAYABLE_PRIORITY_MIN_SCORE,
 ) -> SameGamePrioritySelection:
-    """Filter market passes and retain only explicitly independent evidence paths."""
+    """Assemble eligible markets by family, pair compatibility, and evidence paths."""
     tie_order = {
         "f5_side": 0,
         "f5_total": 1,
         "full_total": 2,
         "ml": 3,
         "plus_1_5": 4,
+        "minus_1_5": 5,
     }
     included: list[PriorityMarketCandidate] = []
     excluded: list[PriorityMarketCandidate] = []
@@ -593,6 +611,12 @@ def assemble_same_game_priority(
         if candidate.decision_rating == "pass":
             excluded.append(candidate)
             notes.append(f"{candidate.market} pass excluded from priority")
+        elif candidate.score < playable_min_score:
+            excluded.append(candidate)
+            notes.append(f"{candidate.market} below playable priority score")
+        elif not candidate.evidence_paths:
+            excluded.append(candidate)
+            notes.append(f"{candidate.market} excluded because evidence is unverified")
         else:
             eligible.append(candidate)
 
@@ -607,6 +631,36 @@ def assemble_same_game_priority(
     for candidate in eligible:
         if not included:
             included.append(candidate)
+            continue
+
+        candidate_family = _priority_market_family(candidate)
+        if candidate_family is not None and any(
+            _priority_market_family(selected) == candidate_family
+            for selected in included
+        ):
+            excluded.append(candidate)
+            notes.append(f"{candidate.market} excluded because its market family is already represented")
+            continue
+
+        incompatible_side_total = any(
+            (
+                {candidate_family, _priority_market_family(selected)}
+                in (
+                    {"f5_side", "f5_total"},
+                    {"full_side", "full_total"},
+                )
+                and not (
+                    candidate.same_game_pair_compatible
+                    and selected.same_game_pair_compatible
+                )
+            )
+            for selected in included
+        )
+        if incompatible_side_total:
+            excluded.append(candidate)
+            notes.append(
+                f"{candidate.market} excluded because side-total compatibility is unverified"
+            )
             continue
 
         independence_verified = bool(candidate.evidence_paths) and all(
