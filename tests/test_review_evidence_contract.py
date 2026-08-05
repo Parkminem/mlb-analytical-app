@@ -293,6 +293,15 @@ def test_full_total_requires_over_or_under_selected_side() -> None:
         )
 
 
+def test_f5_total_requires_over_or_under_selected_side() -> None:
+    with pytest.raises(ValueError, match="full_total_selected_side"):
+        assess_priority_evidence_contract(
+            _candidate("f5_total"),
+            _binding("f5_total"),
+            _market(MarketType.F5_TOTAL, "away", line=9.0),
+        )
+
+
 def test_contract_validates_cross_path_compatibility_before_assessment() -> None:
     suppression = _starter_suppression("away")
     collapse = _starter_collapse("away")

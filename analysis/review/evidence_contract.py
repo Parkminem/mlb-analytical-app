@@ -89,7 +89,7 @@ def _validate_identity(
     if candidate.market != market_input.market_type.value:
         raise ValueError("market_type_mismatch")
     if (
-        market_input.market_type is MarketType.FULL_TOTAL
+        market_input.market_type in {MarketType.F5_TOTAL, MarketType.FULL_TOTAL}
         and market_input.selected_side not in {"over", "under"}
     ):
         raise ValueError("full_total_selected_side_must_be_over_or_under")
@@ -112,10 +112,7 @@ def _priority_market(market_type: MarketType, selected_side: str) -> str:
     if market_type is MarketType.PLUS_1_5:
         return "plus_1_5"
     if market_type in {MarketType.F5_TOTAL, MarketType.FULL_TOTAL}:
-        if market_type is MarketType.FULL_TOTAL and selected_side not in {
-            "over",
-            "under",
-        }:
+        if selected_side not in {"over", "under"}:
             raise ValueError("full_total_selected_side_must_be_over_or_under")
         return selected_side
     raise ValueError("unsupported market_type")
