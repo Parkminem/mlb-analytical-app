@@ -13,6 +13,7 @@ import analysis.operator.service as service_module
 import analysis.shadow as shadow_module
 from analysis.operator.bundles import (
     ManagedBundleCopy,
+    ReplayOnlyPregameBundle,
     bundle_canonical_bytes,
     bundle_sha256,
     intrinsic_capture_key,
@@ -1013,6 +1014,88 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
     assert replay.capture_replayed is True
     assert replay.forecast_replayed is True
     assert replay.link_replayed is True
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+def test_historical_exact_replay_preserves_replay_only_managed_artifact(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
+    fresh_bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    first = runner(
+        fresh_bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    historical_outputs = json.loads(canonical_json(first.forecast.outputs))
+    del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+
+    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_bundle = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+    assert isinstance(historical_bundle, ReplayOnlyPregameBundle)
+    files_before_replay = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    replay = runner(
+        historical_bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+    reloaded = bundles_module.load_historical_managed_bundle(
+        replay.managed_bundle.path,
+        root=bundles,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="historical compatibility bundle requires an exact replay",
+    ):
+        runner(
+            reloaded,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+
+    assert replay.managed_bundle.path == source
+    assert replay.managed_bundle.bundle_hash == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+    assert replay.managed_bundle.replayed is True
+    assert isinstance(reloaded, ReplayOnlyPregameBundle)
+    assert not empty_ledger.exists()
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == files_before_replay
 
 
 def _rewrite_forecast_outputs(

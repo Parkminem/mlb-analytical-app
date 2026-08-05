@@ -77,6 +77,7 @@ class ReplayOnlyPregameBundle:
     """A pre-change managed bundle that may only resolve an exact replay."""
 
     bundle: ProjectedBundle | ConfirmedBundle
+    managed_bundle: ManagedBundleCopy
 
 
 def load_bundle(path: str | os.PathLike[str]) -> _Bundle:
@@ -146,7 +147,14 @@ def load_historical_managed_bundle(
             "historical managed bundle identity is inconsistent"
         )
     if replay_only:
-        return ReplayOnlyPregameBundle(bundle=bundle)
+        return ReplayOnlyPregameBundle(
+            bundle=bundle,
+            managed_bundle=ManagedBundleCopy(
+                path=resolved_path,
+                bundle_hash=actual_hash,
+                replayed=True,
+            ),
+        )
     return bundle
 
 

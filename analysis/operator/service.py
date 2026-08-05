@@ -543,9 +543,13 @@ def _replayed_pregame_result(
     expected_stage: str,
     exact_replay: tuple[CaptureRecord, ForecastRecord, CaptureForecastLink],
     bundle_root: str | Path,
+    replay_only_managed_bundle: ManagedBundleCopy | None = None,
 ) -> PregameRunResult:
     capture, stored_forecast, link = exact_replay
-    managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
+    managed_bundle = replay_only_managed_bundle or persist_managed_bundle(
+        bundle,
+        root=bundle_root,
+    )
     return PregameRunResult(
         stage=expected_stage,
         game_pk=bundle.game_pk,
@@ -668,6 +672,9 @@ def _run_pregame(
             expected_stage=expected_stage,
             exact_replay=exact_replay,
             bundle_root=bundle_root,
+            replay_only_managed_bundle=(
+                supplied_bundle.managed_bundle if replay_only else None
+            ),
         )
     if replay_only:
         raise OperatorPreconditionError(
