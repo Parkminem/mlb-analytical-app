@@ -22,7 +22,7 @@ from analysis.operator.bundles import (
     load_bundle,
     persist_managed_bundle,
 )
-from analysis.forecasting import LineupState
+from analysis.forecasting import LineupState, run_forecast
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import canonical_json, capture_payload
 from analysis.forecasting.simulation import _summarize
@@ -83,8 +83,10 @@ from analysis.review.classification import (
 from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
+    ShadowRunIdempotencyKeys,
     build_shadow_capture_command,
     canonical_legacy_decision_payload,
+    record_shadow_run,
 )
 from tests.test_forecasting_engine import _complete_game
 from tests.test_forecasting_inputs import complete_forecast_game
@@ -168,6 +170,47 @@ def test_historical_v1_cannot_launder_into_current_v2(
     assert type(
         current_type.model_validate_json(json.dumps(fresh_json))
     ) is current_type
+
+
+@pytest.mark.parametrize(
+    ("current_type", "historical_parser", "mapping_factory"),
+    (
+        (
+            ProjectedBundle,
+            parse_historical_projected_bundle_json,
+            projected_bundle_mapping,
+        ),
+        (
+            ConfirmedBundle,
+            parse_historical_confirmed_bundle_json,
+            confirmed_bundle_mapping,
+        ),
+    ),
+)
+def test_relaxed_v1_envelope_only_copy_cannot_launder_from_attributes(
+    current_type,
+    historical_parser,
+    mapping_factory,
+) -> None:
+    historical = historical_parser(
+        _raw(historical_bundle_mapping(mapping_factory, "relaxed"))
+    )
+    envelope_only = historical.model_copy(
+        update={"schema_version": 2, "authority": "current"}
+    )
+
+    for validate in (
+        lambda: current_type.model_validate(
+            envelope_only,
+            from_attributes=True,
+        ),
+        lambda: TypeAdapter(current_type).validate_python(
+            envelope_only,
+            from_attributes=True,
+        ),
+    ):
+        with pytest.raises(ValidationError):
+            validate()
 
 
 def _projected_game(**overrides: object):
@@ -404,10 +447,25 @@ def _mark_current_v2(mapping: dict[str, object]) -> None:
     mapping["authority"] = "current"
 
 
-def _pre_v2_execution_seed(bundle):
-    """Recreate ledger identity emitted before the current schema migration."""
+def _record_pre_v2_execution(bundle, ledger_path: Path):
+    """Record the exact ledger identity emitted by a schema-v1 execution."""
 
-    return bundle.model_copy(update={"schema_version": 1})
+    config = service_module.load_forecast_config(
+        bundle.payload.forecast_config_version
+    )
+    forecast = run_forecast(bundle.payload.game_input, config)
+    capture_key = intrinsic_capture_key(
+        1,
+        bundle.stage,
+        build_shadow_capture_command(bundle.payload.game_input),
+    )
+    return record_shadow_run(
+        LedgerStore(ledger_path),
+        bundle.payload.game_input,
+        bundle.payload.legacy_decision,
+        forecast,
+        ShadowRunIdempotencyKeys(capture=capture_key),
+    )
 
 
 def _bundle_with_legacy(stage: str, game, legacy: dict[str, object]):
@@ -1076,11 +1134,7 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
             )
         }
     )
-    first = run_projected(
-        _pre_v2_execution_seed(fresh_bundle),
-        ledger_path=ledger,
-        bundle_root=bundles,
-    )
+    first = _record_pre_v2_execution(fresh_bundle, ledger)
 
     historical_outputs = json.loads(canonical_json(first.forecast.outputs))
     for candidate in historical_outputs["shadow_comparison"]["legacy"][
@@ -1206,6 +1260,41 @@ def test_normal_runner_rejects_historical_parsed_bundle(
         for path in bundles.rglob("*")
         if path.is_file()
     } == managed_files_before
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize(
+    "invalid_envelope",
+    (
+        {"schema_version": 1},
+        {"authority": "historical"},
+    ),
+)
+def test_normal_runner_rejects_model_copy_invalid_current_envelope(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    invalid_envelope: dict[str, object],
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _pregame_bundle(stage, game_factory())
+    invalid = bundle.model_copy(update=invalid_envelope)
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(invalid, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.exists()
+    assert not bundles.exists()
 
 
 @pytest.mark.parametrize(
@@ -1476,11 +1565,7 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    first = runner(
-        _pre_v2_execution_seed(fresh_bundle),
-        ledger_path=ledger,
-        bundle_root=bundles,
-    )
+    first = _record_pre_v2_execution(fresh_bundle, ledger)
 
     historical_outputs = json.loads(canonical_json(first.forecast.outputs))
     del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
@@ -1589,11 +1674,7 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
             )
         }
     )
-    first = runner(
-        _pre_v2_execution_seed(fresh_bundle),
-        ledger_path=ledger,
-        bundle_root=bundles,
-    )
+    first = _record_pre_v2_execution(fresh_bundle, ledger)
     assert len(
         first.forecast.outputs["shadow_comparison"]["legacy"]["candidates"]
     ) == 2

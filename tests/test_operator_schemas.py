@@ -522,6 +522,36 @@ def test_current_v2_requires_real_json_boolean_compatibility(
         parse_projected_bundle_json(_raw(mapping))
 
 
+@pytest.mark.parametrize("compatibility", (0, 1, "false", "true"))
+@pytest.mark.parametrize(
+    ("current_type", "mapping_factory"),
+    (
+        (ProjectedBundle, projected_bundle_mapping),
+        (ConfirmedBundle, confirmed_bundle_mapping),
+    ),
+)
+def test_current_compatibility_is_intrinsically_strict_boolean(
+    current_type,
+    mapping_factory,
+    compatibility: object,
+) -> None:
+    mapping = mapping_factory()
+    mapping["payload"]["legacy_decision"] = _complete_legacy_decision_mapping()
+    mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ] = compatibility
+    adapter = TypeAdapter(current_type)
+
+    for validate in (
+        lambda: current_type.model_validate(mapping),
+        lambda: adapter.validate_python(mapping),
+        lambda: current_type.model_validate_json(_raw(mapping)),
+        lambda: adapter.validate_json(_raw(mapping)),
+    ):
+        with pytest.raises(ValidationError, match="same_game_pair_compatible"):
+            validate()
+
+
 @pytest.mark.parametrize(
     (
         "historical_parser",

@@ -1,6 +1,6 @@
 """Strict JSON bundle schemas for shadow operator stages."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import fields
 from datetime import datetime
 import json
@@ -9,6 +9,7 @@ from typing import Annotated, Literal, TypeVar
 from pydantic import (
     BaseModel,
     ConfigDict,
+    StrictBool,
     TypeAdapter,
     ValidateAs,
     ValidationError,
@@ -87,7 +88,7 @@ class _CurrentPriorityCandidateInput(BaseModel):
     score: int
     decision_rating: str
     evidence_paths: frozenset[PriorityEvidencePath]
-    same_game_pair_compatible: bool
+    same_game_pair_compatible: StrictBool
 
 
 def _current_candidate(
@@ -116,6 +117,27 @@ class _CurrentLegacyDecisionInput(BaseModel):
     final_priority: tuple[str, ...]
     review_bindings: tuple[CandidateReviewBinding, ...]
     notes: tuple[str, ...] = ()
+
+    @field_validator("candidates", mode="before")
+    @classmethod
+    def _require_explicit_candidate_mappings(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (list, tuple)):
+            return value
+        if any(not isinstance(candidate, Mapping) for candidate in value):
+            raise ValueError(
+                "current candidates must be supplied as explicit mappings"
+            )
+        normalized = []
+        for candidate in value:
+            candidate_mapping = dict(candidate)
+            evidence_paths = candidate_mapping.get("evidence_paths")
+            if isinstance(evidence_paths, (list, tuple, set, frozenset)):
+                candidate_mapping["evidence_paths"] = frozenset(evidence_paths)
+            normalized.append(candidate_mapping)
+        return tuple(normalized)
 
 
 def _current_legacy(
