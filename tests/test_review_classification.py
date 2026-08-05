@@ -147,6 +147,86 @@ def standard_values(*, chain_runs=3.0, runs=3.0, traffic=3.0, xbh=3.0):
 
 
 class PrincipalPathBindingValidatorTests(unittest.TestCase):
+    def test_scoring_side_derivation_uses_canonical_binding_components(self):
+        derive_scoring_side = getattr(
+            classification_module,
+            "derive_canonical_scoring_side",
+            None,
+        )
+        self.assertIsNotNone(
+            derive_scoring_side,
+            "public canonical scoring-side helper is missing",
+        )
+
+        conversion_components = (
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+        )
+        for evidence_path in (
+            PriorityEvidencePath.TOP_ORDER_MATCHUP,
+            PriorityEvidencePath.RECENT_RUN_CONVERSION,
+            PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+        ):
+            with self.subTest(evidence_path=evidence_path):
+                path = binding(
+                    evidence_path,
+                    ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+                    *conversion_components,
+                )
+                self.assertEqual(derive_scoring_side(path), "home")
+
+        for evidence_path, rule, components in (
+            (
+                PriorityEvidencePath.STARTER_COLLAPSE,
+                ContradictionRule.STARTER_COLLAPSE,
+                (
+                    "away_pitcher_chain_runs_allowed",
+                    "away_pitcher_chain_workload_outs",
+                ),
+            ),
+            (
+                PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+                ContradictionRule.LATE_BULLPEN_EXPOSURE,
+                (
+                    "away_pitcher_chain_workload_outs",
+                    "away_bullpen_segment_bridge:1_exposed",
+                ),
+            ),
+        ):
+            with self.subTest(evidence_path=evidence_path):
+                self.assertEqual(
+                    derive_scoring_side(binding(evidence_path, rule, *components)),
+                    "home",
+                )
+
+    def test_scoring_side_derivation_rejects_non_over_routes(self):
+        derive_scoring_side = classification_module.derive_canonical_scoring_side
+        paths = (
+            binding(
+                PriorityEvidencePath.STARTER_SUPPRESSION,
+                ContradictionRule.STARTER_SUPPRESSION,
+                "away_pitcher_chain_runs_allowed",
+            ),
+            binding(
+                PriorityEvidencePath.LINEUP_SUPPRESSION,
+                ContradictionRule.LINEUP_SUPPRESSION,
+                "home_full_runs",
+                "home_full_traffic",
+                "home_full_extra_base_hits",
+            ),
+            binding(
+                PriorityEvidencePath.BULLPEN_PROTECTION,
+                ContradictionRule.BULLPEN_PROTECTION,
+                "home_bullpen_runs_allowed",
+                "home_protected_bullpen_close_entry",
+            ),
+        )
+
+        for path in paths:
+            with self.subTest(evidence_path=path.evidence_path):
+                self.assertIsNone(derive_scoring_side(path))
+
     def test_public_validator_enforces_shape_horizon_and_side_compatibility(self):
         validator = getattr(
             classification_module,

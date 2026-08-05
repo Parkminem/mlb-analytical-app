@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
+from typing import Literal
 
 from analysis.forecasting.inputs import MarketType
 from analysis.model import PriorityEvidencePath
@@ -501,6 +502,43 @@ def validate_principal_path_bindings(
     _validate_candidate_path_compatibility(market_type, principal_paths)
 
 
+def derive_canonical_scoring_side(
+    binding: PrincipalPathBinding,
+) -> Literal["away", "home"] | None:
+    """Derive the scoring side represented by an already validated binding."""
+
+    component_ids = set(binding.component_ids)
+    if binding.evidence_path in _CONVERSION_EVIDENCE_PATHS:
+        for side in _SIDES:
+            for horizon in ("f5", "full"):
+                if component_ids == {
+                    f"{side}_{horizon}_runs",
+                    f"{side}_{horizon}_traffic",
+                    f"{side}_{horizon}_extra_base_hits",
+                }:
+                    return side
+        return None
+
+    if binding.evidence_path is PriorityEvidencePath.STARTER_COLLAPSE:
+        for side in _SIDES:
+            if component_ids == {
+                f"{side}_pitcher_chain_runs_allowed",
+                f"{side}_pitcher_chain_workload_outs",
+            }:
+                return "home" if side == "away" else "away"
+        return None
+
+    if binding.evidence_path is PriorityEvidencePath.LATE_BULLPEN_EXPOSURE:
+        for side in _SIDES:
+            if (
+                f"{side}_pitcher_chain_workload_outs" in component_ids
+                and _shape_matches_late_exposure(component_ids)
+            ):
+                return "home" if side == "away" else "away"
+
+    return None
+
+
 @dataclass(frozen=True)
 class ReviewCandidate:
     capture_forecast_link_record_id: str
@@ -962,5 +1000,6 @@ __all__ = (
     "ReviewCandidate",
     "ReviewClassification",
     "classify_review",
+    "derive_canonical_scoring_side",
     "validate_principal_path_bindings",
 )
