@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import canonical_json, capture_payload
@@ -19,7 +20,17 @@ from analysis.operator.errors import (
     OperatorPreconditionError,
 )
 from analysis.operator.schemas import (
+    CURRENT_PREGAME_AUTHORITY,
+    CURRENT_PREGAME_SCHEMA_VERSION,
+    ConfirmedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
+    ProjectedBundle,
     parse_confirmed_bundle_json,
+    parse_historical_confirmed_bundle_json,
+    parse_historical_projected_bundle_json,
     parse_projected_bundle_json,
     parse_review_bundle_json,
 )
@@ -97,7 +108,8 @@ def _complete_legacy_decision_mapping() -> dict[str, object]:
 
 def projected_bundle_mapping() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "authority": "current",
         "stage": "projected",
         "game_pk": GAME_PK,
         "created_at": "2026-07-14T01:35:00Z",
@@ -112,6 +124,36 @@ def projected_bundle_mapping() -> dict[str, object]:
 def confirmed_bundle_mapping() -> dict[str, object]:
     mapping = projected_bundle_mapping()
     mapping["stage"] = "confirmed"
+    return mapping
+
+
+def _two_candidate_legacy_decision_mapping() -> dict[str, object]:
+    legacy = _complete_legacy_decision_mapping()
+    second_candidate = deepcopy(legacy["candidates"][0])
+    second_candidate.update(
+        market="full_total",
+        score=74,
+        same_game_pair_compatible=True,
+    )
+    legacy["candidates"].append(second_candidate)
+    legacy["final_priority"].append("full_total")
+    return legacy
+
+
+def historical_bundle_mapping(
+    mapping_factory,
+    candidate_contract: str,
+) -> dict[str, object]:
+    mapping = mapping_factory()
+    mapping["schema_version"] = 1
+    mapping.pop("authority")
+    legacy = mapping["payload"]["legacy_decision"]
+    if candidate_contract != "empty":
+        legacy = _two_candidate_legacy_decision_mapping()
+        mapping["payload"]["legacy_decision"] = legacy
+    if candidate_contract == "relaxed":
+        for candidate in legacy["candidates"]:
+            candidate.pop("same_game_pair_compatible")
     return mapping
 
 
@@ -337,6 +379,233 @@ def test_pregame_bundles_round_trip_frozen_domain_values(
         bundle.payload.game_input.captured_at = datetime.now(UTC)
 
 
+@pytest.mark.parametrize(
+    ("parser", "mapping_factory"),
+    (
+        (parse_projected_bundle_json, projected_bundle_mapping),
+        (parse_confirmed_bundle_json, confirmed_bundle_mapping),
+    ),
+)
+def test_current_pregame_requires_v2_authority(parser, mapping_factory) -> None:
+    mapping = mapping_factory()
+    mapping["schema_version"] = CURRENT_PREGAME_SCHEMA_VERSION
+    mapping["authority"] = CURRENT_PREGAME_AUTHORITY
+
+    parsed = parser(json.dumps(mapping))
+
+    assert parsed.schema_version == 2
+    assert parsed.authority == "current"
+    assert CURRENT_PREGAME_SCHEMA_VERSION == 2
+    assert CURRENT_PREGAME_AUTHORITY == "current"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field_name"),
+    (
+        (lambda mapping: mapping.pop("authority"), "authority"),
+        (
+            lambda mapping: mapping.update(authority="historical"),
+            "authority",
+        ),
+        (
+            lambda mapping: mapping.update(authority="current-extra"),
+            "authority",
+        ),
+        (lambda mapping: mapping.update(authority=1), "authority"),
+        (lambda mapping: mapping.update(authority=None), "authority"),
+        (lambda mapping: mapping.update(schema_version=1), "schema_version"),
+        (lambda mapping: mapping.update(schema_version="2"), "schema_version"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("parser", "mapping_factory"),
+    (
+        (parse_projected_bundle_json, projected_bundle_mapping),
+        (parse_confirmed_bundle_json, confirmed_bundle_mapping),
+    ),
+)
+def test_current_pregame_rejects_non_v2_authority_envelopes(
+    parser,
+    mapping_factory,
+    mutation,
+    field_name: str,
+) -> None:
+    mapping = mapping_factory()
+    mutation(mapping)
+
+    with pytest.raises(BundleValidationError, match=field_name):
+        parser(_raw(mapping))
+
+
+@pytest.mark.parametrize(
+    ("parser", "mapping_factory"),
+    (
+        (parse_projected_bundle_json, projected_bundle_mapping),
+        (parse_confirmed_bundle_json, confirmed_bundle_mapping),
+    ),
+)
+def test_current_v2_authority_admits_empty_candidates(
+    parser,
+    mapping_factory,
+) -> None:
+    parsed = parser(_raw(mapping_factory()))
+
+    assert parsed.authority == "current"
+    assert parsed.payload.legacy_decision.candidates == ()
+
+
+@pytest.mark.parametrize("candidate_index", (0, 1))
+@pytest.mark.parametrize(
+    ("parser", "mapping_factory"),
+    (
+        (parse_projected_bundle_json, projected_bundle_mapping),
+        (parse_confirmed_bundle_json, confirmed_bundle_mapping),
+    ),
+)
+def test_current_v2_requires_compatibility_on_every_candidate(
+    parser,
+    mapping_factory,
+    candidate_index: int,
+) -> None:
+    mapping = mapping_factory()
+    legacy = _two_candidate_legacy_decision_mapping()
+    mapping["payload"]["legacy_decision"] = legacy
+    legacy["candidates"][candidate_index].pop("same_game_pair_compatible")
+
+    with pytest.raises(
+        BundleValidationError,
+        match="same_game_pair_compatible",
+    ):
+        parser(_raw(mapping))
+
+
+@pytest.mark.parametrize("candidate_index", (0, 1))
+@pytest.mark.parametrize(
+    ("current_type", "mapping_factory"),
+    (
+        (ProjectedBundle, projected_bundle_mapping),
+        (ConfirmedBundle, confirmed_bundle_mapping),
+    ),
+)
+def test_current_v2_direct_validation_requires_compatibility_on_every_candidate(
+    current_type,
+    mapping_factory,
+    candidate_index: int,
+) -> None:
+    mapping = mapping_factory()
+    legacy = _two_candidate_legacy_decision_mapping()
+    mapping["payload"]["legacy_decision"] = legacy
+    legacy["candidates"][candidate_index].pop("same_game_pair_compatible")
+
+    for validate in (
+        lambda: current_type.model_validate(mapping),
+        lambda: TypeAdapter(current_type).validate_python(mapping),
+        lambda: current_type.model_validate_json(_raw(mapping)),
+    ):
+        with pytest.raises(ValidationError, match="same_game_pair_compatible"):
+            validate()
+
+
+@pytest.mark.parametrize("compatibility", (0, 1, "false", None))
+def test_current_v2_requires_real_json_boolean_compatibility(
+    compatibility: object,
+) -> None:
+    mapping = projected_bundle_mapping()
+    legacy = _complete_legacy_decision_mapping()
+    mapping["payload"]["legacy_decision"] = legacy
+    legacy["candidates"][0]["same_game_pair_compatible"] = compatibility
+
+    with pytest.raises(
+        BundleValidationError,
+        match="same_game_pair_compatible.*invalid_boolean",
+    ):
+        parse_projected_bundle_json(_raw(mapping))
+
+
+@pytest.mark.parametrize(
+    (
+        "historical_parser",
+        "mapping_factory",
+        "relaxed_type",
+        "strict_type",
+    ),
+    (
+        (
+            parse_historical_projected_bundle_json,
+            projected_bundle_mapping,
+            HistoricalRelaxedProjectedBundleV1,
+            HistoricalStrictProjectedBundleV1,
+        ),
+        (
+            parse_historical_confirmed_bundle_json,
+            confirmed_bundle_mapping,
+            HistoricalRelaxedConfirmedBundleV1,
+            HistoricalStrictConfirmedBundleV1,
+        ),
+    ),
+)
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+def test_historical_shape_is_classified_and_preserved(
+    historical_parser,
+    mapping_factory,
+    relaxed_type,
+    strict_type,
+    candidate_contract: str,
+) -> None:
+    mapping = historical_bundle_mapping(mapping_factory, candidate_contract)
+
+    parsed = historical_parser(_raw(mapping))
+    dumped = parsed.model_dump()
+    dumped_json = json.loads(parsed.model_dump_json())
+    nested_payload = parsed.payload.model_dump()
+
+    expected_type = strict_type if candidate_contract == "strict" else relaxed_type
+    assert type(parsed) is expected_type
+    assert parsed.schema_version == 1
+    assert "authority" not in type(parsed).model_fields
+    assert "authority" not in dumped
+    expected_presence = candidate_contract == "strict"
+    for payload in (dumped["payload"], dumped_json["payload"], nested_payload):
+        candidates = payload["legacy_decision"]["candidates"]
+        assert all(
+            ("same_game_pair_compatible" in candidate) is expected_presence
+            for candidate in candidates
+        )
+    if candidate_contract == "strict":
+        assert [
+            candidate.same_game_pair_compatible
+            for candidate in parsed.payload.legacy_decision.candidates
+        ] == [False, True]
+    else:
+        assert all(
+            candidate.same_game_pair_compatible is False
+            for candidate in parsed.payload.legacy_decision.candidates
+        )
+
+
+@pytest.mark.parametrize(
+    ("historical_parser", "mapping_factory"),
+    (
+        (parse_historical_projected_bundle_json, projected_bundle_mapping),
+        (parse_historical_confirmed_bundle_json, confirmed_bundle_mapping),
+    ),
+)
+def test_historical_shape_rejects_mixed_candidate_contracts(
+    historical_parser,
+    mapping_factory,
+) -> None:
+    mapping = historical_bundle_mapping(mapping_factory, "strict")
+    mapping["payload"]["legacy_decision"]["candidates"][0].pop(
+        "same_game_pair_compatible"
+    )
+
+    with pytest.raises(
+        BundleValidationError,
+        match="mixed compatibility contract",
+    ):
+        historical_parser(_raw(mapping))
+
+
 def test_parsing_does_not_run_pregame_service_preflight() -> None:
     mapping = projected_bundle_mapping()
     game_input = mapping["payload"]["game_input"]
@@ -431,7 +700,7 @@ def test_bundle_rejects_unknown_fields(location: str) -> None:
         parse_projected_bundle_json(_raw(mapping))
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, "1"])
+@pytest.mark.parametrize("schema_version", [0, 1, 3, "2"])
 def test_bundle_rejects_unsupported_or_wrong_type_schema_versions(
     schema_version: object,
 ) -> None:
@@ -466,8 +735,8 @@ def test_all_bundles_require_schema_version_json_integer_token(
 def test_bundle_rejects_duplicate_json_keys() -> None:
     raw = _raw(projected_bundle_mapping())
     raw = raw.replace(
-        '"schema_version": 1',
-        '"schema_version": 1, "schema_version": 1',
+        '"schema_version": 2',
+        '"schema_version": 2, "schema_version": 2',
         1,
     )
 

@@ -1,26 +1,25 @@
-"""Strict version-1 JSON bundle schemas for shadow operator stages."""
+"""Strict JSON bundle schemas for shadow operator stages."""
 
 from collections.abc import Callable
 from dataclasses import fields
 from datetime import datetime
 import json
-from typing import Any, Literal, TypeVar
+from typing import Annotated, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
     ConfigDict,
-    GetCoreSchemaHandler,
     TypeAdapter,
+    ValidateAs,
     ValidationError,
     field_validator,
     model_serializer,
     model_validator,
 )
-from pydantic_core import CoreSchema, core_schema
 
 from analysis.forecasting import NormalizedGameInput
 from analysis.ledger import MarketObservationCommand, OfficialResultCommand
-from analysis.model import PriorityMarketCandidate
+from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.review.classification import PrincipalPathBinding
 from analysis.shadow import (
     CandidateReviewBinding,
@@ -28,6 +27,10 @@ from analysis.shadow import (
 )
 
 from .errors import BundleValidationError
+
+
+CURRENT_PREGAME_SCHEMA_VERSION = 2
+CURRENT_PREGAME_AUTHORITY = "current"
 
 
 class PregamePayload(BaseModel):
@@ -48,7 +51,7 @@ class PregamePayload(BaseModel):
 class _BundleEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1]
+    schema_version: int
     game_pk: int
     created_at: datetime
 
@@ -77,44 +80,136 @@ class _PregameBundle(_BundleEnvelope):
         return self
 
 
-def _require_pair_compatibility_core_field(
-    schema: CoreSchema,
-    handler: GetCoreSchemaHandler,
-) -> CoreSchema:
-    # A native required field preserves JSON-mode strict datetime parsing.
-    legacy_reference = schema["schema"]["fields"]["legacy_decision"][
-        "schema"
-    ]
-    legacy_schema = handler.resolve_ref_schema(legacy_reference)
-    candidates_field = next(
-        field
-        for field in legacy_schema["schema"]["fields"]
-        if field["name"] == "candidates"
-    )
-    candidate_reference = candidates_field["schema"]["items_schema"][0]
-    candidate_schema = handler.resolve_ref_schema(candidate_reference)
-    compatibility_field = next(
-        field
-        for field in candidate_schema["schema"]["fields"]
-        if field["name"] == "same_game_pair_compatible"
-    )
-    field_schema = compatibility_field["schema"]
-    if field_schema["type"] == "default":
-        compatibility_field["schema"] = field_schema["schema"]
-    return schema
+class _CurrentPriorityCandidateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: str
+    score: int
+    decision_rating: str
+    evidence_paths: frozenset[PriorityEvidencePath]
+    same_game_pair_compatible: bool
 
 
-class _CurrentPregamePayload(PregamePayload):
+def _current_candidate(
+    value: _CurrentPriorityCandidateInput,
+) -> PriorityMarketCandidate:
+    return PriorityMarketCandidate(
+        market=value.market,
+        score=value.score,
+        decision_rating=value.decision_rating,
+        evidence_paths=value.evidence_paths,
+        same_game_pair_compatible=value.same_game_pair_compatible,
+    )
+
+
+_CurrentPriorityCandidate = Annotated[
+    PriorityMarketCandidate,
+    ValidateAs(_CurrentPriorityCandidateInput, _current_candidate),
+]
+
+
+class _CurrentLegacyDecisionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_version: str
+    candidates: tuple[_CurrentPriorityCandidate, ...]
+    final_priority: tuple[str, ...]
+    review_bindings: tuple[CandidateReviewBinding, ...]
+    notes: tuple[str, ...] = ()
+
+
+def _current_legacy(
+    value: _CurrentLegacyDecisionInput,
+) -> LegacyDecisionSnapshot:
+    return LegacyDecisionSnapshot(
+        model_version=value.model_version,
+        candidates=value.candidates,
+        final_priority=value.final_priority,
+        review_bindings=value.review_bindings,
+        notes=value.notes,
+    )
+
+
+_CurrentLegacyDecision = Annotated[
+    LegacyDecisionSnapshot,
+    ValidateAs(_CurrentLegacyDecisionInput, _current_legacy),
+]
+
+
+class _HistoricalRelaxedPriorityCandidateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: str
+    score: int
+    decision_rating: str
+    evidence_paths: frozenset[PriorityEvidencePath]
+
+
+def _historical_relaxed_candidate(
+    value: _HistoricalRelaxedPriorityCandidateInput,
+) -> PriorityMarketCandidate:
+    return PriorityMarketCandidate(
+        market=value.market,
+        score=value.score,
+        decision_rating=value.decision_rating,
+        evidence_paths=value.evidence_paths,
+        same_game_pair_compatible=False,
+    )
+
+
+_HistoricalRelaxedPriorityCandidate = Annotated[
+    PriorityMarketCandidate,
+    ValidateAs(
+        _HistoricalRelaxedPriorityCandidateInput,
+        _historical_relaxed_candidate,
+    ),
+]
+
+
+class _HistoricalRelaxedLegacyDecisionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_version: str
+    candidates: tuple[_HistoricalRelaxedPriorityCandidate, ...]
+    final_priority: tuple[str, ...]
+    review_bindings: tuple[CandidateReviewBinding, ...]
+    notes: tuple[str, ...] = ()
+
+
+def _historical_relaxed_legacy(
+    value: _HistoricalRelaxedLegacyDecisionInput,
+) -> LegacyDecisionSnapshot:
+    return LegacyDecisionSnapshot(
+        model_version=value.model_version,
+        candidates=value.candidates,
+        final_priority=value.final_priority,
+        review_bindings=value.review_bindings,
+        notes=value.notes,
+    )
+
+
+_HistoricalRelaxedLegacyDecision = Annotated[
+    LegacyDecisionSnapshot,
+    ValidateAs(
+        _HistoricalRelaxedLegacyDecisionInput,
+        _historical_relaxed_legacy,
+    ),
+]
+
+
+class _CurrentPregamePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    game_input: NormalizedGameInput
+    legacy_decision: _CurrentLegacyDecision
+    forecast_config_version: str
+
+    @field_validator("forecast_config_version")
     @classmethod
-    def __get_pydantic_core_schema__(
-        cls,
-        source: Any,
-        handler: GetCoreSchemaHandler,
-    ) -> CoreSchema:
-        return _require_pair_compatibility_core_field(
-            handler(source),
-            handler,
-        )
+    def _require_config_version(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("forecast_config_version must be nonempty")
+        return value
 
 
 def _legacy_candidate_mappings(payload: object) -> list[dict[str, object]]:
@@ -129,70 +224,40 @@ def _legacy_candidate_mappings(payload: object) -> list[dict[str, object]]:
     return [candidate for candidate in candidates if isinstance(candidate, dict)]
 
 
-class _HistoricalPregamePayload(PregamePayload):
+class _HistoricalRelaxedPregamePayload(PregamePayload):
+    legacy_decision: _HistoricalRelaxedLegacyDecision
+
     @model_serializer(mode="wrap")
-    def _preserve_missing_pair_compatibility(self, handler):
+    def _preserve_omitted_compatibility(self, handler):
         payload = handler(self)
         for candidate in _legacy_candidate_mappings(payload):
             candidate.pop("same_game_pair_compatible", None)
         return payload
 
 
-def _has_explicit_pair_compatibility(value: object) -> bool:
-    if not isinstance(value, dict):
-        return True
-    payload = value.get("payload")
-    if isinstance(payload, PregamePayload):
-        return False
-    if not isinstance(payload, dict):
-        return True
-    legacy_decision = payload.get("legacy_decision")
-    if isinstance(legacy_decision, LegacyDecisionSnapshot):
-        return False
-    if not isinstance(legacy_decision, dict):
-        return True
-    candidates = legacy_decision.get("candidates")
-    if not isinstance(candidates, (list, tuple)):
-        return True
-    return all(
-        isinstance(candidate, dict)
-        and "same_game_pair_compatible" in candidate
-        for candidate in candidates
-    )
+class _HistoricalStrictPregamePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
+    game_input: NormalizedGameInput
+    legacy_decision: _CurrentLegacyDecision
+    forecast_config_version: str
 
-class _CurrentPregameBundle(_PregameBundle):
-    payload: _CurrentPregamePayload
-
+    @field_validator("forecast_config_version")
     @classmethod
-    def __get_pydantic_core_schema__(
-        cls,
-        source: Any,
-        handler: GetCoreSchemaHandler,
-    ) -> CoreSchema:
-        schema = handler(source)
-        # JSON presence is structural; this guard also rejects materialized
-        # Python defaults without changing Pydantic's strict JSON semantics.
-        return core_schema.json_or_python_schema(
-            json_schema=schema,
-            python_schema=core_schema.no_info_before_validator_function(
-                cls._require_explicit_pair_compatibility,
-                schema,
-            ),
-        )
-
-    @staticmethod
-    def _require_explicit_pair_compatibility(value: object) -> object:
-        if not _has_explicit_pair_compatibility(value):
-            raise ValueError(
-                "same_game_pair_compatible must be explicitly supplied "
-                "for a current bundle"
-            )
+    def _require_config_version(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("forecast_config_version must be nonempty")
         return value
 
 
-class _HistoricalPregameBundle(_PregameBundle):
-    payload: _HistoricalPregamePayload
+class _CurrentPregameBundle(_PregameBundle):
+    schema_version: Literal[2]
+    authority: Literal["current"]
+    payload: _CurrentPregamePayload
+
+
+class _HistoricalPregameBundleV1(_PregameBundle):
+    schema_version: Literal[1]
 
 
 class ProjectedBundle(_CurrentPregameBundle):
@@ -207,20 +272,45 @@ class ConfirmedBundle(_CurrentPregameBundle):
     stage: Literal["confirmed"]
 
 
-class HistoricalProjectedBundle(_HistoricalPregameBundle):
-    """Runtime-distinct representation of a pre-field projected bundle."""
+class HistoricalRelaxedProjectedBundleV1(_HistoricalPregameBundleV1):
+    """Replay-only projected v1 bundle without compatibility fields."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stage: Literal["projected"]
+    payload: _HistoricalRelaxedPregamePayload
 
 
-class HistoricalConfirmedBundle(_HistoricalPregameBundle):
-    """Runtime-distinct representation of a pre-field confirmed bundle."""
+class HistoricalStrictProjectedBundleV1(_HistoricalPregameBundleV1):
+    """Replay-only projected v1 bundle with compatibility fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: Literal["projected"]
+    payload: _HistoricalStrictPregamePayload
+
+
+class HistoricalRelaxedConfirmedBundleV1(_HistoricalPregameBundleV1):
+    """Replay-only confirmed v1 bundle without compatibility fields."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stage: Literal["confirmed"]
+    payload: _HistoricalRelaxedPregamePayload
+
+
+class HistoricalStrictConfirmedBundleV1(_HistoricalPregameBundleV1):
+    """Replay-only confirmed v1 bundle with compatibility fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: Literal["confirmed"]
+    payload: _HistoricalStrictPregamePayload
+
+
+# Task 2 replaces these compatibility aliases in bundle/service consumers.
+HistoricalProjectedBundle = HistoricalRelaxedProjectedBundleV1
+HistoricalConfirmedBundle = HistoricalRelaxedConfirmedBundleV1
 
 
 class ReviewPayload(BaseModel):
@@ -274,6 +364,7 @@ class ReviewPayload(BaseModel):
 class ReviewBundle(_BundleEnvelope):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    schema_version: Literal[1]
     stage: Literal["review"]
     payload: ReviewPayload
 
@@ -291,8 +382,18 @@ class ReviewBundle(_BundleEnvelope):
 
 _PROJECTED_ADAPTER = TypeAdapter(ProjectedBundle)
 _CONFIRMED_ADAPTER = TypeAdapter(ConfirmedBundle)
-_HISTORICAL_PROJECTED_ADAPTER = TypeAdapter(HistoricalProjectedBundle)
-_HISTORICAL_CONFIRMED_ADAPTER = TypeAdapter(HistoricalConfirmedBundle)
+_HISTORICAL_RELAXED_PROJECTED_ADAPTER = TypeAdapter(
+    HistoricalRelaxedProjectedBundleV1
+)
+_HISTORICAL_STRICT_PROJECTED_ADAPTER = TypeAdapter(
+    HistoricalStrictProjectedBundleV1
+)
+_HISTORICAL_RELAXED_CONFIRMED_ADAPTER = TypeAdapter(
+    HistoricalRelaxedConfirmedBundleV1
+)
+_HISTORICAL_STRICT_CONFIRMED_ADAPTER = TypeAdapter(
+    HistoricalStrictConfirmedBundleV1
+)
 _REVIEW_ADAPTER = TypeAdapter(ReviewBundle)
 _BundleType = TypeVar("_BundleType", bound=BaseModel)
 _AuditPresenceCheck = Callable[[object], None]
@@ -457,6 +558,29 @@ def _bundle_payload(value: object) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _raw_candidate_mappings(value: object) -> list[dict[str, object]]:
+    payload = _bundle_payload(value)
+    return _legacy_candidate_mappings(payload)
+
+
+def _historical_candidate_contract(
+    value: object,
+) -> Literal["relaxed", "strict"]:
+    candidates = _raw_candidate_mappings(value)
+    presence = tuple(
+        "same_game_pair_compatible" in candidate for candidate in candidates
+    )
+    if not presence:
+        return "relaxed"
+    if all(presence):
+        return "strict"
+    if not any(presence):
+        return "relaxed"
+    raise BundleValidationError(
+        "invalid historical bundle: mixed compatibility contract"
+    )
+
+
 def _require_pregame_audit_fields(value: object) -> None:
     _require_pregame_audit_fields_with_candidates(
         value,
@@ -464,10 +588,17 @@ def _require_pregame_audit_fields(value: object) -> None:
     )
 
 
-def _require_historical_pregame_audit_fields(value: object) -> None:
+def _require_historical_relaxed_pregame_audit_fields(value: object) -> None:
     _require_pregame_audit_fields_with_candidates(
         value,
         _HISTORICAL_LEGACY_CANDIDATE_FIELDS,
+    )
+
+
+def _require_historical_strict_pregame_audit_fields(value: object) -> None:
+    _require_pregame_audit_fields_with_candidates(
+        value,
+        _LEGACY_CANDIDATE_FIELDS,
     )
 
 
@@ -713,13 +844,22 @@ def parse_review_bundle_json(
 
 def parse_historical_projected_bundle_json(
     raw: str | bytes | bytearray,
-) -> HistoricalProjectedBundle:
-    """Parse a persisted pre-field schema-v1 projected bundle."""
+) -> HistoricalRelaxedProjectedBundleV1 | HistoricalStrictProjectedBundleV1:
+    """Parse a projected schema-v1 bundle without changing its shape."""
 
+    _, decoded_value = _decode_bundle_json(raw)
+    if _historical_candidate_contract(decoded_value) == "strict":
+        return _parse_bundle_json(
+            raw,
+            _HISTORICAL_STRICT_PROJECTED_ADAPTER,
+            _require_historical_strict_pregame_audit_fields,
+            _PROJECTED_TRUSTED_FIELDS,
+            _PROJECTED_DYNAMIC_MAPPING_FIELDS,
+        )
     return _parse_bundle_json(
         raw,
-        _HISTORICAL_PROJECTED_ADAPTER,
-        _require_historical_pregame_audit_fields,
+        _HISTORICAL_RELAXED_PROJECTED_ADAPTER,
+        _require_historical_relaxed_pregame_audit_fields,
         _PROJECTED_TRUSTED_FIELDS,
         _PROJECTED_DYNAMIC_MAPPING_FIELDS,
     )
@@ -727,13 +867,22 @@ def parse_historical_projected_bundle_json(
 
 def parse_historical_confirmed_bundle_json(
     raw: str | bytes | bytearray,
-) -> HistoricalConfirmedBundle:
-    """Parse a persisted pre-field schema-v1 confirmed bundle."""
+) -> HistoricalRelaxedConfirmedBundleV1 | HistoricalStrictConfirmedBundleV1:
+    """Parse a confirmed schema-v1 bundle without changing its shape."""
 
+    _, decoded_value = _decode_bundle_json(raw)
+    if _historical_candidate_contract(decoded_value) == "strict":
+        return _parse_bundle_json(
+            raw,
+            _HISTORICAL_STRICT_CONFIRMED_ADAPTER,
+            _require_historical_strict_pregame_audit_fields,
+            _CONFIRMED_TRUSTED_FIELDS,
+            _CONFIRMED_DYNAMIC_MAPPING_FIELDS,
+        )
     return _parse_bundle_json(
         raw,
-        _HISTORICAL_CONFIRMED_ADAPTER,
-        _require_historical_pregame_audit_fields,
+        _HISTORICAL_RELAXED_CONFIRMED_ADAPTER,
+        _require_historical_relaxed_pregame_audit_fields,
         _CONFIRMED_TRUSTED_FIELDS,
         _CONFIRMED_DYNAMIC_MAPPING_FIELDS,
     )

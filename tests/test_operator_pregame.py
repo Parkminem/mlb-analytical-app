@@ -56,10 +56,16 @@ from analysis.operator.errors import (
 )
 from analysis.operator.schemas import (
     ConfirmedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
     HistoricalConfirmedBundle,
     HistoricalProjectedBundle,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     parse_confirmed_bundle_json,
+    parse_historical_confirmed_bundle_json,
+    parse_historical_projected_bundle_json,
     parse_projected_bundle_json,
     parse_review_bundle_json,
 )
@@ -86,6 +92,7 @@ from tests.test_operator_schemas import (
     _complete_legacy_decision_mapping,
     _raw,
     confirmed_bundle_mapping,
+    historical_bundle_mapping,
     projected_bundle_mapping,
     review_bundle_mapping,
 )
@@ -93,6 +100,74 @@ from tests.test_operator_schemas import (
 
 def _projected_bundle() -> ProjectedBundle:
     return parse_projected_bundle_json(_raw(projected_bundle_mapping()))
+
+
+@pytest.mark.parametrize(
+    (
+        "current_type",
+        "historical_parser",
+        "mapping_factory",
+        "relaxed_type",
+        "strict_type",
+    ),
+    (
+        (
+            ProjectedBundle,
+            parse_historical_projected_bundle_json,
+            projected_bundle_mapping,
+            HistoricalRelaxedProjectedBundleV1,
+            HistoricalStrictProjectedBundleV1,
+        ),
+        (
+            ConfirmedBundle,
+            parse_historical_confirmed_bundle_json,
+            confirmed_bundle_mapping,
+            HistoricalRelaxedConfirmedBundleV1,
+            HistoricalStrictConfirmedBundleV1,
+        ),
+    ),
+)
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+def test_historical_v1_cannot_launder_into_current_v2(
+    current_type,
+    historical_parser,
+    mapping_factory,
+    relaxed_type,
+    strict_type,
+    candidate_contract: str,
+) -> None:
+    mapping = historical_bundle_mapping(mapping_factory, candidate_contract)
+    historical = historical_parser(_raw(mapping))
+    expected_type = strict_type if candidate_contract == "strict" else relaxed_type
+    assert type(historical) is expected_type
+
+    for validate in (
+        lambda: current_type.model_validate(historical, from_attributes=True),
+        lambda: TypeAdapter(current_type).validate_python(
+            historical,
+            from_attributes=True,
+        ),
+        lambda: current_type.model_validate_json(historical.model_dump_json()),
+    ):
+        with pytest.raises(ValidationError):
+            validate()
+
+    fresh = historical.model_dump()
+    fresh["schema_version"] = 2
+    fresh["authority"] = "current"
+    for candidate in fresh["payload"]["legacy_decision"]["candidates"]:
+        candidate.setdefault("same_game_pair_compatible", False)
+    fresh_json = json.loads(historical.model_dump_json())
+    fresh_json["schema_version"] = 2
+    fresh_json["authority"] = "current"
+    for candidate in fresh_json["payload"]["legacy_decision"]["candidates"]:
+        candidate.setdefault("same_game_pair_compatible", False)
+
+    assert type(current_type.model_validate(fresh)) is current_type
+    assert type(TypeAdapter(current_type).validate_python(fresh)) is current_type
+    assert type(
+        current_type.model_validate_json(json.dumps(fresh_json))
+    ) is current_type
 
 
 def _projected_game(**overrides: object):
@@ -311,6 +386,28 @@ def _write_hash_named_managed_bundle(
     )
     source.write_bytes(raw)
     return source
+
+
+def _historical_v1_mapping(
+    mapping: dict[str, object],
+) -> dict[str, object]:
+    historical = deepcopy(mapping)
+    historical["schema_version"] = 1
+    historical.pop("authority")
+    for candidate in historical["payload"]["legacy_decision"]["candidates"]:
+        candidate.pop("same_game_pair_compatible", None)
+    return historical
+
+
+def _mark_current_v2(mapping: dict[str, object]) -> None:
+    mapping["schema_version"] = 2
+    mapping["authority"] = "current"
+
+
+def _pre_v2_execution_seed(bundle):
+    """Recreate ledger identity emitted before the current schema migration."""
+
+    return bundle.model_copy(update={"schema_version": 1})
 
 
 def _bundle_with_legacy(stage: str, game, legacy: dict[str, object]):
@@ -980,7 +1077,7 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
         }
     )
     first = run_projected(
-        fresh_bundle,
+        _pre_v2_execution_seed(fresh_bundle),
         ledger_path=ledger,
         bundle_root=bundles,
     )
@@ -997,9 +1094,9 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
         if isinstance(record, ForecastRecord)
     )
 
-    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
-    for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
-        del candidate["same_game_pair_compatible"]
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle))
+    )
     source = _write_hash_named_managed_bundle(mapping, bundles)
     def fail_forecast(*args, **kwargs):
         raise AssertionError("exact historical replay must not run forecast")
@@ -1040,10 +1137,7 @@ def test_normal_runner_rejects_historical_artifact(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    mapping = json.loads(bundle_canonical_bytes(bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(json.loads(bundle_canonical_bytes(bundle)))
     source = _write_hash_named_managed_bundle(mapping, bundles)
     historical_artifact = bundles_module.load_historical_managed_bundle(
         source,
@@ -1083,10 +1177,7 @@ def test_normal_runner_rejects_historical_parsed_bundle(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    mapping = json.loads(bundle_canonical_bytes(bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(json.loads(bundle_canonical_bytes(bundle)))
     source = _write_hash_named_managed_bundle(mapping, bundles)
     historical_artifact = bundles_module.load_historical_managed_bundle(
         source,
@@ -1138,10 +1229,7 @@ def test_historical_public_dump_copy_cannot_create_current_pregame_run(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    mapping = json.loads(bundle_canonical_bytes(bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(json.loads(bundle_canonical_bytes(bundle)))
     source = _write_hash_named_managed_bundle(mapping, bundles)
     artifact = bundles_module.load_historical_managed_bundle(
         source,
@@ -1199,6 +1287,7 @@ def test_historical_public_dump_copy_cannot_create_current_pregame_run(
     explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
         "same_game_pair_compatible"
     ] = False
+    _mark_current_v2(explicitly_fresh)
     assert type(current_type.model_validate(explicitly_fresh)) is current_type
 
 
@@ -1222,10 +1311,7 @@ def test_historical_json_dump_cannot_create_current_pregame_run(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    mapping = json.loads(bundle_canonical_bytes(bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(json.loads(bundle_canonical_bytes(bundle)))
     source = _write_hash_named_managed_bundle(mapping, bundles)
     artifact = bundles_module.load_historical_managed_bundle(
         source,
@@ -1263,6 +1349,7 @@ def test_historical_json_dump_cannot_create_current_pregame_run(
     explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
         "same_game_pair_compatible"
     ] = False
+    _mark_current_v2(explicitly_fresh)
     fresh_json = json.dumps(explicitly_fresh)
     assert type(
         current_type.model_validate_json(fresh_json, strict=True)
@@ -1302,10 +1389,7 @@ def test_historical_nested_payload_dump_cannot_create_current_pregame_run(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    mapping = json.loads(bundle_canonical_bytes(bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(json.loads(bundle_canonical_bytes(bundle)))
     source = _write_hash_named_managed_bundle(mapping, bundles)
     artifact = bundles_module.load_historical_managed_bundle(
         source,
@@ -1343,6 +1427,7 @@ def test_historical_nested_payload_dump_cannot_create_current_pregame_run(
     explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
         "same_game_pair_compatible"
     ] = False
+    _mark_current_v2(explicitly_fresh)
     assert type(current_type.model_validate(explicitly_fresh)) is current_type
     assert type(adapter.validate_python(explicitly_fresh)) is current_type
     files_after = {
@@ -1392,7 +1477,7 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         _valid_recommended_legacy_mapping(),
     )
     first = runner(
-        fresh_bundle,
+        _pre_v2_execution_seed(fresh_bundle),
         ledger_path=ledger,
         bundle_root=bundles,
     )
@@ -1408,10 +1493,9 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         if isinstance(record, ForecastRecord)
     )
 
-    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle))
+    )
     source = _write_hash_named_managed_bundle(mapping, bundles)
     files_before_replay = {
         path.relative_to(bundles): path.read_bytes()
@@ -1506,7 +1590,7 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         }
     )
     first = runner(
-        fresh_bundle,
+        _pre_v2_execution_seed(fresh_bundle),
         ledger_path=ledger,
         bundle_root=bundles,
     )
@@ -1541,13 +1625,14 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         and record.forecast_run_id == historical_forecast.forecast_run_id
     )
 
-    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
-    for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
-        del candidate["same_game_pair_compatible"]
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle))
+    )
     source = _write_hash_named_managed_bundle(mapping, bundles)
     artifact = bundles_module.load_historical_managed_bundle(source, root=bundles)
     assert isinstance(artifact, ReplayOnlyPregameBundle)
     assert type(artifact.bundle) is historical_type
+    current_managed = persist_managed_bundle(fresh_bundle, root=bundles)
     caller_constructed_artifact = ReplayOnlyPregameBundle(
         bundle=artifact.bundle,
         managed_bundle=ManagedBundleCopy(
@@ -1591,7 +1676,7 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         match="historical replay requires a pre-change managed bundle",
     ):
         historical_replay(
-            first.managed_bundle.path,
+            current_managed.path,
             ledger_path=empty_ledger,
             bundle_root=bundles,
         )
@@ -1773,9 +1858,7 @@ def test_historical_schema_v1_managed_bundle_defaults_missing_compatibility(
     mapping["payload"]["legacy_decision"] = (
         _complete_legacy_decision_mapping()
     )
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(mapping)
     source = _write_hash_named_managed_bundle(mapping, tmp_path)
 
     loaded = bundles_module.load_historical_managed_bundle(
@@ -1799,9 +1882,7 @@ def test_missing_compatibility_managed_bundle_cannot_create_fresh_records(
     mapping = projected_bundle_mapping()
     mapping["payload"]["game_input"] = capture_payload(game)
     mapping["payload"]["legacy_decision"] = legacy
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    mapping = _historical_v1_mapping(mapping)
     source = _write_hash_named_managed_bundle(mapping, bundles)
     with pytest.raises(
         OperatorPreconditionError,
@@ -1880,7 +1961,7 @@ def test_managed_bundle_copy_is_immutable_and_replayable(tmp_path: Path) -> None
     assert first.path == (
         tmp_path
         / str(bundle.game_pk)
-        / f"projected-v1-{expected_hash[:16]}.json"
+        / f"projected-v2-{expected_hash[:16]}.json"
     )
     assert first.path.read_bytes() == bundle_canonical_bytes(bundle)
     assert first.replayed is False
@@ -1895,7 +1976,7 @@ def test_managed_bundle_rejects_conflicting_existing_bytes(tmp_path: Path) -> No
     digest = bundle_sha256(bundle)
     game_dir = tmp_path / str(bundle.game_pk)
     game_dir.mkdir()
-    target = game_dir / f"projected-v1-{digest[:16]}.json"
+    target = game_dir / f"projected-v2-{digest[:16]}.json"
     target.write_bytes(b"different")
 
     with pytest.raises(OperatorIOError, match="conflicting managed bundle"):
@@ -1938,7 +2019,7 @@ def test_managed_bundle_rejects_symlinked_target_without_mutating_it(
     game_dir.mkdir()
     outside = tmp_path / "outside.json"
     outside.write_text("outside", encoding="utf-8")
-    target = game_dir / f"projected-v1-{digest[:16]}.json"
+    target = game_dir / f"projected-v2-{digest[:16]}.json"
     target.symlink_to(outside)
 
     with pytest.raises(OperatorIOError, match="symbolic link"):
@@ -2779,7 +2860,7 @@ def test_partial_progress_never_exposes_managed_bundle_fields(
     )
     digest = bundle_sha256(bundle)
     unsafe_target = (
-        outside / f"projected-v1-{digest[:16]}.json"
+        outside / f"projected-v2-{digest[:16]}.json"
     )
     unsafe_target.write_bytes(bundle_canonical_bytes(bundle))
 
