@@ -701,6 +701,7 @@ def test_2026_08_05_rejects_ml_starter_evidence_bound_to_wrong_pitcher(
     paths = (
         starter_path,
         _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        bullpen_protection_path(),
     )
     legacy = legacy_snapshot(
         model_version="2026-08-05",
@@ -725,6 +726,7 @@ def test_2026_08_05_accepts_ml_starter_suppression_for_selected_pitcher(
             contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
         ),
         _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        bullpen_protection_path(),
     )
     legacy = legacy_snapshot(
         model_version="2026-08-05",
@@ -737,6 +739,62 @@ def test_2026_08_05_accepts_ml_starter_suppression_for_selected_pitcher(
     )
 
     validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
+def test_2026_08_05_inherits_ml_bullpen_evidence_contract() -> None:
+    paths = (
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("away_pitcher_chain_runs_allowed",),
+            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+        ),
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        review_bindings=(binding(market_key="away_ml", paths=paths),),
+    )
+
+    with pytest.raises(ValueError, match="missing_ml_bullpen_evidence_path"):
+        validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
+def test_2026_08_05_inherits_two_sided_under_evidence_contract() -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="under:full",
+        selected_side="under",
+        line=8.5,
+    )
+    paths = principal_paths()
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        final_priority=(MarketType.FULL_TOTAL.value,),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing_under_two_sided_evidence_paths",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
 
 
 def test_2026_08_05_rejects_high_total_two_sided_over_evidence(
@@ -1945,6 +2003,84 @@ class ShadowRecordingTests(unittest.TestCase):
             self.record(
                 legacy=legacy,
                 keys=self.keys("priority-evidence-contract"),
+            )
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
+    def test_recording_enforces_2026_08_05_inherited_evidence_contracts(self) -> None:
+        ml_market = next(
+            market
+            for market in self.game.markets
+            if market.market_type is MarketType.ML
+        )
+        ml_paths = (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+                component_ids=("away_pitcher_chain_runs_allowed",),
+                contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+            ),
+            _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        )
+        missing_bullpen = legacy_snapshot(
+            model_version="2026-08-05",
+            candidates=(
+                candidate(
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in ml_paths
+                    ),
+                ),
+            ),
+            review_bindings=(
+                binding(market_key=ml_market.market_key, paths=ml_paths),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing_ml_bullpen_evidence_path",
+        ):
+            self.record(
+                legacy=missing_bullpen,
+                keys=self.keys("missing-bullpen"),
+            )
+
+        under_market = replace(
+            self.game.markets[0],
+            market_key="record:under:full:2026-08-05",
+            market_type=MarketType.FULL_TOTAL,
+            selected_side="under",
+            line=8.5,
+        )
+        under_game = replace(self.game, markets=(under_market,))
+        missing_two_sided_under = legacy_snapshot(
+            model_version="2026-08-05",
+            candidates=(
+                candidate(
+                    market=MarketType.FULL_TOTAL.value,
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in principal_paths()
+                    ),
+                ),
+            ),
+            final_priority=(MarketType.FULL_TOTAL.value,),
+            review_bindings=(
+                binding(
+                    market_key=under_market.market_key,
+                    legacy_market=MarketType.FULL_TOTAL.value,
+                    paths=principal_paths(),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing_under_two_sided_evidence_paths",
+        ):
+            self.record(
+                game=under_game,
+                legacy=missing_two_sided_under,
+                forecast=run_forecast(under_game, _fast_config()),
+                keys=self.keys("missing-two-sided-under"),
             )
 
         self.assertEqual(tuple(self.store.iter_records()), ())
