@@ -1914,6 +1914,41 @@ class ShadowRecordingTests(unittest.TestCase):
 
         self.assertEqual(tuple(self.store.iter_records()), ())
 
+    def test_recording_enforces_2026_08_05_priority_evidence_contract(self) -> None:
+        market = next(
+            market
+            for market in self.game.markets
+            if market.market_type is MarketType.ML
+        )
+        paths = (
+            _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+            bullpen_protection_path(),
+        )
+        legacy = legacy_snapshot(
+            model_version="2026-08-05",
+            candidates=(
+                candidate(
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in paths
+                    ),
+                ),
+            ),
+            review_bindings=(
+                binding(market_key=market.market_key, paths=paths),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing_ml_starter_evidence",
+        ):
+            self.record(
+                legacy=legacy,
+                keys=self.keys("priority-evidence-contract"),
+            )
+
+        self.assertEqual(tuple(self.store.iter_records()), ())
+
     def test_recording_preserves_historical_under_contract(self) -> None:
         market = replace(
             self.game.markets[0],

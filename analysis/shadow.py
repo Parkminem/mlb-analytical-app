@@ -90,6 +90,12 @@ _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSIONS = frozenset(
 )
 _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION = "2026-08-03"
 _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION = "2026-08-05"
+_RECORDING_REVIEW_CONTRACT_MODEL_VERSIONS = frozenset(
+    (
+        _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION,
+        _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION,
+    )
+)
 _ML_BULLPEN_REVIEW_PATHS = frozenset(
     (
         PriorityEvidencePath.BULLPEN_PROTECTION,
@@ -2143,7 +2149,7 @@ def record_shadow_run(
         raise ValueError(
             "forecast market_inputs do not match canonical game_input markets"
         )
-    if legacy.model_version == _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION:
+    if legacy.model_version in _RECORDING_REVIEW_CONTRACT_MODEL_VERSIONS:
         validate_recommended_review_contract(legacy, resolved_game.markets)
     if comparison is None:
         comparison = compare_shadow_forecast(legacy, forecast)
