@@ -1767,7 +1767,11 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
     def fail_historical_side_effect(*args, **kwargs):
         raise AssertionError("historical replay reached a forbidden write path")
 
-    monkeypatch.setattr(service_module, "run_forecast", fail_historical_side_effect)
+    monkeypatch.setattr(
+        service_module,
+        "run_forecast",
+        fail_historical_side_effect,
+    )
     monkeypatch.setattr(
         service_module,
         "record_shadow_run",
@@ -1810,6 +1814,293 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         for path in bundles.rglob("*")
         if path.is_file()
     } == files_before_replay
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "historical_parser",
+        "historical_replay",
+        "game_factory",
+    ),
+    (
+        (
+            "projected",
+            parse_historical_projected_bundle_json,
+            replay_historical_projected,
+            _projected_game,
+        ),
+        (
+            "confirmed",
+            parse_historical_confirmed_bundle_json,
+            replay_historical_confirmed,
+            _confirmed_game,
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("artifact_contract", "ledger_contract"),
+    (("relaxed", "strict"), ("strict", "relaxed")),
+)
+def test_historical_replay_rejects_opposite_frozen_candidate_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    historical_parser,
+    historical_replay,
+    game_factory,
+    artifact_contract: str,
+    ledger_contract: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    fresh_bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle)),
+        candidate_contract=artifact_contract,
+    )
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_bundle = historical_parser(source.read_bytes())
+    first = _record_pre_v2_execution(historical_bundle, ledger)
+
+    if ledger_contract == "relaxed":
+        outputs = json.loads(canonical_json(first.forecast.outputs))
+        del outputs["shadow_comparison"]["legacy"]["candidates"][0][
+            "same_game_pair_compatible"
+        ]
+        _rewrite_forecast_outputs(ledger, first.forecast, outputs)
+
+    original_bytes = source.read_bytes()
+    ledger_before_replay = ledger.read_bytes()
+    files_before_replay = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    def fail_historical_side_effect(*args, **kwargs):
+        raise AssertionError("shape mismatch reached a forbidden write path")
+
+    monkeypatch.setattr(
+        service_module,
+        "run_forecast",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        fail_historical_side_effect,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="historical replay requires an exact existing replay",
+    ):
+        historical_replay(
+            source,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    assert source.read_bytes() == original_bytes
+    assert ledger.read_bytes() == ledger_before_replay
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == files_before_replay
+
+
+@pytest.mark.parametrize(
+    ("stage", "historical_parser", "historical_replay"),
+    (
+        (
+            "projected",
+            parse_historical_projected_bundle_json,
+            replay_historical_projected,
+        ),
+        (
+            "confirmed",
+            parse_historical_confirmed_bundle_json,
+            replay_historical_confirmed,
+        ),
+    ),
+)
+@pytest.mark.parametrize("artifact_contract", ("relaxed", "strict"))
+def test_historical_replay_rejects_mixed_frozen_candidate_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    historical_parser,
+    historical_replay,
+    artifact_contract: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game, legacy = _compatible_ml_over_case()
+    if stage == "confirmed":
+        game = replace(
+            game,
+            away_lineup=replace(game.away_lineup, state=LineupState.CONFIRMED),
+        )
+    legacy = replace(
+        legacy,
+        candidates=tuple(
+            replace(candidate, same_game_pair_compatible=False)
+            for candidate in legacy.candidates
+        ),
+    )
+    base = _pregame_bundle(stage, game)
+    fresh_bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle)),
+        candidate_contract=artifact_contract,
+    )
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_bundle = historical_parser(source.read_bytes())
+    with monkeypatch.context() as seed_gates:
+        seed_gates.setattr(
+            shadow_module,
+            "validate_recommended_review_contract",
+            lambda *args, **kwargs: None,
+        )
+        seed_gates.setattr(
+            shadow_module,
+            "require_recommended_review_eligibility",
+            lambda *args, **kwargs: None,
+        )
+        first = _record_pre_v2_execution(historical_bundle, ledger)
+    outputs = json.loads(canonical_json(first.forecast.outputs))
+    candidates = outputs["shadow_comparison"]["legacy"]["candidates"]
+    del candidates[0]["same_game_pair_compatible"]
+    assert candidates[1]["same_game_pair_compatible"] is False
+    _rewrite_forecast_outputs(ledger, first.forecast, outputs)
+    ledger_before_replay = ledger.read_bytes()
+    original_bytes = source.read_bytes()
+
+    def fail_historical_side_effect(*args, **kwargs):
+        raise AssertionError("mixed shape reached a forbidden write path")
+
+    monkeypatch.setattr(
+        service_module,
+        "run_forecast",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        fail_historical_side_effect,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="historical replay requires an exact existing replay",
+    ):
+        historical_replay(
+            source,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    assert ledger.read_bytes() == ledger_before_replay
+    assert source.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "historical_parser",
+        "historical_replay",
+        "relaxed_type",
+        "game_factory",
+    ),
+    (
+        (
+            "projected",
+            parse_historical_projected_bundle_json,
+            replay_historical_projected,
+            HistoricalRelaxedProjectedBundleV1,
+            _projected_game,
+        ),
+        (
+            "confirmed",
+            parse_historical_confirmed_bundle_json,
+            replay_historical_confirmed,
+            HistoricalRelaxedConfirmedBundleV1,
+            _confirmed_game,
+        ),
+    ),
+)
+def test_historical_empty_candidate_comparison_contract_is_relaxed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    historical_parser,
+    historical_replay,
+    relaxed_type,
+    game_factory,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    empty_legacy = projected_bundle_mapping()["payload"]["legacy_decision"]
+    fresh_bundle = _bundle_with_legacy(stage, game_factory(), empty_legacy)
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle))
+    )
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_bundle = historical_parser(source.read_bytes())
+    assert type(historical_bundle) is relaxed_type
+    first = _record_pre_v2_execution(historical_bundle, ledger)
+    raw_candidates = first.forecast.outputs["shadow_comparison"]["legacy"][
+        "candidates"
+    ]
+    assert tuple(raw_candidates) == ()
+
+    def fail_historical_side_effect(*args, **kwargs):
+        raise AssertionError("empty replay reached a forbidden write path")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_historical_side_effect)
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        fail_historical_side_effect,
+    )
+    ledger_before_replay = ledger.read_bytes()
+    original_bytes = source.read_bytes()
+
+    replay = historical_replay(
+        source,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert replay.capture == first.capture
+    assert replay.forecast == first.forecast
+    assert replay.link == first.link
+    assert ledger.read_bytes() == ledger_before_replay
+    assert source.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize(

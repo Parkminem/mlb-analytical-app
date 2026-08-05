@@ -421,6 +421,43 @@ def _capture_matches_command(
     )
 
 
+def _historical_comparison_contract_matches(
+    bundle: _ReplayBundle,
+    value: object,
+) -> bool:
+    bundle_type = type(bundle)
+    if bundle_type in (
+        HistoricalRelaxedProjectedBundleV1,
+        HistoricalRelaxedConfirmedBundleV1,
+    ):
+        expected_presence = False
+    elif bundle_type in (
+        HistoricalStrictProjectedBundleV1,
+        HistoricalStrictConfirmedBundleV1,
+    ):
+        expected_presence = True
+    else:
+        return True
+
+    if not isinstance(value, Mapping):
+        return False
+    legacy = value.get("legacy")
+    if not isinstance(legacy, Mapping):
+        return False
+    candidates = legacy.get("candidates")
+    if not isinstance(candidates, (list, tuple)):
+        return False
+    if not candidates:
+        return expected_presence is False
+    if not all(isinstance(candidate, Mapping) for candidate in candidates):
+        return False
+    presence = tuple(
+        "same_game_pair_compatible" in candidate
+        for candidate in candidates
+    )
+    return all(presence) if expected_presence else not any(presence)
+
+
 def _forecast_outputs_match(
     forecast: ForecastRecord,
     link: CaptureForecastLink,
@@ -444,9 +481,13 @@ def _forecast_outputs_match(
             away_team=game.identity.away_team,
             home_team=game.identity.home_team,
         )
-        comparison = deserialize_shadow_comparison(
-            linked_shadow_comparison(link, forecast)
-        )
+        raw_comparison = linked_shadow_comparison(link, forecast)
+        if not _historical_comparison_contract_matches(
+            bundle,
+            raw_comparison,
+        ):
+            return False
+        comparison = deserialize_shadow_comparison(raw_comparison)
         validate_shadow_forecast_context(
             comparison,
             context.market_inputs,
