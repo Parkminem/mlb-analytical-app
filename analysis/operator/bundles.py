@@ -14,7 +14,7 @@ from pydantic import TypeAdapter
 from analysis.forecasting.identity import canonical_json
 from analysis.ledger import CaptureCommand
 
-from .errors import OperatorIOError
+from .errors import BundleValidationError, OperatorIOError
 from .fdio import (
     create_exclusive_file,
     open_directory,
@@ -72,6 +72,13 @@ class ManagedBundleCopy:
         return self.bundle_hash
 
 
+@dataclass(frozen=True)
+class ReplayOnlyPregameBundle:
+    """A pre-change managed bundle that may only resolve an exact replay."""
+
+    bundle: ProjectedBundle | ConfirmedBundle
+
+
 def load_bundle(path: str | os.PathLike[str]) -> _Bundle:
     """Read raw bundle bytes and delegate strict domain parsing."""
 
@@ -90,7 +97,7 @@ def load_historical_managed_bundle(
     path: str | os.PathLike[str],
     *,
     root: str | os.PathLike[str],
-) -> _Bundle:
+) -> _Bundle | ReplayOnlyPregameBundle:
     """Read an authenticated managed artifact through historical schemas."""
 
     bundle_path = Path(path).expanduser()
@@ -123,7 +130,12 @@ def load_historical_managed_bundle(
     if actual_hash[:16] != filename_match.group("hash_prefix"):
         raise OperatorIOError("historical managed bundle hash is invalid")
     stage = bundle_stage_from_json(raw)
-    bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
+    replay_only = False
+    try:
+        bundle = _BUNDLE_PARSERS[stage](raw)
+    except BundleValidationError:
+        bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
+        replay_only = stage in ("projected", "confirmed")
     if (
         stage != filename_match.group("stage")
         or bundle.schema_version
@@ -133,6 +145,8 @@ def load_historical_managed_bundle(
         raise OperatorIOError(
             "historical managed bundle identity is inconsistent"
         )
+    if replay_only:
+        return ReplayOnlyPregameBundle(bundle=bundle)
     return bundle
 
 
@@ -422,6 +436,7 @@ def persist_managed_bundle(
 __all__ = (
     "DEFAULT_BUNDLE_ROOT",
     "ManagedBundleCopy",
+    "ReplayOnlyPregameBundle",
     "bundle_canonical_bytes",
     "bundle_sha256",
     "intrinsic_capture_key",

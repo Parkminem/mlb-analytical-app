@@ -8,6 +8,7 @@ import warnings
 import pytest
 
 import analysis.operator.bundles as bundles_module
+import analysis.operator.cli as cli_module
 import analysis.operator.service as service_module
 import analysis.shadow as shadow_module
 from analysis.operator.bundles import (
@@ -284,6 +285,22 @@ def _compatible_ml_over_case() -> tuple[object, LegacyDecisionSnapshot]:
 
 def _run_paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "ledger" / "shadow.jsonl", tmp_path / "bundles"
+
+
+def _write_hash_named_managed_bundle(
+    mapping: dict[str, object],
+    root: Path,
+) -> Path:
+    raw = canonical_json(mapping).encode("utf-8")
+    bundle_hash = hashlib.sha256(raw).hexdigest()
+    game_dir = root / str(mapping["game_pk"])
+    game_dir.mkdir(parents=True, exist_ok=True)
+    source = game_dir / (
+        f"{mapping['stage']}-v{mapping['schema_version']}-"
+        f"{bundle_hash[:16]}.json"
+    )
+    source.write_bytes(raw)
+    return source
 
 
 def _bundle_with_legacy(stage: str, game, legacy: dict[str, object]):
@@ -943,9 +960,15 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
-    game = _projected_game()
-    legacy = _valid_recommended_legacy_mapping()
-    fresh_bundle = _bundle_with_legacy("projected", game, legacy)
+    game, legacy = _compatible_ml_over_case()
+    base = _pregame_bundle("projected", game)
+    fresh_bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
     first = run_projected(
         fresh_bundle,
         ledger_path=ledger,
@@ -953,9 +976,10 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
     )
 
     historical_outputs = json.loads(canonical_json(first.forecast.outputs))
-    del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
+    for candidate in historical_outputs["shadow_comparison"]["legacy"][
+        "candidates"
+    ]:
+        del candidate["same_game_pair_compatible"]
     _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
     historical_forecast = next(
         record
@@ -963,17 +987,10 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
         if isinstance(record, ForecastRecord)
     )
 
-    mapping = projected_bundle_mapping()
-    mapping["payload"]["game_input"] = capture_payload(game)
-    mapping["payload"]["legacy_decision"] = legacy
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
-    raw = canonical_json(mapping).encode("utf-8")
-    bundle_hash = hashlib.sha256(raw).hexdigest()
-    game_dir = bundles / str(mapping["game_pk"])
-    source = game_dir / f"projected-v1-{bundle_hash[:16]}.json"
-    source.write_bytes(raw)
+    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
+    for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
+        del candidate["same_game_pair_compatible"]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
     historical_bundle = bundles_module.load_historical_managed_bundle(
         source,
         root=bundles,
@@ -1161,21 +1178,79 @@ def test_historical_schema_v1_managed_bundle_defaults_missing_compatibility(
     del mapping["payload"]["legacy_decision"]["candidates"][0][
         "same_game_pair_compatible"
     ]
-    raw = canonical_json(mapping).encode("utf-8")
-    bundle_hash = hashlib.sha256(raw).hexdigest()
-    game_dir = tmp_path / str(mapping["game_pk"])
-    game_dir.mkdir()
-    source = game_dir / f"projected-v1-{bundle_hash[:16]}.json"
-    source.write_bytes(raw)
+    source = _write_hash_named_managed_bundle(mapping, tmp_path)
 
     loaded = bundles_module.load_historical_managed_bundle(
         source,
         root=tmp_path,
     )
+    loaded_bundle = getattr(loaded, "bundle", loaded)
 
-    assert loaded.payload.legacy_decision.candidates[
+    assert loaded_bundle.payload.legacy_decision.candidates[
         0
     ].same_game_pair_compatible is False
+
+
+def test_missing_compatibility_managed_bundle_cannot_create_fresh_records(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    legacy = _valid_recommended_legacy_mapping()
+    legacy["review_bindings"][0]["market_key"] = "sea_ml"
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["game_input"] = capture_payload(game)
+    mapping["payload"]["legacy_decision"] = legacy
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    loaded = cli_module._load_stage_bundle(
+        source,
+        expected_type=ProjectedBundle,
+        expected_stage="projected",
+        bundle_root=bundles,
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="historical compatibility bundle requires an exact replay",
+    ):
+        run_projected(
+            loaded,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    assert not ledger.exists()
+
+
+def test_strict_current_managed_bundle_can_create_fresh_records(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    bundle = _bundle_with_legacy(
+        "projected",
+        game,
+        _valid_recommended_legacy_mapping(),
+    )
+    persisted = persist_managed_bundle(bundle, root=bundles)
+    loaded = cli_module._load_stage_bundle(
+        persisted.path,
+        expected_type=ProjectedBundle,
+        expected_stage="projected",
+        bundle_root=bundles,
+    )
+
+    result = run_projected(
+        loaded,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert result.capture_replayed is False
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
 
 
 @pytest.mark.parametrize(

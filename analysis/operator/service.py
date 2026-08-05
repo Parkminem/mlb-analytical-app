@@ -65,6 +65,7 @@ from analysis.shadow import (
 from .bundles import (
     DEFAULT_BUNDLE_ROOT,
     ManagedBundleCopy,
+    ReplayOnlyPregameBundle,
     intrinsic_capture_key,
     persist_managed_bundle,
 )
@@ -622,13 +623,17 @@ def _pregame_partial_progress(
 
 
 def _run_pregame(
-    bundle: _Bundle,
+    supplied_bundle: _Bundle | ReplayOnlyPregameBundle,
     *,
     expected_stage: str,
     ledger_path: str | Path,
     bundle_root: str | Path,
     registry_root: str | Path | None,
 ) -> PregameRunResult:
+    replay_only = isinstance(supplied_bundle, ReplayOnlyPregameBundle)
+    bundle = (
+        supplied_bundle.bundle if replay_only else supplied_bundle
+    )
     _require_stage(bundle, expected_stage)
     _validate_game(bundle, expected_stage)
     config = load_forecast_config(
@@ -663,6 +668,10 @@ def _run_pregame(
             expected_stage=expected_stage,
             exact_replay=exact_replay,
             bundle_root=bundle_root,
+        )
+    if replay_only:
+        raise OperatorPreconditionError(
+            "historical compatibility bundle requires an exact replay"
         )
 
     received_legacy_model_version = (
@@ -861,7 +870,7 @@ def _run_pregame(
 
 
 def run_projected(
-    bundle: ProjectedBundle,
+    bundle: ProjectedBundle | ReplayOnlyPregameBundle,
     *,
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
     bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
@@ -879,7 +888,7 @@ def run_projected(
 
 
 def run_confirmed(
-    bundle: ConfirmedBundle,
+    bundle: ConfirmedBundle | ReplayOnlyPregameBundle,
     *,
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
     bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,

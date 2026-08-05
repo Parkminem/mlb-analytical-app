@@ -10,6 +10,7 @@ from rich.text import Text
 
 from .bundles import (
     DEFAULT_BUNDLE_ROOT,
+    ReplayOnlyPregameBundle,
     load_bundle,
     load_historical_managed_bundle,
 )
@@ -145,14 +146,22 @@ def _load_stage_bundle(
     expected_type: type[_BundleT],
     expected_stage: str,
     bundle_root: Path,
-) -> _BundleT:
+) -> _BundleT | ReplayOnlyPregameBundle:
     resolved_path = path.expanduser().resolve(strict=False)
     resolved_root = bundle_root.expanduser().resolve(strict=False)
     if resolved_path.parent.parent == resolved_root:
         bundle = load_historical_managed_bundle(path, root=bundle_root)
     else:
         bundle = load_bundle(path)
-    if type(bundle) is not expected_type or bundle.stage != expected_stage:
+    validated_bundle = (
+        bundle.bundle
+        if isinstance(bundle, ReplayOnlyPregameBundle)
+        else bundle
+    )
+    if (
+        type(validated_bundle) is not expected_type
+        or validated_bundle.stage != expected_stage
+    ):
         raise OperatorPreconditionError(
             "bundle stage/type mismatch: "
             f"{expected_stage} requires {expected_type.__name__} with stage "
