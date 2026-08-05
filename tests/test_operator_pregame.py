@@ -825,6 +825,195 @@ def test_invalid_recommended_contract_before_forecast(
 
 
 @pytest.mark.parametrize(
+    ("market_kind", "expected_error"),
+    (
+        ("ml", "missing_ml_starter_evidence"),
+        ("high_total_over", "missing_high_total_two_sided_over_evidence"),
+    ),
+)
+def test_2026_08_05_evidence_contract_rejects_before_forecast_or_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market_kind: str,
+    expected_error: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    if market_kind == "ml":
+        market = next(
+            market
+            for market in game.markets
+            if market.market_type.value == "ml"
+        )
+        paths = (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                component_ids=(
+                    "away_full_runs",
+                    "away_full_traffic",
+                    "away_full_extra_base_hits",
+                ),
+                contradiction_rule=(
+                    ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+                ),
+            ),
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.BULLPEN_PROTECTION,
+                component_ids=(
+                    "home_bullpen_runs_allowed",
+                    "home_protected_bullpen_close_entry",
+                ),
+                contradiction_rule=ContradictionRule.BULLPEN_PROTECTION,
+            ),
+        )
+        candidate = PriorityMarketCandidate(
+            market="ml",
+            score=78,
+            decision_rating="play",
+            evidence_paths=frozenset(path.evidence_path for path in paths),
+        )
+    else:
+        market = replace(
+            next(
+                market
+                for market in game.markets
+                if market.market_type.value == "full_total"
+            ),
+            market_key="full_over",
+            selected_side="over",
+            line=9.0,
+        )
+        game = replace(
+            game,
+            markets=tuple(
+                market if item.market_type.value == "full_total" else item
+                for item in game.markets
+            ),
+        )
+        paths = (
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                component_ids=(
+                    "away_full_runs",
+                    "away_full_traffic",
+                    "away_full_extra_base_hits",
+                ),
+                contradiction_rule=(
+                    ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+                ),
+            ),
+            PrincipalPathBinding(
+                evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+                component_ids=(
+                    "home_pitcher_chain_runs_allowed",
+                    "home_pitcher_chain_workload_outs",
+                ),
+                contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+            ),
+        )
+        candidate = PriorityMarketCandidate(
+            market="full_total",
+            score=78,
+            decision_rating="play",
+            evidence_paths=frozenset(path.evidence_path for path in paths),
+        )
+    legacy = LegacyDecisionSnapshot(
+        model_version="2026-08-05",
+        candidates=(candidate,),
+        final_priority=(candidate.market,),
+        review_bindings=(
+            CandidateReviewBinding(
+                market_key=market.market_key,
+                legacy_candidate_index=0,
+                legacy_market=candidate.market,
+                principal_paths=paths,
+            ),
+        ),
+    )
+    bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=legacy,
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("evidence rejection must not run forecast")
+
+    monkeypatch.setattr(service_module, "LEGACY_MODEL_VERSION", "2026-08-05")
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(OperatorPreconditionError, match=expected_error):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.parent.exists()
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
+def test_exact_old_version_replay_precedes_fresh_evidence_version_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _valid_recommended_legacy_mapping(),
+    )
+    first = run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("exact old-version replay must not run forecast")
+
+    monkeypatch.setattr(service_module, "LEGACY_MODEL_VERSION", "2026-08-05")
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    replay = run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert replay.capture == first.capture
+    assert replay.forecast == first.forecast
+    assert replay.link == first.link
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
+
+
+def test_nonexact_old_version_submission_rejects_without_new_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        "projected",
+        _projected_game(),
+        _valid_recommended_legacy_mapping(),
+    )
+    run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+    changed = _validated_current_copy(
+        bundle,
+        legacy_decision=replace(
+            bundle.payload.legacy_decision,
+            notes=("not an exact replay",),
+        ),
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("old-version rejection must not run forecast")
+
+    monkeypatch.setattr(service_module, "LEGACY_MODEL_VERSION", "2026-08-05")
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match=(
+            "fresh pregame legacy model_version must be 2026-08-05; "
+            "received 2026-08-03"
+        ),
+    ):
+        run_projected(changed, ledger_path=ledger, bundle_root=bundles)
+
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
+    assert len(tuple(bundles.rglob("*.json"))) == 1
+
+
+@pytest.mark.parametrize(
     "violation",
     ("below_threshold", "duplicate_side_family", "correlated", "incompatible"),
 )

@@ -623,6 +623,303 @@ def test_recommended_contract_allows_unbound_pass() -> None:
     )
 
 
+def _conversion_path(
+    evidence_path: PriorityEvidencePath,
+    side: str,
+    *,
+    horizon: str = "full",
+) -> PrincipalPathBinding:
+    return PrincipalPathBinding(
+        evidence_path=evidence_path,
+        component_ids=(
+            f"{side}_{horizon}_runs",
+            f"{side}_{horizon}_traffic",
+            f"{side}_{horizon}_extra_base_hits",
+        ),
+        contradiction_rule=(
+            ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION
+        ),
+    )
+
+
+def _starter_collapse_path(side: str) -> PrincipalPathBinding:
+    return PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+        component_ids=(
+            f"{side}_pitcher_chain_runs_allowed",
+            f"{side}_pitcher_chain_workload_outs",
+        ),
+        contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+    )
+
+
+def _ml_market():
+    return replace(
+        complete_forecast_game().markets[0],
+        market_key="away_ml",
+        market_type=MarketType.ML,
+        selected_side="away",
+        line=None,
+    )
+
+
+def test_2026_08_05_rejects_playable_ml_without_directional_starter_evidence(
+) -> None:
+    paths = (
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        bullpen_protection_path(),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        review_bindings=(binding(market_key="away_ml", paths=paths),),
+    )
+
+    with pytest.raises(ValueError, match="missing_ml_starter_evidence"):
+        validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
+@pytest.mark.parametrize(
+    "starter_path",
+    (
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("home_pitcher_chain_runs_allowed",),
+            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+        ),
+        _starter_collapse_path("away"),
+    ),
+    ids=("selected_side_opponent_suppression", "selected_side_collapse"),
+)
+def test_2026_08_05_rejects_ml_starter_evidence_bound_to_wrong_pitcher(
+    starter_path: PrincipalPathBinding,
+) -> None:
+    paths = (
+        starter_path,
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        review_bindings=(binding(market_key="away_ml", paths=paths),),
+    )
+
+    with pytest.raises(ValueError, match="missing_ml_starter_evidence"):
+        validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
+def test_2026_08_05_accepts_ml_starter_suppression_for_selected_pitcher(
+) -> None:
+    paths = (
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+            component_ids=("away_pitcher_chain_runs_allowed",),
+            contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+        ),
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        review_bindings=(binding(market_key="away_ml", paths=paths),),
+    )
+
+    validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
+def test_2026_08_05_rejects_high_total_two_sided_over_evidence(
+) -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="over:full",
+        selected_side="over",
+        line=9.0,
+    )
+    paths = (
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        _starter_collapse_path("home"),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        final_priority=(MarketType.FULL_TOTAL.value,),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing_high_total_two_sided_over_evidence",
+    ):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+@pytest.mark.parametrize(
+    "opposing_pitcher_path",
+    (
+        _starter_collapse_path("away"),
+        PrincipalPathBinding(
+            evidence_path=PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+            component_ids=(
+                "away_bullpen_segment_missing_exposed",
+                "away_pitcher_chain_workload_outs",
+            ),
+            contradiction_rule=ContradictionRule.LATE_BULLPEN_EXPOSURE,
+        ),
+    ),
+    ids=("starter_collapse", "late_bullpen_exposure"),
+)
+def test_2026_08_05_accepts_high_total_two_sided_conversion_and_opposing_pitcher_route(
+    opposing_pitcher_path: PrincipalPathBinding,
+) -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="over:full",
+        selected_side="over",
+        line=9.0,
+    )
+    paths = (
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        opposing_pitcher_path,
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        final_priority=(MarketType.FULL_TOTAL.value,),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    validate_recommended_review_contract(legacy, (market,))
+
+
+@pytest.mark.parametrize(
+    ("paths", "error"),
+    (
+        (
+            (
+                _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+                _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "home"),
+            ),
+            "missing_high_total_two_sided_over_evidence",
+        ),
+        (
+            (
+                _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+                _conversion_path(PriorityEvidencePath.RECENT_RUN_CONVERSION, "away"),
+            ),
+            "missing_high_total_two_sided_over_evidence",
+        ),
+        (
+            (
+                _conversion_path(
+                    PriorityEvidencePath.TOP_ORDER_MATCHUP,
+                    "away",
+                    horizon="f5",
+                ),
+                _conversion_path(PriorityEvidencePath.RECENT_RUN_CONVERSION, "home"),
+            ),
+            "invalid binding shape",
+        ),
+    ),
+    ids=("duplicate_canonical_path", "same_scoring_side", "wrong_horizon"),
+)
+def test_2026_08_05_high_total_two_sided_contract_rejects_invalid_routes(
+    paths: tuple[PrincipalPathBinding, ...],
+    error: str,
+) -> None:
+    market = replace(
+        complete_forecast_game().markets[0],
+        market_key="over:full",
+        selected_side="over",
+        line=9.0,
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                market=MarketType.FULL_TOTAL.value,
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        final_priority=(MarketType.FULL_TOTAL.value,),
+        review_bindings=(
+            binding(
+                market_key=market.market_key,
+                legacy_market=MarketType.FULL_TOTAL.value,
+                paths=paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        validate_recommended_review_contract(legacy, (market,))
+
+
+@pytest.mark.parametrize(
+    ("score", "rating"),
+    ((71, "play"), (78, "pass")),
+)
+def test_2026_08_05_contract_leaves_pass_and_subthreshold_ml_outside_gate(
+    score: int,
+    rating: str,
+) -> None:
+    paths = (
+        _conversion_path(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+        bullpen_protection_path(),
+    )
+    legacy = legacy_snapshot(
+        model_version="2026-08-05",
+        candidates=(
+            candidate(
+                score=score,
+                rating=rating,
+                evidence_paths=frozenset(path.evidence_path for path in paths),
+            ),
+        ),
+        final_priority=() if rating == "pass" else (),
+        review_bindings=(
+            (binding(market_key="away_ml", paths=paths),)
+            if rating != "pass"
+            else ()
+        ),
+    )
+
+    validate_recommended_review_contract(legacy, (_ml_market(),))
+
+
 def _additional_valid_full_game_paths() -> tuple[PrincipalPathBinding, ...]:
     return (
         PrincipalPathBinding(

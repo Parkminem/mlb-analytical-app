@@ -72,6 +72,7 @@ from analysis.review.classification import (
     PrincipalPathBinding,
     validate_principal_path_bindings,
 )
+from analysis.review.evidence_contract import assess_priority_evidence_contract
 
 
 _FORECAST_RUN_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -88,6 +89,7 @@ _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSIONS = frozenset(
     ("2026-08-02", "2026-08-03")
 )
 _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSION = "2026-08-03"
+_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION = "2026-08-05"
 _ML_BULLPEN_REVIEW_PATHS = frozenset(
     (
         PriorityEvidencePath.BULLPEN_PROTECTION,
@@ -469,6 +471,27 @@ def validate_recommended_review_contract(
         except ValueError as error:
             errors.append(f"{prefix}: {error}")
             continue
+        if (
+            legacy.model_version == _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION
+            and candidate.score >= 72
+        ):
+            try:
+                assessment = assess_priority_evidence_contract(
+                    candidate,
+                    binding,
+                    market,
+                )
+            except ValueError as error:
+                errors.append(f"{prefix}: {error}")
+                continue
+            if (
+                assessment.score_cap is not None
+                and candidate.score > assessment.score_cap
+            ):
+                errors.append(
+                    f"{prefix}: {assessment.reason_codes[0]}"
+                )
+                continue
         binding_paths = frozenset(
             path.evidence_path for path in binding.principal_paths
         )
