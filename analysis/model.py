@@ -628,7 +628,21 @@ def assemble_same_game_priority(
         )
     )
 
+    family_winners: set[str] = set()
+    fixed_winners: list[PriorityMarketCandidate] = []
     for candidate in eligible:
+        candidate_family = _priority_market_family(candidate)
+        if candidate_family is not None and candidate_family in family_winners:
+            excluded.append(candidate)
+            notes.append(
+                f"{candidate.market} excluded because its market family is already represented"
+            )
+            continue
+        if candidate_family is not None:
+            family_winners.add(candidate_family)
+        fixed_winners.append(candidate)
+
+    for candidate in fixed_winners:
         if not included:
             included.append(candidate)
             continue

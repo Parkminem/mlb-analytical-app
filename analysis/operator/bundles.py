@@ -18,9 +18,12 @@ from .errors import BundleValidationError, OperatorIOError
 from .fdio import (
     create_exclusive_file,
     open_directory,
+    open_regular_file,
+    read_open_regular_file,
     read_regular_file,
     stat_at,
     verify_child_directory,
+    verify_child_regular_file,
     verify_public_directory,
 )
 from .schemas import (
@@ -105,59 +108,138 @@ def load_historical_managed_bundle(
 
     bundle_path = Path(path).expanduser()
     root_path = Path(root).expanduser()
+    root_descriptor = -1
+    game_descriptor = -1
+    file_descriptor = -1
     try:
         if bundle_path.is_symlink() or root_path.is_symlink():
             raise OperatorIOError("historical managed bundle path is symbolic")
-        resolved_path = bundle_path.resolve(strict=True)
-        resolved_root = root_path.resolve(strict=True)
-        if resolved_path.parent.parent != resolved_root:
+        authenticated_path = Path(os.path.abspath(bundle_path))
+        authenticated_root = Path(os.path.abspath(root_path))
+        if authenticated_path.parent.parent != authenticated_root:
             raise OperatorIOError(
                 "historical managed bundle must be inside its managed root"
             )
         filename_match = _MANAGED_BUNDLE_FILENAME.fullmatch(
-            resolved_path.name
+            authenticated_path.name
         )
         if filename_match is None:
             raise OperatorIOError(
                 "historical managed bundle filename is invalid"
             )
-        raw = resolved_path.read_bytes()
+        game_name = authenticated_path.parent.name
+        root_descriptor = open_directory(authenticated_root)
+        game_metadata = stat_at(root_descriptor, game_name)
+        if game_metadata is None:
+            raise OperatorIOError(
+                "historical managed bundle game directory does not exist"
+            )
+        if stat.S_ISLNK(game_metadata.st_mode):
+            raise OperatorIOError(
+                "historical managed bundle game directory is symbolic"
+            )
+        if not stat.S_ISDIR(game_metadata.st_mode):
+            raise OperatorIOError(
+                "historical managed bundle game path must be a directory"
+            )
+        game_descriptor = open_directory(
+            game_name,
+            dir_fd=root_descriptor,
+        )
+        file_descriptor = open_regular_file(
+            game_descriptor,
+            authenticated_path.name,
+            label="historical managed bundle path",
+        )
+        _verify_historical_managed_descriptors(
+            authenticated_root,
+            root_descriptor,
+            game_name,
+            game_descriptor,
+            authenticated_path.name,
+            file_descriptor,
+        )
+        raw = read_open_regular_file(
+            file_descriptor,
+            label="historical managed bundle path",
+        )
+        actual_hash = hashlib.sha256(raw).hexdigest()
+        if actual_hash[:16] != filename_match.group("hash_prefix"):
+            raise OperatorIOError("historical managed bundle hash is invalid")
+        stage = bundle_stage_from_json(raw)
+        replay_only = False
+        try:
+            bundle = _BUNDLE_PARSERS[stage](raw)
+        except BundleValidationError:
+            bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
+            replay_only = stage in ("projected", "confirmed")
+        if (
+            stage != filename_match.group("stage")
+            or bundle.schema_version
+            != int(filename_match.group("schema_version"))
+            or game_name != str(bundle.game_pk)
+        ):
+            raise OperatorIOError(
+                "historical managed bundle identity is inconsistent"
+            )
+        _verify_historical_managed_descriptors(
+            authenticated_root,
+            root_descriptor,
+            game_name,
+            game_descriptor,
+            authenticated_path.name,
+            file_descriptor,
+        )
+        if replay_only:
+            return ReplayOnlyPregameBundle(
+                bundle=bundle,
+                managed_bundle=ManagedBundleCopy(
+                    path=authenticated_path,
+                    bundle_hash=actual_hash,
+                    replayed=True,
+                ),
+            )
+        return bundle
     except OperatorIOError:
         raise
     except OSError as error:
         raise OperatorIOError(
             f"unable to read historical managed bundle {bundle_path}: {error}"
         ) from error
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if game_descriptor >= 0:
+            os.close(game_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
 
-    actual_hash = hashlib.sha256(raw).hexdigest()
-    if actual_hash[:16] != filename_match.group("hash_prefix"):
-        raise OperatorIOError("historical managed bundle hash is invalid")
-    stage = bundle_stage_from_json(raw)
-    replay_only = False
-    try:
-        bundle = _BUNDLE_PARSERS[stage](raw)
-    except BundleValidationError:
-        bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
-        replay_only = stage in ("projected", "confirmed")
-    if (
-        stage != filename_match.group("stage")
-        or bundle.schema_version
-        != int(filename_match.group("schema_version"))
-        or resolved_path.parent.name != str(bundle.game_pk)
-    ):
-        raise OperatorIOError(
-            "historical managed bundle identity is inconsistent"
-        )
-    if replay_only:
-        return ReplayOnlyPregameBundle(
-            bundle=bundle,
-            managed_bundle=ManagedBundleCopy(
-                path=resolved_path,
-                bundle_hash=actual_hash,
-                replayed=True,
-            ),
-        )
-    return bundle
+
+def _verify_historical_managed_descriptors(
+    root_path: Path,
+    root_descriptor: int,
+    game_name: str,
+    game_descriptor: int,
+    filename: str,
+    file_descriptor: int,
+) -> None:
+    verify_public_directory(
+        root_path,
+        root_descriptor,
+        label="historical managed bundle root",
+    )
+    verify_child_directory(
+        root_descriptor,
+        game_name,
+        game_descriptor,
+        label="historical managed bundle game directory",
+    )
+    verify_child_regular_file(
+        game_descriptor,
+        filename,
+        file_descriptor,
+        label="historical managed bundle path",
+    )
 
 
 def _serialized_bundle(bundle: _Bundle) -> dict[str, object]:

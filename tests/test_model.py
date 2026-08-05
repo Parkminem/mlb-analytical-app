@@ -124,6 +124,82 @@ class SameGamePriorityTests(unittest.TestCase):
         self.assertEqual([candidate.market for candidate in result.included], ["full_total"])
         self.assertEqual([candidate.market for candidate in result.excluded], ["ml"])
 
+    def test_incompatible_family_winner_does_not_promote_lower_side(self):
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "full_total",
+                    90,
+                    "over",
+                    frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE}),
+                    same_game_pair_compatible=True,
+                ),
+                model.PriorityMarketCandidate(
+                    "ml",
+                    85,
+                    "play",
+                    frozenset({model.PriorityEvidencePath.BULLPEN_PROTECTION}),
+                ),
+                model.PriorityMarketCandidate(
+                    "plus_1_5",
+                    80,
+                    "play",
+                    frozenset(
+                        {model.PriorityEvidencePath.UNDERDOG_RUN_CREATION}
+                    ),
+                    same_game_pair_compatible=True,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            [(candidate.market, candidate.score) for candidate in result.included],
+            [("full_total", 90)],
+        )
+        self.assertCountEqual(
+            [(candidate.market, candidate.score) for candidate in result.excluded],
+            [("ml", 85), ("plus_1_5", 80)],
+        )
+
+    def test_correlated_family_winner_does_not_promote_lower_side(self):
+        shared_path = frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE})
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "full_total",
+                    90,
+                    "over",
+                    shared_path,
+                    same_game_pair_compatible=True,
+                ),
+                model.PriorityMarketCandidate(
+                    "ml",
+                    85,
+                    "play",
+                    shared_path,
+                    same_game_pair_compatible=True,
+                ),
+                model.PriorityMarketCandidate(
+                    "plus_1_5",
+                    80,
+                    "play",
+                    frozenset(
+                        {model.PriorityEvidencePath.UNDERDOG_RUN_CREATION}
+                    ),
+                    same_game_pair_compatible=True,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            [(candidate.market, candidate.score) for candidate in result.included],
+            [("full_total", 90)],
+        )
+        self.assertCountEqual(
+            [(candidate.market, candidate.score) for candidate in result.excluded],
+            [("ml", 85), ("plus_1_5", 80)],
+        )
+
     def test_f5_side_and_full_total_require_explicit_compatibility(self):
         result = model.assemble_same_game_priority(
             [

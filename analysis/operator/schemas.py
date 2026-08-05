@@ -4,16 +4,19 @@ from collections.abc import Callable
 from dataclasses import fields
 from datetime import datetime
 import json
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
     ConfigDict,
+    GetCoreSchemaHandler,
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
+from pydantic_core import CoreSchema, core_schema
 
 from analysis.forecasting import NormalizedGameInput
 from analysis.ledger import MarketObservationCommand, OfficialResultCommand
@@ -74,19 +77,93 @@ class _PregameBundle(_BundleEnvelope):
         return self
 
 
-class ProjectedBundle(_PregameBundle):
+def _legacy_candidate_mappings(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, dict):
+        return []
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    legacy_decision = payload.get("legacy_decision")
+    if not isinstance(legacy_decision, dict):
+        return []
+    candidates = legacy_decision.get("candidates")
+    if not isinstance(candidates, (list, tuple)):
+        return []
+    return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+
+def _has_explicit_pair_compatibility(value: object) -> bool:
+    if not isinstance(value, dict):
+        return True
+    payload = value.get("payload")
+    if isinstance(payload, PregamePayload):
+        return False
+    if not isinstance(payload, dict):
+        return True
+    legacy_decision = payload.get("legacy_decision")
+    if isinstance(legacy_decision, LegacyDecisionSnapshot):
+        return False
+    if not isinstance(legacy_decision, dict):
+        return True
+    candidates = legacy_decision.get("candidates")
+    if not isinstance(candidates, (list, tuple)):
+        return True
+    return all(
+        isinstance(candidate, dict)
+        and "same_game_pair_compatible" in candidate
+        for candidate in candidates
+    )
+
+
+class _CurrentPregameBundle(_PregameBundle):
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        schema = handler(source)
+        # A Python-only wrapper preserves Pydantic's native strict JSON rules.
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                cls._require_explicit_pair_compatibility,
+                schema,
+            ),
+        )
+
+    @staticmethod
+    def _require_explicit_pair_compatibility(value: object) -> object:
+        if not _has_explicit_pair_compatibility(value):
+            raise ValueError(
+                "same_game_pair_compatible must be explicitly supplied "
+                "for a current bundle"
+            )
+        return value
+
+
+class _HistoricalPregameBundle(_PregameBundle):
+    @model_serializer(mode="wrap")
+    def _preserve_missing_pair_compatibility(self, handler):
+        payload = handler(self)
+        for candidate in _legacy_candidate_mappings(payload):
+            candidate.pop("same_game_pair_compatible", None)
+        return payload
+
+
+class ProjectedBundle(_CurrentPregameBundle):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stage: Literal["projected"]
 
 
-class ConfirmedBundle(_PregameBundle):
+class ConfirmedBundle(_CurrentPregameBundle):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stage: Literal["confirmed"]
 
 
-class HistoricalProjectedBundle(_PregameBundle):
+class HistoricalProjectedBundle(_HistoricalPregameBundle):
     """Runtime-distinct representation of a pre-field projected bundle."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -94,7 +171,7 @@ class HistoricalProjectedBundle(_PregameBundle):
     stage: Literal["projected"]
 
 
-class HistoricalConfirmedBundle(_PregameBundle):
+class HistoricalConfirmedBundle(_HistoricalPregameBundle):
     """Runtime-distinct representation of a pre-field confirmed bundle."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)

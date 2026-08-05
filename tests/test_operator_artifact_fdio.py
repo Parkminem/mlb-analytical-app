@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -7,15 +8,26 @@ import pytest
 
 import analysis.operator.bundles as bundles_module
 import analysis.operator.reporting as reporting_module
-from analysis.operator.bundles import persist_managed_bundle
+from analysis.forecasting.identity import canonical_json
+from analysis.operator.bundles import (
+    load_historical_managed_bundle,
+    persist_managed_bundle,
+)
 from analysis.operator.errors import OperatorIOError
 from analysis.operator.reporting import write_calibration_reports
 from tests.test_forecasting_engine import _complete_game
-from tests.test_operator_pregame import _projected_bundle
+from tests.test_operator_pregame import (
+    _projected_bundle,
+    _write_hash_named_managed_bundle,
+)
 from tests.test_operator_reporting import (
     _ledger_record,
     _mapping,
     _unique_row,
+)
+from tests.test_operator_schemas import (
+    _complete_legacy_decision_mapping,
+    projected_bundle_mapping,
 )
 
 
@@ -48,6 +60,122 @@ def _substitute_after_exclusive_lock(
             substitute()
 
     monkeypatch.setattr(module.fcntl, "flock", adversarial_flock)
+
+
+def _historical_bundle_mapping(note: str) -> dict[str, object]:
+    mapping = projected_bundle_mapping()
+    legacy = _complete_legacy_decision_mapping()
+    legacy["notes"] = [note]
+    del legacy["candidates"][0]["same_game_pair_compatible"]
+    mapping["payload"]["legacy_decision"] = legacy
+    return mapping
+
+
+def test_historical_loader_rejects_symlinked_game_directory_alias(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bundles"
+    source = _write_hash_named_managed_bundle(
+        _historical_bundle_mapping("original"),
+        root,
+    )
+    alias = root / "game-alias"
+    alias.symlink_to(source.parent.name, target_is_directory=True)
+
+    with pytest.raises(OperatorIOError, match="symbolic"):
+        load_historical_managed_bundle(alias / source.name, root=root)
+
+
+def test_historical_loader_rejects_file_swap_between_validation_and_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "bundles"
+    inside_raw = canonical_json(
+        _historical_bundle_mapping("inside")
+    ).encode("utf-8")
+    outside_raw = canonical_json(
+        _historical_bundle_mapping("outside")
+    ).encode("utf-8")
+    outside_hash = hashlib.sha256(outside_raw).hexdigest()
+    game_dir = root / "900001"
+    game_dir.mkdir(parents=True)
+    source = game_dir / f"projected-v1-{outside_hash[:16]}.json"
+    source.write_bytes(inside_raw)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(outside_raw)
+    real_pattern = bundles_module._MANAGED_BUNDLE_FILENAME
+    substituted = False
+
+    class AdversarialFilenamePattern:
+        def fullmatch(self, value: str):
+            nonlocal substituted
+            match = real_pattern.fullmatch(value)
+            if match is not None and not substituted:
+                substituted = True
+                source.unlink()
+                source.symlink_to(outside)
+            return match
+
+    monkeypatch.setattr(
+        bundles_module,
+        "_MANAGED_BUNDLE_FILENAME",
+        AdversarialFilenamePattern(),
+    )
+
+    with pytest.raises(OperatorIOError):
+        load_historical_managed_bundle(source, root=root)
+
+    assert substituted is True
+    assert source.is_symlink()
+    assert outside.read_bytes() == outside_raw
+
+
+@pytest.mark.parametrize("substitution", ("root", "game", "file"))
+def test_historical_loader_rejects_authenticated_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    substitution: str,
+) -> None:
+    root = tmp_path / "bundles"
+    source = _write_hash_named_managed_bundle(
+        _historical_bundle_mapping("authenticated"),
+        root,
+    )
+    raw = source.read_bytes()
+    game_dir = source.parent
+    external = tmp_path / f"external-{substitution}"
+    external.mkdir()
+    moved = tmp_path / f"opened-{substitution}"
+    real_sha256 = hashlib.sha256
+    substituted = False
+
+    def substitute_path() -> None:
+        if substitution == "root":
+            root.rename(moved)
+            root.symlink_to(external, target_is_directory=True)
+        elif substitution == "game":
+            game_dir.rename(moved)
+            game_dir.symlink_to(external, target_is_directory=True)
+        else:
+            outside = external / "outside.json"
+            outside.write_bytes(b"outside")
+            source.unlink()
+            source.symlink_to(outside)
+
+    def adversarial_sha256(data=b"", *args, **kwargs):
+        nonlocal substituted
+        if data == raw and not substituted:
+            substituted = True
+            substitute_path()
+        return real_sha256(data, *args, **kwargs)
+
+    monkeypatch.setattr(bundles_module.hashlib, "sha256", adversarial_sha256)
+
+    with pytest.raises(OperatorIOError):
+        load_historical_managed_bundle(source, root=root)
+
+    assert substituted is True
 
 
 def test_bundle_root_substitution_after_game_lock_never_writes_external(

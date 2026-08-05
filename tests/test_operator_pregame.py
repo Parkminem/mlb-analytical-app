@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 import hashlib
@@ -6,6 +7,7 @@ from pathlib import Path
 import warnings
 
 import pytest
+from pydantic import ValidationError
 
 import analysis.operator.bundles as bundles_module
 import analysis.operator.cli as cli_module
@@ -53,6 +55,7 @@ from analysis.operator.errors import (
     OperatorPreconditionError,
 )
 from analysis.operator.schemas import (
+    ConfirmedBundle,
     HistoricalConfirmedBundle,
     HistoricalProjectedBundle,
     ProjectedBundle,
@@ -1112,6 +1115,91 @@ def test_normal_runner_rejects_historical_parsed_bundle(
         for path in bundles.rglob("*")
         if path.is_file()
     } == managed_files_before
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+def test_historical_public_dump_copy_cannot_create_current_pregame_run(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+) -> None:
+    _, bundles = _run_paths(tmp_path)
+    empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = json.loads(bundle_canonical_bytes(bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+    assert isinstance(artifact, ReplayOnlyPregameBundle)
+    historical_copy = artifact.bundle.model_copy()
+    dumped = historical_copy.model_dump()
+    files_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    reconstruction_error = None
+    try:
+        normal_input = current_type.model_validate(dumped)
+    except ValidationError as error:
+        reconstruction_error = error
+        normal_input = historical_copy
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(
+            normal_input,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+
+    dumped_candidate = dumped["payload"]["legacy_decision"]["candidates"][0]
+    assert reconstruction_error is not None
+    assert "same_game_pair_compatible" not in dumped_candidate
+    assert not empty_ledger.exists()
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == files_before
+
+    prevalidated_payload = deepcopy(dumped)
+    prevalidated_payload["payload"] = historical_copy.payload
+    with pytest.raises(ValidationError):
+        current_type.model_validate(prevalidated_payload)
+
+    prevalidated_candidate = deepcopy(dumped)
+    prevalidated_candidate["payload"]["legacy_decision"]["candidates"] = (
+        historical_copy.payload.legacy_decision.candidates[0],
+    )
+    with pytest.raises(ValidationError):
+        current_type.model_validate(prevalidated_candidate)
+
+    explicitly_fresh = deepcopy(dumped)
+    explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ] = False
+    assert type(current_type.model_validate(explicitly_fresh)) is current_type
 
 
 @pytest.mark.parametrize(

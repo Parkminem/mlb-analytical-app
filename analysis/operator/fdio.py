@@ -34,6 +34,41 @@ def open_directory(
     return os.open(path, flags, dir_fd=dir_fd)
 
 
+def open_regular_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> int:
+    metadata = stat_at(directory_descriptor, name)
+    if metadata is None:
+        raise OperatorIOError(f"{label} does not exist")
+    if stat.S_ISLNK(metadata.st_mode):
+        raise OperatorIOError(f"{label} cannot be a symbolic link")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OperatorIOError(f"{label} must be a regular file")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        linked = stat_at(directory_descriptor, name)
+        expected_identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or linked is None
+            or not stat.S_ISREG(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected_identity
+            or (linked.st_dev, linked.st_ino) != expected_identity
+        ):
+            raise OperatorIOError(f"{label} changed during authentication")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def stat_at(directory_descriptor: int, name: str) -> os.stat_result | None:
     try:
         return os.stat(
@@ -80,6 +115,42 @@ def verify_child_directory(
         or metadata.st_ino != expected.inode
     ):
         raise OperatorIOError(f"{label} changed during publication")
+
+
+def verify_child_regular_file(
+    parent_descriptor: int,
+    name: str,
+    file_descriptor: int,
+    *,
+    label: str,
+) -> None:
+    expected = os.fstat(file_descriptor)
+    metadata = stat_at(parent_descriptor, name)
+    if (
+        not stat.S_ISREG(expected.st_mode)
+        or metadata is None
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_dev != expected.st_dev
+        or metadata.st_ino != expected.st_ino
+    ):
+        raise OperatorIOError(f"{label} changed during authentication")
+
+
+def read_open_regular_file(descriptor: int, *, label: str) -> bytes:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OperatorIOError(f"{label} must be a regular file")
+    with os.fdopen(os.dup(descriptor), "rb") as artifact_file:
+        raw = artifact_file.read()
+    after = os.fstat(descriptor)
+    if (
+        (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise OperatorIOError(f"{label} changed while being read")
+    return raw
 
 
 def read_regular_file(
@@ -183,8 +254,11 @@ __all__ = (
     "create_temporary_symlink",
     "directory_identity",
     "open_directory",
+    "open_regular_file",
+    "read_open_regular_file",
     "read_regular_file",
     "stat_at",
     "verify_child_directory",
+    "verify_child_regular_file",
     "verify_public_directory",
 )
