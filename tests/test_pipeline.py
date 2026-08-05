@@ -642,15 +642,34 @@ class CurrentRuntimeDocumentationTests(unittest.TestCase):
 
     def test_model_docs_state_inherited_review_contracts(self):
         project_root = Path(__file__).resolve().parents[1]
-        text = (project_root / "docs/model.md").read_text(encoding="utf-8")
+        model_text = (project_root / "docs/model.md").read_text(encoding="utf-8")
+        template_text = (
+            project_root / "docs/analysis-output-template.md"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             "The `2026-08-05` contract inherits the prior ML bullpen review contract",
-            text,
+            model_text,
         )
         self.assertIn(
             "the prior two-sided under review contract",
-            text,
+            model_text,
+        )
+        self.assertIn(
+            "model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`",
+            model_text,
+        )
+        self.assertIn(
+            "model versions `2026-08-03` and `2026-08-05`",
+            model_text,
+        )
+        self.assertIn(
+            "model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`",
+            template_text,
+        )
+        self.assertIn(
+            "model versions `2026-08-03` and `2026-08-05`",
+            template_text,
         )
 
 

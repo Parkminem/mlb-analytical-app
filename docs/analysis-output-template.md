@@ -30,8 +30,8 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 - Record the `market_key` and exact legacy candidate identity: the current contract uses `legacy_candidate_index` plus `legacy_market`, with the candidate's score and `play`/`lean`/`pass` rating and the final priority preserved in the snapshot.
 - Record two to four unique canonical principal evidence paths.
-- For every recommended full-game ML in model versions `2026-08-02` and `2026-08-03`, declare and bind `bullpen_protection` or `late_bullpen_exposure` according to the actual pregame ML reasoning. Never add a bullpen path after the result or merely to satisfy the contract.
-- For every recommended F5 or full-game under in model version `2026-08-03`, declare and bind `starter_suppression` plus `lineup_suppression` with the same away/home namespace. This is the required two-sided review coverage; never freeze a one-sided under path.
+- For every recommended full-game ML in model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`, declare and bind `bullpen_protection` or `late_bullpen_exposure` according to the actual pregame ML reasoning. Never add a bullpen path after the result or merely to satisfy the contract.
+- For every recommended F5 or full-game under in model versions `2026-08-03` and `2026-08-05`, declare and bind `starter_suppression` plus `lineup_suppression` with the same away/home namespace. This is the required two-sided review coverage; never freeze a one-sided under path.
 - Bind every path to exact component IDs and its exact deterministic contradiction rule.
 - Freeze each bound `ComponentDistribution`, including `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95`; these fix the central 80% and 90% predictive intervals.
 
