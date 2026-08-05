@@ -29,6 +29,8 @@ from analysis.forecasting.validation import (
     PregameTimingError,
 )
 from analysis.ledger import (
+    CaptureForecastLink,
+    CaptureRecord,
     ForecastCommand,
     ForecastRecord,
     IdempotencyConflict,
@@ -1273,6 +1275,26 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
     ]:
         del candidate["same_game_pair_compatible"]
     _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+    historical_records = tuple(LedgerStore(ledger).iter_records())
+    historical_capture = next(
+        record
+        for record in historical_records
+        if isinstance(record, CaptureRecord)
+        and record.capture_id == first.capture.capture_id
+    )
+    historical_forecast = next(
+        record
+        for record in historical_records
+        if isinstance(record, ForecastRecord)
+        and record.forecast_run_id == first.forecast.forecast_run_id
+    )
+    historical_link = next(
+        record
+        for record in historical_records
+        if isinstance(record, CaptureForecastLink)
+        and record.capture_id == historical_capture.capture_id
+        and record.forecast_run_id == historical_forecast.forecast_run_id
+    )
 
     mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
     for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
@@ -1294,12 +1316,21 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         for path in bundles.rglob("*")
         if path.is_file()
     }
+    ledger_before_replay = ledger.read_bytes()
 
     returned = historical_replay(
         source,
         ledger_path=ledger,
         bundle_root=bundles,
     )
+
+    assert returned.capture == historical_capture
+    assert returned.forecast == historical_forecast
+    assert returned.link == historical_link
+    assert returned.capture_replayed is True
+    assert returned.forecast_replayed is True
+    assert returned.link_replayed is True
+    assert ledger.read_bytes() == ledger_before_replay
 
     with pytest.raises(
         TypeError,
@@ -1329,6 +1360,7 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         != caller_constructed_artifact.managed_bundle.bundle_hash
     )
     assert not empty_ledger.exists()
+    assert ledger.read_bytes() == ledger_before_replay
     assert {
         path.relative_to(bundles): path.read_bytes()
         for path in bundles.rglob("*")

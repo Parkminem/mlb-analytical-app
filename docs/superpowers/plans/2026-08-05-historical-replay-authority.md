@@ -244,7 +244,7 @@ git commit -m "fix: dispatch historical bundles to replay only"
 **Files:**
 - Modify: `tests/test_operator_pregame.py`
 - Modify: `tests/test_operator_cli.py`
-- Modify: `.superpowers/sdd/2026-08-05-multi-market-priority/progress.md`
+- Modify: `.superpowers/sdd/2026-08-05-historical-replay-authority/progress.md`
 
 **Interfaces:**
 - Consumes: all strict and historical replay interfaces from Tasks 1 and 2.
@@ -312,7 +312,7 @@ Expected: pipeline exits 0 with model version `2026-08-03`, fixed legacy authori
 
 - [ ] **Step 5: Update the SDD progress ledger and commit**
 
-Record RED/GREEN evidence, exact test counts, review status, and commit SHAs in `.superpowers/sdd/2026-08-05-multi-market-priority/progress.md` using `apply_patch`, then commit only tracked product/test changes if the SDD file is ignored:
+Record RED/GREEN evidence, exact test counts, review status, and commit SHAs in `.superpowers/sdd/2026-08-05-historical-replay-authority/progress.md` using `apply_patch`, then commit only tracked product/test changes if the SDD file is ignored:
 
 ```bash
 git add tests/test_operator_pregame.py tests/test_operator_cli.py
