@@ -74,7 +74,7 @@ class ManagedBundleCopy:
 
 @dataclass(frozen=True)
 class ReplayOnlyPregameBundle:
-    """A pre-change managed bundle that may only resolve an exact replay."""
+    """Authenticated pre-change data for the path-based replay service only."""
 
     bundle: ProjectedBundle | ConfirmedBundle
     managed_bundle: ManagedBundleCopy
@@ -99,7 +99,7 @@ def load_historical_managed_bundle(
     *,
     root: str | os.PathLike[str],
 ) -> _Bundle | ReplayOnlyPregameBundle:
-    """Read an authenticated managed artifact through historical schemas."""
+    """Authenticate and read a managed artifact through historical schemas."""
 
     bundle_path = Path(path).expanduser()
     root_path = Path(root).expanduser()

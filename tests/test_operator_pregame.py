@@ -58,6 +58,8 @@ from analysis.operator.schemas import (
 )
 from analysis.operator.service import (
     PregameRunResult,
+    replay_historical_confirmed,
+    replay_historical_projected,
     run_confirmed,
     run_projected,
 )
@@ -992,18 +994,13 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
     for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
         del candidate["same_game_pair_compatible"]
     source = _write_hash_named_managed_bundle(mapping, bundles)
-    historical_bundle = bundles_module.load_historical_managed_bundle(
-        source,
-        root=bundles,
-    )
-
     def fail_forecast(*args, **kwargs):
         raise AssertionError("exact historical replay must not run forecast")
 
     monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
 
-    replay = run_projected(
-        historical_bundle,
+    replay = replay_historical_projected(
+        source,
         ledger_path=ledger,
         bundle_root=bundles,
     )
@@ -1023,10 +1020,65 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
         ("confirmed", run_confirmed, _confirmed_game),
     ),
 )
-def test_historical_exact_replay_preserves_replay_only_managed_artifact(
+def test_normal_runner_rejects_historical_artifact(
     tmp_path: Path,
     stage: str,
     runner,
+    game_factory,
+) -> None:
+    _, bundles = _run_paths(tmp_path)
+    empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = json.loads(bundle_canonical_bytes(bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(
+            historical_artifact,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+
+    assert not empty_ledger.exists()
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "historical_replay", "game_factory"),
+    (
+        (
+            "projected",
+            run_projected,
+            replay_historical_projected,
+            _projected_game,
+        ),
+        (
+            "confirmed",
+            run_confirmed,
+            replay_historical_confirmed,
+            _confirmed_game,
+        ),
+    ),
+)
+def test_historical_dedicated_replay_preserves_managed_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    runner,
+    historical_replay,
     game_factory,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
@@ -1047,49 +1099,61 @@ def test_historical_exact_replay_preserves_replay_only_managed_artifact(
         "same_game_pair_compatible"
     ]
     _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+    historical_forecast = next(
+        record
+        for record in LedgerStore(ledger).iter_records("forecast")
+        if isinstance(record, ForecastRecord)
+    )
 
     mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
     del mapping["payload"]["legacy_decision"]["candidates"][0][
         "same_game_pair_compatible"
     ]
     source = _write_hash_named_managed_bundle(mapping, bundles)
-    historical_bundle = bundles_module.load_historical_managed_bundle(
-        source,
-        root=bundles,
-    )
-    assert isinstance(historical_bundle, ReplayOnlyPregameBundle)
     files_before_replay = {
         path.relative_to(bundles): path.read_bytes()
         for path in bundles.rglob("*")
         if path.is_file()
     }
 
-    replay = runner(
-        historical_bundle,
+    def fail_historical_side_effect(*args, **kwargs):
+        raise AssertionError("historical replay reached a forbidden write path")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_historical_side_effect)
+    monkeypatch.setattr(
+        service_module,
+        "record_shadow_run",
+        fail_historical_side_effect,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "persist_managed_bundle",
+        fail_historical_side_effect,
+    )
+    replay = historical_replay(
+        source,
         ledger_path=ledger,
         bundle_root=bundles,
-    )
-    reloaded = bundles_module.load_historical_managed_bundle(
-        replay.managed_bundle.path,
-        root=bundles,
     )
 
     with pytest.raises(
         OperatorPreconditionError,
-        match="historical compatibility bundle requires an exact replay",
+        match="historical replay requires an exact existing replay",
     ):
-        runner(
-            reloaded,
+        historical_replay(
+            source,
             ledger_path=empty_ledger,
             bundle_root=bundles,
         )
 
-    assert replay.managed_bundle.path == source
+    assert replay.capture == first.capture
+    assert replay.forecast == historical_forecast
+    assert replay.link == first.link
+    assert replay.managed_bundle.path == source.resolve()
     assert replay.managed_bundle.bundle_hash == hashlib.sha256(
         source.read_bytes()
     ).hexdigest()
     assert replay.managed_bundle.replayed is True
-    assert isinstance(reloaded, ReplayOnlyPregameBundle)
     assert not empty_ledger.exists()
     assert {
         path.relative_to(bundles): path.read_bytes()
@@ -1288,19 +1352,12 @@ def test_missing_compatibility_managed_bundle_cannot_create_fresh_records(
         "same_game_pair_compatible"
     ]
     source = _write_hash_named_managed_bundle(mapping, bundles)
-    loaded = cli_module._load_stage_bundle(
-        source,
-        expected_type=ProjectedBundle,
-        expected_stage="projected",
-        bundle_root=bundles,
-    )
-
     with pytest.raises(
         OperatorPreconditionError,
-        match="historical compatibility bundle requires an exact replay",
+        match="historical replay requires an exact existing replay",
     ):
-        run_projected(
-            loaded,
+        replay_historical_projected(
+            source,
             ledger_path=ledger,
             bundle_root=bundles,
         )
@@ -2584,11 +2641,16 @@ def test_stage_and_lineup_state_mismatches_are_preconditions(
         )
 
 
-def test_calling_wrong_stage_service_is_a_precondition(tmp_path: Path) -> None:
+def test_calling_wrong_stage_service_rejects_non_exact_bundle_type(
+    tmp_path: Path,
+) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
     confirmed = _pregame_bundle("confirmed", _confirmed_game())
 
-    with pytest.raises(OperatorPreconditionError, match="stage"):
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
         run_projected(
             confirmed,
             ledger_path=ledger_path,

@@ -67,6 +67,7 @@ from .bundles import (
     ManagedBundleCopy,
     ReplayOnlyPregameBundle,
     intrinsic_capture_key,
+    load_historical_managed_bundle,
     persist_managed_bundle,
 )
 from .config import load_forecast_config
@@ -543,13 +544,9 @@ def _replayed_pregame_result(
     expected_stage: str,
     exact_replay: tuple[CaptureRecord, ForecastRecord, CaptureForecastLink],
     bundle_root: str | Path,
-    replay_only_managed_bundle: ManagedBundleCopy | None = None,
 ) -> PregameRunResult:
     capture, stored_forecast, link = exact_replay
-    managed_bundle = replay_only_managed_bundle or persist_managed_bundle(
-        bundle,
-        root=bundle_root,
-    )
+    managed_bundle = persist_managed_bundle(bundle, root=bundle_root)
     return PregameRunResult(
         stage=expected_stage,
         game_pk=bundle.game_pk,
@@ -627,17 +624,13 @@ def _pregame_partial_progress(
 
 
 def _run_pregame(
-    supplied_bundle: _Bundle | ReplayOnlyPregameBundle,
+    bundle: _Bundle,
     *,
     expected_stage: str,
     ledger_path: str | Path,
     bundle_root: str | Path,
     registry_root: str | Path | None,
 ) -> PregameRunResult:
-    replay_only = isinstance(supplied_bundle, ReplayOnlyPregameBundle)
-    bundle = (
-        supplied_bundle.bundle if replay_only else supplied_bundle
-    )
     _require_stage(bundle, expected_stage)
     _validate_game(bundle, expected_stage)
     config = load_forecast_config(
@@ -672,13 +665,6 @@ def _run_pregame(
             expected_stage=expected_stage,
             exact_replay=exact_replay,
             bundle_root=bundle_root,
-            replay_only_managed_bundle=(
-                supplied_bundle.managed_bundle if replay_only else None
-            ),
-        )
-    if replay_only:
-        raise OperatorPreconditionError(
-            "historical compatibility bundle requires an exact replay"
         )
 
     received_legacy_model_version = (
@@ -877,7 +863,7 @@ def _run_pregame(
 
 
 def run_projected(
-    bundle: ProjectedBundle | ReplayOnlyPregameBundle,
+    bundle: ProjectedBundle,
     *,
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
     bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
@@ -885,6 +871,11 @@ def run_projected(
 ) -> PregameRunResult:
     """Append or replay one projected-lineup shadow forecast."""
 
+    if type(bundle) is not ProjectedBundle:
+        raise TypeError(
+            "normal pregame runner requires a strict current bundle: "
+            "ProjectedBundle"
+        )
     return _run_pregame(
         bundle,
         expected_stage="projected",
@@ -895,7 +886,7 @@ def run_projected(
 
 
 def run_confirmed(
-    bundle: ConfirmedBundle | ReplayOnlyPregameBundle,
+    bundle: ConfirmedBundle,
     *,
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
     bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
@@ -903,9 +894,115 @@ def run_confirmed(
 ) -> PregameRunResult:
     """Append or replay one confirmed-lineup shadow forecast."""
 
+    if type(bundle) is not ConfirmedBundle:
+        raise TypeError(
+            "normal pregame runner requires a strict current bundle: "
+            "ConfirmedBundle"
+        )
     return _run_pregame(
         bundle,
         expected_stage="confirmed",
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+        registry_root=registry_root,
+    )
+
+
+def _replay_historical_pregame(
+    path: str | Path,
+    *,
+    expected_stage: str,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    ledger_path: str | Path,
+    bundle_root: str | Path,
+    registry_root: str | Path | None,
+) -> PregameRunResult:
+    artifact = load_historical_managed_bundle(path, root=bundle_root)
+    if not isinstance(artifact, ReplayOnlyPregameBundle):
+        raise OperatorPreconditionError(
+            "historical replay requires a pre-change managed bundle"
+        )
+    bundle = artifact.bundle
+    if type(bundle) is not expected_type or bundle.stage != expected_stage:
+        raise OperatorPreconditionError("historical replay stage/type mismatch")
+
+    _validate_game(bundle, expected_stage)
+    config = load_forecast_config(
+        bundle.payload.forecast_config_version,
+        registry_root=registry_root,
+    )
+    command = _capture_command(bundle)
+    capture_key = intrinsic_capture_key(
+        bundle.schema_version,
+        bundle.stage,
+        command,
+    )
+    forecast_run_id = _pregame_operation(
+        lambda: build_forecast_run_id_for_input(
+            bundle.payload.game_input,
+            config,
+        )
+    )
+    exact_replay = _existing_exact_pregame_replay(
+        ledger_path,
+        bundle,
+        expected_stage=expected_stage,
+        command=command,
+        capture_key=capture_key,
+        forecast_run_id=forecast_run_id,
+        config=config,
+    )
+    if exact_replay is None:
+        raise OperatorPreconditionError(
+            "historical replay requires an exact existing replay"
+        )
+    capture, forecast, link = exact_replay
+    return PregameRunResult(
+        stage=expected_stage,
+        game_pk=bundle.game_pk,
+        lineup_state=capture.lineup_state,
+        capture=capture,
+        forecast=forecast,
+        link=link,
+        managed_bundle=artifact.managed_bundle,
+        capture_replayed=True,
+        forecast_replayed=True,
+        link_replayed=True,
+    )
+
+
+def replay_historical_projected(
+    path: str | Path,
+    *,
+    ledger_path: str | Path = DEFAULT_LEDGER_PATH,
+    bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
+    registry_root: str | Path | None = None,
+) -> PregameRunResult:
+    """Replay an authenticated pre-change projected managed bundle."""
+
+    return _replay_historical_pregame(
+        path,
+        expected_stage="projected",
+        expected_type=ProjectedBundle,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+        registry_root=registry_root,
+    )
+
+
+def replay_historical_confirmed(
+    path: str | Path,
+    *,
+    ledger_path: str | Path = DEFAULT_LEDGER_PATH,
+    bundle_root: str | Path = DEFAULT_BUNDLE_ROOT,
+    registry_root: str | Path | None = None,
+) -> PregameRunResult:
+    """Replay an authenticated pre-change confirmed managed bundle."""
+
+    return _replay_historical_pregame(
+        path,
+        expected_stage="confirmed",
+        expected_type=ConfirmedBundle,
         ledger_path=ledger_path,
         bundle_root=bundle_root,
         registry_root=registry_root,
@@ -1842,6 +1939,8 @@ __all__ = (
     "DEFAULT_REPORT_DIR",
     "PregameRunResult",
     "ReviewRunResult",
+    "replay_historical_confirmed",
+    "replay_historical_projected",
     "run_confirmed",
     "run_projected",
     "run_review",
