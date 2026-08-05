@@ -263,6 +263,22 @@ def test_non_qualifying_total_does_not_activate_high_total_contract(
     assert assessment.reason_codes == ()
 
 
+def test_review_only_rating_does_not_activate_evidence_contract() -> None:
+    candidate = _candidate(
+        "full_total",
+        score=80,
+        rating="review-only",
+    )
+    assessment = assess_priority_evidence_contract(
+        candidate,
+        _binding("full_total"),
+        _market(MarketType.FULL_TOTAL, "over", line=9.0),
+    )
+
+    assert assessment.score_cap is None
+    assert assessment.reason_codes == ()
+
+
 def test_candidate_binding_and_market_identity_must_match() -> None:
     candidate = _candidate("ml")
 

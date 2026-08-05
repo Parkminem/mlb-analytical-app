@@ -83,7 +83,7 @@ def _validate_identity(
 
 def _is_playable_non_pass(candidate: PriorityMarketCandidate) -> bool:
     return (
-        candidate.decision_rating != "pass"
+        candidate.decision_rating in {"play", "lean"}
         and candidate.score >= _PLAYABLE_PRIORITY_MIN_SCORE
     )
 
