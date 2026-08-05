@@ -1,8 +1,10 @@
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timezone
+import gc
 import json
 from pathlib import Path
+from weakref import ref
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -617,8 +619,44 @@ def test_current_runtime_authority_is_absent_from_public_schema_and_dump(
         "created_at",
         "payload",
     }
-    assert "runtime_authority" not in json.dumps(schema)
-    assert "runtime_authority" not in json.dumps(dumped, default=str)
+    public_schema = json.dumps(schema)
+    public_dump = json.dumps(dumped, default=str)
+    for private_name in (
+        "runtime_authority",
+        "validation_event",
+        "authority_token",
+        "payload_token",
+    ):
+        assert private_name not in public_schema
+        assert private_name not in public_dump
+
+
+@pytest.mark.parametrize(
+    ("current_type", "mapping_factory"),
+    (
+        (ProjectedBundle, projected_bundle_mapping),
+        (ConfirmedBundle, confirmed_bundle_mapping),
+    ),
+)
+def test_current_runtime_authority_does_not_retain_released_graphs(
+    current_type,
+    mapping_factory,
+) -> None:
+    bundle = current_type.model_validate(mapping_factory())
+    payload = bundle.payload
+    decision = payload.legacy_decision
+    bundle_ref = ref(bundle)
+    payload_ref = ref(payload)
+    decision_ref = ref(decision)
+
+    del bundle
+    del payload
+    del decision
+    gc.collect()
+
+    assert bundle_ref() is None
+    assert payload_ref() is None
+    assert decision_ref() is None
 
 
 @pytest.mark.parametrize(

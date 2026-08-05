@@ -1,19 +1,21 @@
 """Strict JSON bundle schemas for shadow operator stages."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields
+from copy import deepcopy as _deepcopy_value
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 import hashlib
 import hmac
 import json
+from threading import RLock
 from typing import Annotated, Literal, TypeVar
+from weakref import ReferenceType, ref
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     InstanceOf,
-    PrivateAttr,
     StrictBool,
     TypeAdapter,
     ValidateAs,
@@ -42,27 +44,204 @@ from .errors import BundleValidationError
 
 CURRENT_PREGAME_SCHEMA_VERSION = 2
 CURRENT_PREGAME_AUTHORITY = "current"
-_CURRENT_AUTHORITY_TOKEN_BYTES = 32
 
 
 @dataclass(frozen=True)
-class _CurrentPayloadAuthority:
-    token: bytes
+class _IdentityAuthority:
+    value_ref: ReferenceType[object]
+    graph: tuple[object, ...]
     digest: bytes
 
 
 @dataclass(frozen=True)
-class _CurrentBundleAuthority:
-    payload_token: bytes
-    digest: bytes
+class _ValidationEvent:
+    value: object
+
+
+_AuthorityRegistry = dict[int, _IdentityAuthority]
+_DECISION_AUTHORITIES: _AuthorityRegistry = {}
+_PAYLOAD_AUTHORITIES: _AuthorityRegistry = {}
+_BUNDLE_AUTHORITIES: _AuthorityRegistry = {}
+_VALIDATION_EVENTS: dict[int, ReferenceType[_ValidationEvent]] = {}
+_AUTHORITY_LOCK = RLock()
+
+
+def _issue_validation_event(value: object) -> _ValidationEvent:
+    event = _ValidationEvent(value)
+    identity = id(event)
+
+    def remove(dead_ref: ReferenceType[_ValidationEvent]) -> None:
+        with _AUTHORITY_LOCK:
+            current = _VALIDATION_EVENTS.get(identity)
+            if current is dead_ref:
+                _VALIDATION_EVENTS.pop(identity, None)
+
+    event_ref = ref(event, remove)
+    with _AUTHORITY_LOCK:
+        _VALIDATION_EVENTS[identity] = event_ref
+    return event
+
+
+def _consume_validation_event(event: object) -> bool:
+    if type(event) is not _ValidationEvent:
+        return False
+    with _AUTHORITY_LOCK:
+        event_ref = _VALIDATION_EVENTS.get(id(event))
+        if event_ref is None or event_ref() is not event:
+            return False
+        _VALIDATION_EVENTS.pop(id(event), None)
+        return True
+
+
+def _identity_graph(root: object) -> tuple[object, ...]:
+    """Capture the exact reachable public graph without retaining its root."""
+
+    graph: list[object] = []
+    seen = {id(root)}
+
+    def visit(value: object) -> None:
+        identity = id(value)
+        if identity in seen:
+            return
+        seen.add(identity)
+        graph.append(value)
+
+        if isinstance(value, BaseModel):
+            for name in type(value).model_fields:
+                visit(getattr(value, name))
+        elif is_dataclass(value) and not isinstance(value, type):
+            for field in fields(value):
+                visit(getattr(value, field.name))
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                visit(key)
+                visit(item)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                visit(item)
+
+    if isinstance(root, BaseModel):
+        for name in type(root).model_fields:
+            visit(getattr(root, name))
+    elif is_dataclass(root) and not isinstance(root, type):
+        for field in fields(root):
+            visit(getattr(root, field.name))
+    return tuple(graph)
+
+
+def _copy_memo_is_clean(
+    root: object,
+    memo: dict[int, object] | None,
+) -> bool:
+    if not memo:
+        return True
+    return id(root) not in memo and all(
+        id(value) not in memo for value in _identity_graph(root)
+    )
+
+
+def _register_authority(
+    registry: _AuthorityRegistry,
+    value: object,
+    digest: bytes,
+) -> None:
+    identity = id(value)
+    graph = _identity_graph(value)
+
+    def remove(dead_ref: ReferenceType[object]) -> None:
+        with _AUTHORITY_LOCK:
+            current = registry.get(identity)
+            if current is not None and current.value_ref is dead_ref:
+                registry.pop(identity, None)
+
+    value_ref = ref(value, remove)
+    authority = _IdentityAuthority(
+        value_ref=value_ref,
+        graph=graph,
+        digest=digest,
+    )
+    with _AUTHORITY_LOCK:
+        registry[identity] = authority
+
+
+def _discard_authority(
+    registry: _AuthorityRegistry,
+    value: object,
+) -> None:
+    with _AUTHORITY_LOCK:
+        current = registry.get(id(value))
+        if current is not None and current.value_ref() is value:
+            registry.pop(id(value), None)
+
+
+def _has_authority(
+    registry: _AuthorityRegistry,
+    value: object,
+    digest: bytes,
+) -> bool:
+    try:
+        graph = _identity_graph(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    with _AUTHORITY_LOCK:
+        authority = registry.get(id(value))
+        if authority is None or authority.value_ref() is not value:
+            return False
+        return (
+            len(authority.graph) == len(graph)
+            and all(
+                registered is current
+                for registered, current in zip(authority.graph, graph)
+            )
+            and hmac.compare_digest(authority.digest, digest)
+        )
 
 
 class _CurrentLegacyDecisionSnapshot(LegacyDecisionSnapshot):
-    """Runtime-only proof that strict current decision validation completed."""
+    """Strict current decision domain value with deliberate copy semantics."""
+
+    def __copy__(self) -> "_CurrentLegacyDecisionSnapshot":
+        copied = type(self)(
+            model_version=self.model_version,
+            candidates=self.candidates,
+            final_priority=self.final_priority,
+            review_bindings=self.review_bindings,
+            notes=self.notes,
+        )
+        _authorize_current_decision_copy(self, copied)
+        return copied
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object] | None = None,
+    ) -> "_CurrentLegacyDecisionSnapshot":
+        memo = {} if memo is None else memo
+        authorize_copy = _copy_memo_is_clean(self, memo)
+        copied = type(self)(
+            model_version=_deepcopy_value(self.model_version, memo),
+            candidates=_deepcopy_value(self.candidates, memo),
+            final_priority=_deepcopy_value(self.final_priority, memo),
+            review_bindings=_deepcopy_value(self.review_bindings, memo),
+            notes=_deepcopy_value(self.notes, memo),
+        )
+        memo[id(self)] = copied
+        if authorize_copy:
+            _authorize_current_decision_copy(self, copied)
+        return copied
 
 
 def _authority_digest(value: object) -> bytes:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).digest()
+
+
+def _decision_authority_digest(value: object) -> bytes:
+    return _authority_digest(
+        {
+            "authority": CURRENT_PREGAME_AUTHORITY,
+            "schema_version": CURRENT_PREGAME_SCHEMA_VERSION,
+            "legacy_decision": canonical_legacy_decision_payload(value),
+        }
+    )
 
 
 def _payload_authority_digest(
@@ -88,7 +267,7 @@ def _bundle_authority_digest(
     stage: object,
     game_pk: object,
     created_at: object,
-    payload_authority: _CurrentPayloadAuthority,
+    payload: object,
 ) -> bytes:
     return _authority_digest(
         {
@@ -97,10 +276,67 @@ def _bundle_authority_digest(
             "stage": stage,
             "game_pk": game_pk,
             "created_at": created_at,
-            "payload_token": payload_authority.token.hex(),
-            "payload_digest": payload_authority.digest.hex(),
+            "payload_digest": _payload_authority_digest(
+                payload.game_input,
+                payload.legacy_decision,
+                payload.forecast_config_version,
+            ).hex(),
         }
     )
+
+
+def _has_current_decision_authority(value: object) -> bool:
+    if type(value) is not _CurrentLegacyDecisionSnapshot:
+        return False
+    try:
+        if (
+            type(value.model_version) is not str
+            or not value.model_version.strip()
+            or type(value.candidates) is not tuple
+            or type(value.final_priority) is not tuple
+            or type(value.review_bindings) is not tuple
+            or type(value.notes) is not tuple
+            or any(
+                type(candidate) is not PriorityMarketCandidate
+                for candidate in value.candidates
+            )
+            or any(
+                type(priority) is not str
+                for priority in value.final_priority
+            )
+            or any(
+                type(binding) is not CandidateReviewBinding
+                for binding in value.review_bindings
+            )
+            or any(type(note) is not str for note in value.notes)
+        ):
+            return False
+        digest = _decision_authority_digest(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return _has_authority(_DECISION_AUTHORITIES, value, digest)
+
+
+def _authorize_current_decision_copy(
+    source: object,
+    copied: object,
+) -> None:
+    if (
+        not _has_current_decision_authority(source)
+        or type(copied) is not _CurrentLegacyDecisionSnapshot
+    ):
+        return
+    try:
+        source_digest = _decision_authority_digest(source)
+        copied_digest = _decision_authority_digest(copied)
+    except (AttributeError, TypeError, ValueError):
+        return
+    if hmac.compare_digest(source_digest, copied_digest):
+        _register_authority(
+            _DECISION_AUTHORITIES,
+            copied,
+            copied_digest,
+        )
 
 
 class PregamePayload(BaseModel):
@@ -219,16 +455,10 @@ def _current_legacy(
         review_bindings=value.review_bindings,
         notes=value.notes,
     )
-    object.__setattr__(
+    _register_authority(
+        _DECISION_AUTHORITIES,
         decision,
-        "_current_authority_token",
-        _authority_digest(
-            {
-                "authority": CURRENT_PREGAME_AUTHORITY,
-                "schema_version": CURRENT_PREGAME_SCHEMA_VERSION,
-                "legacy_decision": canonical_legacy_decision_payload(decision),
-            }
-        ),
+        _decision_authority_digest(decision),
     )
     return decision
 
@@ -324,32 +554,64 @@ class _CurrentPregamePayload(BaseModel):
     game_input: NormalizedGameInput
     legacy_decision: _CurrentLegacyDecision
     forecast_config_version: str
-    _runtime_authority: _CurrentPayloadAuthority = PrivateAttr()
 
     @field_validator("forecast_config_version")
     @classmethod
-    def _require_config_version(cls, value: str) -> str:
+    def _require_config_version(cls, value: str) -> object:
         if not value.strip():
             raise ValueError("forecast_config_version must be nonempty")
-        return value
+        return _issue_validation_event(value)
 
-    def model_post_init(self, context: object) -> None:
-        del context
-        token = getattr(
-            self.legacy_decision,
-            "_current_authority_token",
-            None,
-        )
-        if type(token) is not bytes:
-            raise ValueError("current decision authority is missing")
-        self._runtime_authority = _CurrentPayloadAuthority(
-            token=token,
-            digest=_payload_authority_digest(
+    @model_validator(mode="after")
+    def _issue_validation_authority(self) -> "_CurrentPregamePayload":
+        event = self.forecast_config_version
+        if type(event) is not _ValidationEvent:
+            return self
+        if not _consume_validation_event(event):
+            raise ValueError("current payload validation event is invalid")
+        object.__setattr__(self, "forecast_config_version", event.value)
+        if not _has_current_decision_authority(self.legacy_decision):
+            raise ValueError("current decision authority is invalid")
+        _register_authority(
+            _PAYLOAD_AUTHORITIES,
+            self,
+            _payload_authority_digest(
                 self.game_input,
                 self.legacy_decision,
                 self.forecast_config_version,
             ),
         )
+        return self
+
+    def __copy__(self) -> "_CurrentPregamePayload":
+        copied = super().__copy__()
+        _authorize_current_payload_copy(self, copied)
+        return copied
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object] | None = None,
+    ) -> "_CurrentPregamePayload":
+        authorize_copy = _copy_memo_is_clean(self, memo)
+        copied = super().__deepcopy__(memo)
+        if authorize_copy:
+            _authorize_current_decision_copy(
+                self.legacy_decision,
+                copied.legacy_decision,
+            )
+            _authorize_current_payload_copy(self, copied)
+        return copied
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> "_CurrentPregamePayload":
+        copied = super().model_copy(update=update, deep=deep)
+        if update is not None:
+            _discard_authority(_PAYLOAD_AUTHORITIES, copied)
+        return copied
 
 
 def is_current_pregame_payload(value: object) -> bool:
@@ -357,36 +619,53 @@ def is_current_pregame_payload(value: object) -> bool:
 
     if type(value) is not _CurrentPregamePayload:
         return False
-    runtime_authority = getattr(value, "_runtime_authority", None)
-    legacy_decision = value.legacy_decision
-    decision_token = getattr(
-        legacy_decision,
-        "_current_authority_token",
-        None,
-    )
-    if (
-        type(runtime_authority) is not _CurrentPayloadAuthority
-        or type(value.game_input) is not NormalizedGameInput
-        or type(legacy_decision) is not _CurrentLegacyDecisionSnapshot
-        or type(value.forecast_config_version) is not str
-        or not value.forecast_config_version.strip()
-        or type(decision_token) is not bytes
-        or len(decision_token) != _CURRENT_AUTHORITY_TOKEN_BYTES
-        or type(runtime_authority.token) is not bytes
-        or len(runtime_authority.token) != _CURRENT_AUTHORITY_TOKEN_BYTES
-        or type(runtime_authority.digest) is not bytes
-        or not hmac.compare_digest(runtime_authority.token, decision_token)
-    ):
-        return False
     try:
+        if (
+            type(value.game_input) is not NormalizedGameInput
+            or not _has_current_decision_authority(value.legacy_decision)
+            or type(value.forecast_config_version) is not str
+            or not value.forecast_config_version.strip()
+        ):
+            return False
         digest = _payload_authority_digest(
             value.game_input,
-            legacy_decision,
+            value.legacy_decision,
             value.forecast_config_version,
         )
     except (AttributeError, TypeError, ValueError):
         return False
-    return hmac.compare_digest(runtime_authority.digest, digest)
+    return _has_authority(_PAYLOAD_AUTHORITIES, value, digest)
+
+
+def _authorize_current_payload_copy(
+    source: object,
+    copied: object,
+) -> None:
+    if (
+        not is_current_pregame_payload(source)
+        or type(copied) is not _CurrentPregamePayload
+        or not _has_current_decision_authority(copied.legacy_decision)
+    ):
+        return
+    try:
+        source_digest = _payload_authority_digest(
+            source.game_input,
+            source.legacy_decision,
+            source.forecast_config_version,
+        )
+        copied_digest = _payload_authority_digest(
+            copied.game_input,
+            copied.legacy_decision,
+            copied.forecast_config_version,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return
+    if hmac.compare_digest(source_digest, copied_digest):
+        _register_authority(
+            _PAYLOAD_AUTHORITIES,
+            copied,
+            copied_digest,
+        )
 
 
 _CurrentPregamePayloadSource = (
@@ -437,7 +716,11 @@ class _CurrentPregameBundle(_PregameBundle):
     schema_version: Literal[2]
     authority: Literal["current"]
     payload: _CurrentPregamePayloadSource = Field(union_mode="left_to_right")
-    _runtime_authority: _CurrentBundleAuthority = PrivateAttr()
+
+    @field_validator("authority", mode="after")
+    @classmethod
+    def _mark_current_validation(cls, value: str) -> object:
+        return _issue_validation_event(value)
 
     @field_validator("payload", mode="after")
     @classmethod
@@ -461,20 +744,63 @@ class _CurrentPregameBundle(_PregameBundle):
             )
         return _CurrentPregamePayload.model_validate(value)
 
-    def model_post_init(self, context: object) -> None:
-        del context
-        payload_authority = self.payload._runtime_authority
-        self._runtime_authority = _CurrentBundleAuthority(
-            payload_token=payload_authority.token,
-            digest=_bundle_authority_digest(
+    @model_validator(mode="after")
+    def _issue_validation_authority(self) -> "_CurrentPregameBundle":
+        event = self.authority
+        if type(event) is not _ValidationEvent:
+            return self
+        if not _consume_validation_event(event):
+            raise ValueError("current bundle validation event is invalid")
+        object.__setattr__(self, "authority", event.value)
+        if (
+            not is_current_pregame_payload(self.payload)
+            or self.game_pk != self.payload.game_input.identity.game_pk
+        ):
+            raise ValueError("current bundle authority is invalid")
+        _register_authority(
+            _BUNDLE_AUTHORITIES,
+            self,
+            _bundle_authority_digest(
                 schema_version=self.schema_version,
                 authority=self.authority,
                 stage=self.stage,
                 game_pk=self.game_pk,
                 created_at=self.created_at,
-                payload_authority=payload_authority,
+                payload=self.payload,
             ),
         )
+        return self
+
+    def __copy__(self) -> "_CurrentPregameBundle":
+        copied = super().__copy__()
+        _authorize_current_bundle_copy(self, copied)
+        return copied
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object] | None = None,
+    ) -> "_CurrentPregameBundle":
+        authorize_copy = _copy_memo_is_clean(self, memo)
+        copied = super().__deepcopy__(memo)
+        if authorize_copy:
+            _authorize_current_decision_copy(
+                self.payload.legacy_decision,
+                copied.payload.legacy_decision,
+            )
+            _authorize_current_payload_copy(self.payload, copied.payload)
+            _authorize_current_bundle_copy(self, copied)
+        return copied
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> "_CurrentPregameBundle":
+        copied = super().model_copy(update=update, deep=deep)
+        if update is not None:
+            _discard_authority(_BUNDLE_AUTHORITIES, copied)
+        return copied
 
     @field_serializer("payload", return_type=_CurrentPregamePayload)
     def _serialize_current_payload(
@@ -506,40 +832,18 @@ def is_current_pregame_bundle(
     expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
     expected_stage: Literal["projected", "confirmed"],
 ) -> bool:
-    """Verify the complete sealed runtime graph for a normal pregame run.
+    """Verify validation-event authority for the complete runtime graph.
 
-    Untouched shallow and deep copies retain the value-based seal. Pydantic
-    update copies deliberately do not mint a new seal and must be revalidated
-    from an explicit current-v2 mapping before normal execution.
+    Untouched shallow and deep copies receive deliberate identity-bound
+    authority from an authorized source. Any update-bearing Pydantic copy must
+    be revalidated from an explicit current-v2 mapping before normal execution;
+    caller-supplied deep-copy graph substitutions are likewise untrusted.
     """
 
-    if (
-        type(value) is not expected_type
-        or type(value.schema_version) is not int
-        or value.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
-        or type(value.authority) is not str
-        or value.authority != CURRENT_PREGAME_AUTHORITY
-        or type(value.stage) is not str
-        or value.stage != expected_stage
-        or type(value.game_pk) is not int
-        or type(value.created_at) is not datetime
-        or value.created_at.tzinfo is None
-        or value.created_at.utcoffset() is None
-        or not is_current_pregame_payload(value.payload)
-        or value.game_pk != value.payload.game_input.identity.game_pk
-    ):
-        return False
-    runtime_authority = getattr(value, "_runtime_authority", None)
-    payload_authority = value.payload._runtime_authority
-    if (
-        type(runtime_authority) is not _CurrentBundleAuthority
-        or type(runtime_authority.payload_token) is not bytes
-        or type(runtime_authority.digest) is not bytes
-        or type(payload_authority.token) is not bytes
-        or not hmac.compare_digest(
-            runtime_authority.payload_token,
-            payload_authority.token,
-        )
+    if not _has_current_bundle_invariants(
+        value,
+        expected_type=expected_type,
+        expected_stage=expected_stage,
     ):
         return False
     try:
@@ -549,11 +853,88 @@ def is_current_pregame_bundle(
             stage=value.stage,
             game_pk=value.game_pk,
             created_at=value.created_at,
-            payload_authority=payload_authority,
+            payload=value.payload,
         )
     except (AttributeError, TypeError, ValueError):
         return False
-    return hmac.compare_digest(runtime_authority.digest, digest)
+    return _has_authority(_BUNDLE_AUTHORITIES, value, digest)
+
+
+def _has_current_bundle_invariants(
+    value: object,
+    *,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_stage: Literal["projected", "confirmed"],
+) -> bool:
+    if type(value) is not expected_type:
+        return False
+    try:
+        return not (
+            type(value.schema_version) is not int
+            or value.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
+            or type(value.authority) is not str
+            or value.authority != CURRENT_PREGAME_AUTHORITY
+            or type(value.stage) is not str
+            or value.stage != expected_stage
+            or type(value.game_pk) is not int
+            or type(value.created_at) is not datetime
+            or value.created_at.tzinfo is None
+            or value.created_at.utcoffset() is None
+            or not is_current_pregame_payload(value.payload)
+            or type(value.payload.game_input.identity.game_pk) is not int
+            or value.game_pk != value.payload.game_input.identity.game_pk
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _authorize_current_bundle_copy(source: object, copied: object) -> None:
+    if type(source) is ProjectedBundle:
+        expected_type = ProjectedBundle
+        expected_stage = "projected"
+    elif type(source) is ConfirmedBundle:
+        expected_type = ConfirmedBundle
+        expected_stage = "confirmed"
+    else:
+        return
+    if (
+        not is_current_pregame_bundle(
+            source,
+            expected_type=expected_type,
+            expected_stage=expected_stage,
+        )
+        or not _has_current_bundle_invariants(
+            copied,
+            expected_type=expected_type,
+            expected_stage=expected_stage,
+        )
+    ):
+        return
+    try:
+        source_digest = _bundle_authority_digest(
+            schema_version=source.schema_version,
+            authority=source.authority,
+            stage=source.stage,
+            game_pk=source.game_pk,
+            created_at=source.created_at,
+            payload=source.payload,
+        )
+        copied_digest = _bundle_authority_digest(
+            schema_version=copied.schema_version,
+            authority=copied.authority,
+            stage=copied.stage,
+            game_pk=copied.game_pk,
+            created_at=copied.created_at,
+            payload=copied.payload,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return
+    if hmac.compare_digest(source_digest, copied_digest):
+        _register_authority(
+            _BUNDLE_AUTHORITIES,
+            copied,
+            copied_digest,
+        )
 
 
 class HistoricalRelaxedProjectedBundleV1(_HistoricalPregameBundleV1):

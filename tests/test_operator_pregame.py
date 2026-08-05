@@ -1,4 +1,4 @@
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 import hashlib
@@ -11,6 +11,7 @@ from pydantic import TypeAdapter, ValidationError
 
 import analysis.operator.bundles as bundles_module
 import analysis.operator.cli as cli_module
+import analysis.operator.config as operator_config_module
 import analysis.operator.service as service_module
 import analysis.shadow as shadow_module
 from analysis.operator.bundles import (
@@ -437,6 +438,25 @@ def _compatible_ml_over_case() -> tuple[object, LegacyDecisionSnapshot]:
 
 def _run_paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "ledger" / "shadow.jsonl", tmp_path / "bundles"
+
+
+def _model_construct_like(value, **updates: object):
+    fields = {
+        name: getattr(value, name)
+        for name in type(value).model_fields
+    }
+    fields.update(updates)
+    return type(value).model_construct(**fields)
+
+
+def _copy_pydantic_private_state(source: object, target: object) -> None:
+    private_state = getattr(source, "__pydantic_private__", None)
+    if private_state is not None:
+        object.__setattr__(
+            target,
+            "__pydantic_private__",
+            deepcopy(private_state),
+        )
 
 
 def _write_hash_named_managed_bundle(
@@ -1394,6 +1414,475 @@ def test_normal_runner_rejects_nested_historical_decision_copy_before_writes(
 
 
 @pytest.mark.parametrize(
+    (
+        "stage",
+        "current_type",
+        "runner",
+        "game_factory",
+        "historical_parser",
+    ),
+    (
+        (
+            "projected",
+            ProjectedBundle,
+            run_projected,
+            _projected_game,
+            parse_historical_projected_bundle_json,
+        ),
+        (
+            "confirmed",
+            ConfirmedBundle,
+            run_confirmed,
+            _confirmed_game,
+            parse_historical_confirmed_bundle_json,
+        ),
+    ),
+)
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+@pytest.mark.parametrize("reentry", ("direct", "base_model", "type_adapter"))
+def test_normal_runner_rejects_copied_private_authority_on_equal_historical_graph(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    historical_parser,
+    candidate_contract: str,
+    reentry: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    if candidate_contract == "empty":
+        current = _pregame_bundle(stage, game_factory())
+    else:
+        current = _bundle_with_legacy(
+            stage,
+            game_factory(),
+            _valid_recommended_legacy_mapping(),
+        )
+    historical = historical_parser(
+        _raw(
+            _historical_v1_mapping(
+                json.loads(bundle_canonical_bytes(current)),
+                candidate_contract=candidate_contract,
+            )
+        )
+    )
+
+    forged_decision = deepcopy(historical.payload.legacy_decision)
+    object.__setattr__(
+        forged_decision,
+        "__class__",
+        type(current.payload.legacy_decision),
+    )
+    if hasattr(current.payload.legacy_decision, "_current_authority_token"):
+        object.__setattr__(
+            forged_decision,
+            "_current_authority_token",
+            current.payload.legacy_decision._current_authority_token,
+        )
+    assert forged_decision == current.payload.legacy_decision
+    assert hash(forged_decision) == hash(current.payload.legacy_decision)
+
+    forged_payload = _model_construct_like(
+        current.payload,
+        game_input=historical.payload.game_input,
+        legacy_decision=forged_decision,
+    )
+    _copy_pydantic_private_state(current.payload, forged_payload)
+    assert forged_payload == current.payload
+
+    forged = _model_construct_like(current, payload=forged_payload)
+    _copy_pydantic_private_state(current, forged)
+    assert forged == current
+
+    if reentry == "base_model":
+        normal_input = current_type.model_validate(forged)
+    elif reentry == "type_adapter":
+        normal_input = TypeAdapter(current_type).validate_python(forged)
+    else:
+        normal_input = forged
+    assert normal_input is forged
+
+    error = None
+    try:
+        runner(normal_input, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("construct_scope", ("outer", "nested"))
+@pytest.mark.parametrize("reentry", ("direct", "base_model", "type_adapter"))
+def test_normal_runner_rejects_unregistered_model_construct_reentry(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    construct_scope: str,
+    reentry: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+    payload = current.payload
+    if construct_scope == "nested":
+        payload = _model_construct_like(payload)
+    forged = _model_construct_like(current, payload=payload)
+
+    if reentry == "base_model":
+        normal_input = current_type.model_validate(forged)
+    elif reentry == "type_adapter":
+        normal_input = TypeAdapter(current_type).validate_python(forged)
+    else:
+        normal_input = forged
+    assert normal_input is forged
+
+    error = None
+    try:
+        runner(normal_input, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("construct_scope", ("outer", "nested"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "cross_game_payload",
+        "cross_game_payload_and_envelope",
+        "envelope_game_pk",
+        "game_input_captured_at",
+        "valid_alternate_config",
+        "separately_validated_current_decision",
+        "created_at",
+        "schema_version",
+        "authority",
+        "stage",
+    ),
+)
+def test_normal_runner_rejects_model_construct_graph_mutations_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    construct_scope: str,
+    mutation: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = game_factory()
+    current = _pregame_bundle(stage, game)
+    other_game = replace(
+        game,
+        identity=replace(game.identity, game_pk=game.identity.game_pk + 1),
+    )
+    source = current
+    envelope_updates: dict[str, object] = {}
+    registry_root = None
+
+    if mutation.startswith("cross_game_payload"):
+        source = _pregame_bundle(stage, other_game)
+        if mutation == "cross_game_payload_and_envelope":
+            envelope_updates["game_pk"] = other_game.identity.game_pk
+    elif mutation == "envelope_game_pk":
+        envelope_updates["game_pk"] = other_game.identity.game_pk
+    elif mutation == "game_input_captured_at":
+        changed_game = replace(
+            game,
+            captured_at=game.captured_at + timedelta(seconds=1),
+        )
+        source = _pregame_bundle(stage, changed_game)
+    elif mutation == "valid_alternate_config":
+        version = "shadow-forecast-authority-alternate"
+        config = SimulationConfig(version=version, simulations=12)
+        registry_root = tmp_path / "config"
+        registry_root.mkdir()
+        (registry_root / f"{version}.json").write_text(
+            json.dumps(config.to_mapping()),
+            encoding="utf-8",
+        )
+        assert (
+            operator_config_module.load_forecast_config(
+                version,
+                registry_root=registry_root,
+            )
+            == config
+        )
+        monkeypatch.setattr(
+            service_module,
+            "load_forecast_config",
+            operator_config_module.load_forecast_config,
+        )
+        source_mapping = json.loads(current.model_dump_json(warnings="error"))
+        source_mapping["payload"]["forecast_config_version"] = version
+        source = current_type.model_validate(source_mapping)
+    elif mutation == "separately_validated_current_decision":
+        source = _bundle_with_legacy(
+            stage,
+            game,
+            _valid_recommended_legacy_mapping(),
+        )
+    elif mutation == "created_at":
+        envelope_updates["created_at"] = current.created_at + timedelta(seconds=1)
+    elif mutation == "schema_version":
+        envelope_updates["schema_version"] = 1
+    elif mutation == "authority":
+        envelope_updates["authority"] = "historical"
+    else:
+        envelope_updates["stage"] = (
+            "confirmed" if stage == "projected" else "projected"
+        )
+
+    payload = source.payload
+    if construct_scope == "nested":
+        payload = _model_construct_like(payload)
+    forged = _model_construct_like(
+        current,
+        payload=payload,
+        **envelope_updates,
+    )
+
+    error = None
+    try:
+        runner(
+            forged,
+            ledger_path=ledger,
+            bundle_root=bundles,
+            registry_root=registry_root,
+        )
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize(
+    "replaced_field",
+    (
+        "payload",
+        "game_input",
+        "game_identity",
+        "legacy_decision",
+        "forecast_config_version",
+        "created_at",
+        "game_pk",
+    ),
+)
+def test_normal_runner_rejects_equal_object_replacement_in_authorized_graph(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    replaced_field: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+    equal = current_type.model_validate(
+        json.loads(current.model_dump_json(warnings="error"))
+    )
+    assert equal == current
+    assert equal is not current
+
+    if replaced_field == "payload":
+        assert equal.payload is not current.payload
+        object.__setattr__(current, "payload", equal.payload)
+    elif replaced_field == "game_input":
+        assert equal.payload.game_input is not current.payload.game_input
+        object.__setattr__(
+            current.payload,
+            "game_input",
+            equal.payload.game_input,
+        )
+    elif replaced_field == "game_identity":
+        assert (
+            equal.payload.game_input.identity
+            is not current.payload.game_input.identity
+        )
+        object.__setattr__(
+            current.payload.game_input,
+            "identity",
+            equal.payload.game_input.identity,
+        )
+    elif replaced_field == "legacy_decision":
+        assert (
+            equal.payload.legacy_decision
+            is not current.payload.legacy_decision
+        )
+        object.__setattr__(
+            current.payload,
+            "legacy_decision",
+            equal.payload.legacy_decision,
+        )
+    elif replaced_field == "forecast_config_version":
+        replacement = f" {current.payload.forecast_config_version}"[1:]
+        assert replacement == current.payload.forecast_config_version
+        assert replacement is not current.payload.forecast_config_version
+        object.__setattr__(
+            current.payload,
+            "forecast_config_version",
+            replacement,
+        )
+    elif replaced_field == "created_at":
+        replacement = current.created_at.replace()
+        assert replacement == current.created_at
+        assert replacement is not current.created_at
+        object.__setattr__(current, "created_at", replacement)
+    else:
+        replacement = int(str(current.game_pk))
+        assert replacement == current.game_pk
+        assert replacement is not current.game_pk
+        object.__setattr__(current, "game_pk", replacement)
+
+    error = None
+    try:
+        runner(current, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("forged_node", ("bundle", "payload", "decision"))
+def test_normal_runner_rejects_current_runtime_subclasses_before_writes(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    forged_node: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+
+    if forged_node == "bundle":
+        forged = copy(current)
+        forged_type = type("ForgedCurrentBundle", (type(current),), {})
+        object.__setattr__(forged, "__class__", forged_type)
+    elif forged_node == "payload":
+        forged_payload = copy(current.payload)
+        forged_type = type(
+            "ForgedCurrentPayload",
+            (type(current.payload),),
+            {},
+        )
+        object.__setattr__(forged_payload, "__class__", forged_type)
+        forged = _model_construct_like(current, payload=forged_payload)
+    else:
+        forged_decision = copy(current.payload.legacy_decision)
+        forged_type = type(
+            "ForgedCurrentDecision",
+            (type(current.payload.legacy_decision),),
+            {},
+        )
+        object.__setattr__(forged_decision, "__class__", forged_type)
+        forged_payload = _model_construct_like(
+            current.payload,
+            legacy_decision=forged_decision,
+        )
+        forged = _model_construct_like(current, payload=forged_payload)
+
+    error = None
+    try:
+        runner(forged, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("missing_node", ("bundle", "payload", "decision"))
+def test_normal_runner_rejects_incomplete_runtime_constructs_before_writes(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    missing_node: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+
+    if missing_node == "bundle":
+        forged = type(current).model_construct()
+    elif missing_node == "payload":
+        forged_payload = type(current.payload).model_construct()
+        forged = _model_construct_like(current, payload=forged_payload)
+    else:
+        forged_decision = object.__new__(
+            type(current.payload.legacy_decision)
+        )
+        forged_payload = _model_construct_like(
+            current.payload,
+            legacy_decision=forged_decision,
+        )
+        forged = _model_construct_like(current, payload=forged_payload)
+
+    error = None
+    try:
+        runner(forged, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
     ("stage", "runner", "game_factory"),
     (
         ("projected", run_projected, _projected_game),
@@ -1501,14 +1990,17 @@ def test_normal_runner_rejects_stale_current_authority_before_writes(
         ("confirmed", run_confirmed, _confirmed_game),
     ),
 )
-@pytest.mark.parametrize("deep", (False, True))
+@pytest.mark.parametrize(
+    "copy_kind",
+    ("copy", "deepcopy", "model_copy", "model_copy_deep"),
+)
 @pytest.mark.parametrize("candidate_contract", ("empty", "candidate"))
 def test_normal_runner_accepts_untampered_current_bundle_copy(
     tmp_path: Path,
     stage: str,
     runner,
     game_factory,
-    deep: bool,
+    copy_kind: str,
     candidate_contract: str,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
@@ -1520,7 +2012,12 @@ def test_normal_runner_accepts_untampered_current_bundle_copy(
         )
     else:
         bundle = _pregame_bundle(stage, game_factory())
-    bundle = bundle.model_copy(deep=deep)
+    if copy_kind == "copy":
+        bundle = copy(bundle)
+    elif copy_kind == "deepcopy":
+        bundle = deepcopy(bundle)
+    else:
+        bundle = bundle.model_copy(deep=copy_kind == "model_copy_deep")
 
     result = runner(bundle, ledger_path=ledger, bundle_root=bundles)
 
@@ -1528,6 +2025,109 @@ def test_normal_runner_accepts_untampered_current_bundle_copy(
     assert result.game_pk == bundle.game_pk
     assert ledger.is_file()
     assert result.managed_bundle.path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize(
+    "swapped_node",
+    (
+        "payload",
+        "game_input",
+        "legacy_decision",
+        "forecast_config_version",
+        "created_at",
+    ),
+)
+def test_normal_runner_rejects_deepcopy_memo_graph_substitution_before_writes(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    swapped_node: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+    equal = current_type.model_validate(
+        json.loads(current.model_dump_json(warnings="error"))
+    )
+    assert equal == current
+    memo: dict[int, object]
+
+    if swapped_node == "payload":
+        memo = {id(current.payload): equal.payload}
+    elif swapped_node == "game_input":
+        memo = {
+            id(current.payload.game_input): equal.payload.game_input,
+        }
+    elif swapped_node == "legacy_decision":
+        memo = {
+            id(current.payload.legacy_decision): (
+                equal.payload.legacy_decision
+            ),
+        }
+    elif swapped_node == "forecast_config_version":
+        replacement = f" {current.payload.forecast_config_version}"[1:]
+        assert replacement is not current.payload.forecast_config_version
+        memo = {id(current.payload.forecast_config_version): replacement}
+    else:
+        replacement = current.created_at.replace()
+        assert replacement is not current.created_at
+        memo = {id(current.created_at): replacement}
+    forged = deepcopy(current, memo)
+    assert forged == current
+
+    error = None
+    try:
+        runner(forged, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("updated_node", ("bundle", "payload"))
+def test_normal_runner_rejects_empty_update_model_copy_before_writes(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    updated_node: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    current = _pregame_bundle(stage, game_factory())
+    if updated_node == "payload":
+        invalid_payload = current.payload.model_copy(update={})
+        invalid = current.model_copy(update={"payload": invalid_payload})
+    else:
+        invalid = current.model_copy(update={})
+
+    error = None
+    try:
+        runner(invalid, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert public preflight
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
 
 
 @pytest.mark.parametrize(
