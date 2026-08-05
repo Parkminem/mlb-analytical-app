@@ -21,6 +21,7 @@ from analysis.operator.errors import (
     OperatorPartialProgress,
     OperatorPreconditionError,
 )
+from analysis.pipeline import LEGACY_MODEL_VERSION
 from analysis.operator.schemas import (
     CURRENT_PREGAME_AUTHORITY,
     CURRENT_PREGAME_SCHEMA_VERSION,
@@ -55,7 +56,7 @@ def test_partial_progress_is_not_rerun_safe_without_authoritative_state() -> Non
 
 def _legacy_decision_mapping() -> dict[str, object]:
     snapshot = LegacyDecisionSnapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(),
         final_priority=(),
         review_bindings=(),
@@ -66,7 +67,7 @@ def _legacy_decision_mapping() -> dict[str, object]:
 
 def _complete_legacy_decision_mapping() -> dict[str, object]:
     return {
-        "model_version": "2026-08-03",
+        "model_version": LEGACY_MODEL_VERSION,
         "candidates": [
             {
                 "market": "ml",
@@ -89,7 +90,7 @@ def _complete_legacy_decision_mapping() -> dict[str, object]:
                     {
                         "evidence_path": "starter_suppression",
                         "component_ids": [
-                            "home_pitcher_chain_runs_allowed"
+                            "away_pitcher_chain_runs_allowed"
                         ],
                         "contradiction_rule": "starter_suppression",
                     },

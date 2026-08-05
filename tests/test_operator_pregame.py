@@ -50,6 +50,7 @@ from analysis.ledger.forecast_codec import (
     expand_component_distributions,
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
+from analysis.pipeline import LEGACY_MODEL_VERSION
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorError,
@@ -416,7 +417,16 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
         component_ids=("home_pitcher_chain_runs_allowed",),
         contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
     )
+    ml_starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+        component_ids=(
+            "home_pitcher_chain_runs_allowed",
+            "home_pitcher_chain_workload_outs",
+        ),
+        contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+    )
     ml_paths = (
+        ml_starter_path,
         PrincipalPathBinding(
             evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
             component_ids=(
@@ -470,7 +480,7 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
         ),
     )
     return LegacyDecisionSnapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=candidates,
         final_priority=("ml", "full_total"),
         review_bindings=(
@@ -539,10 +549,15 @@ def _compatible_ml_over_case() -> tuple[object, LegacyDecisionSnapshot]:
         ),
         contradiction_rule=ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
     )
-    ml_paths = (top_order_path, bullpen_path)
+    ml_starter_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_SUPPRESSION,
+        component_ids=("away_pitcher_chain_runs_allowed",),
+        contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
+    )
+    ml_paths = (ml_starter_path, top_order_path, bullpen_path)
     total_paths = (starter_collapse_path, recent_conversion_path)
     legacy = LegacyDecisionSnapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             PriorityMarketCandidate(
                 market="ml",
@@ -787,7 +802,7 @@ def test_fresh_stale_legacy_model_version_rejects_before_forecast_without_artifa
     with pytest.raises(
         OperatorPreconditionError,
         match=(
-            "fresh pregame legacy model_version must be 2026-08-03; "
+            "fresh pregame legacy model_version must be 2026-08-05; "
             "received 2026-07-13"
         ),
     ):
@@ -959,6 +974,14 @@ def test_exact_old_version_replay_precedes_fresh_evidence_version_check(
         _projected_game(),
         _valid_recommended_legacy_mapping(),
     )
+    bundle = _validated_current_copy(
+        bundle,
+        legacy_decision=replace(
+            bundle.payload.legacy_decision,
+            model_version="2026-08-03",
+        ),
+    )
+    monkeypatch.setattr(service_module, "LEGACY_MODEL_VERSION", "2026-08-03")
     first = run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
 
     def fail_forecast(*args, **kwargs):
@@ -985,6 +1008,14 @@ def test_nonexact_old_version_submission_rejects_without_new_artifacts(
         _projected_game(),
         _valid_recommended_legacy_mapping(),
     )
+    bundle = _validated_current_copy(
+        bundle,
+        legacy_decision=replace(
+            bundle.payload.legacy_decision,
+            model_version="2026-08-03",
+        ),
+    )
+    monkeypatch.setattr(service_module, "LEGACY_MODEL_VERSION", "2026-08-03")
     run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
     changed = _validated_current_copy(
         bundle,
@@ -1145,6 +1176,7 @@ def test_invalid_static_path_count_rejects_before_forecast_without_artifacts(
     legacy = _complete_legacy_decision_mapping()
     candidate = legacy["candidates"][0]
     binding = legacy["review_bindings"][0]
+    candidate["score"] = 71
     candidate["evidence_paths"] = ["bullpen_protection"]
     binding["principal_paths"] = binding["principal_paths"][1:]
     bundle = _bundle_with_legacy(
@@ -4479,22 +4511,28 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
         )
     else:
         first_binding = legacy.review_bindings[0]
-        conversion_path = first_binding.principal_paths[0]
+        conversion_path = next(
+            path
+            for path in first_binding.principal_paths
+            if path.evidence_path is PriorityEvidencePath.TOP_ORDER_MATCHUP
+        )
         corrected_legacy = replace(
             legacy,
             review_bindings=(
                 replace(
                     first_binding,
-                    principal_paths=(
+                    principal_paths=tuple(
                         replace(
-                            conversion_path,
+                            path,
                             component_ids=(
                                 "home_full_runs",
                                 "home_full_traffic",
                                 "home_full_extra_base_hits",
                             ),
-                        ),
-                        *first_binding.principal_paths[1:],
+                        )
+                        if path is conversion_path
+                        else path
+                        for path in first_binding.principal_paths
                     ),
                 ),
                 *legacy.review_bindings[1:],

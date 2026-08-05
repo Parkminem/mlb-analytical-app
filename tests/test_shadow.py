@@ -37,6 +37,7 @@ from analysis.ledger import (
     LedgerStore,
 )
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
+from analysis.pipeline import LEGACY_MODEL_VERSION
 from analysis.review.classification import (
     ContradictionRule,
     PrincipalPathBinding,
@@ -394,7 +395,7 @@ def test_current_under_contract_accepts_two_sided_suppression_binding(
     lineup_path = lineup_suppression_path(side="home", horizon=horizon)
     paths = (starter_path, lineup_path)
     legacy = legacy_snapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             candidate(
                 market=market_type.value,
@@ -423,7 +424,7 @@ def test_current_under_contract_rejects_missing_lineup_suppression_path() -> Non
         line=8.5,
     )
     legacy = legacy_snapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             candidate(
                 market=MarketType.FULL_TOTAL.value,
@@ -456,7 +457,7 @@ def test_current_under_contract_rejects_unbound_lineup_suppression_path() -> Non
         line=8.5,
     )
     legacy = legacy_snapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             candidate(
                 market=MarketType.FULL_TOTAL.value,
@@ -529,7 +530,7 @@ def test_current_under_contract_rejects_duplicated_scoring_direction() -> None:
     lineup_path = lineup_suppression_path(side="away")
     paths = (starter_path, lineup_path)
     legacy = legacy_snapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             candidate(
                 market=MarketType.FULL_TOTAL.value,
@@ -569,7 +570,7 @@ def test_lineup_suppression_contract_rejects_over_direction() -> None:
     lineup_path = lineup_suppression_path(side="home")
     paths = (starter_path, lineup_path)
     legacy = legacy_snapshot(
-        model_version="2026-08-03",
+        model_version=LEGACY_MODEL_VERSION,
         candidates=(
             candidate(
                 market=MarketType.FULL_TOTAL.value,
@@ -1941,7 +1942,7 @@ class ShadowRecordingTests(unittest.TestCase):
         game = replace(self.game, markets=(market,))
         forecast = run_forecast(game, _fast_config())
         legacy = legacy_snapshot(
-            model_version="2026-08-03",
+            model_version=LEGACY_MODEL_VERSION,
             candidates=(
                 candidate(
                     market=MarketType.FULL_TOTAL.value,
