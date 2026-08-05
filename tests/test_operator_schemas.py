@@ -553,6 +553,48 @@ def test_current_compatibility_is_intrinsically_strict_boolean(
 
 
 @pytest.mark.parametrize(
+    "dump_path",
+    (
+        "model_dump",
+        "model_dump_json",
+        "adapter_dump_python",
+        "adapter_dump_json",
+    ),
+)
+@pytest.mark.parametrize(
+    ("current_type", "mapping_factory"),
+    (
+        (ProjectedBundle, projected_bundle_mapping),
+        (ConfirmedBundle, confirmed_bundle_mapping),
+    ),
+)
+def test_current_bundle_public_dump_paths_are_warning_free(
+    current_type,
+    mapping_factory,
+    dump_path: str,
+) -> None:
+    mapping = mapping_factory()
+    mapping["payload"]["legacy_decision"] = _complete_legacy_decision_mapping()
+    bundle = current_type.model_validate(mapping)
+    adapter = TypeAdapter(current_type)
+
+    if dump_path == "model_dump":
+        dumped = bundle.model_dump(warnings="error")
+    elif dump_path == "model_dump_json":
+        dumped = json.loads(bundle.model_dump_json(warnings="error"))
+    elif dump_path == "adapter_dump_python":
+        dumped = adapter.dump_python(bundle, warnings="error")
+    else:
+        dumped = json.loads(adapter.dump_json(bundle, warnings="error"))
+
+    assert dumped["schema_version"] == 2
+    assert dumped["authority"] == "current"
+    assert dumped["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ] is False
+
+
+@pytest.mark.parametrize(
     (
         "historical_parser",
         "mapping_factory",

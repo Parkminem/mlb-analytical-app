@@ -16,6 +16,7 @@ from pydantic import (
     ValidateAs,
     ValidationError,
     ValidationInfo,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -312,6 +313,13 @@ class _CurrentPregameBundle(_PregameBundle):
                 strict=True,
             )
         return _CurrentPregamePayload.model_validate(value)
+
+    @field_serializer("payload", return_type=_CurrentPregamePayload)
+    def _serialize_current_payload(
+        self,
+        value: _CurrentPregamePayload,
+    ) -> _CurrentPregamePayload:
+        return value
 
 
 class _HistoricalPregameBundleV1(_PregameBundle):
