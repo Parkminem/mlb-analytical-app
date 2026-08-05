@@ -21,7 +21,15 @@ from .errors import (
     OperatorPartialProgress,
     OperatorPreconditionError,
 )
-from .schemas import ConfirmedBundle, ProjectedBundle, ReviewBundle
+from .schemas import (
+    ConfirmedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
+    ProjectedBundle,
+    ReviewBundle,
+)
 from .service import (
     DEFAULT_LEDGER_PATH,
     DEFAULT_REPORT_DIR,
@@ -199,12 +207,25 @@ def _load_pregame_bundle(
         if resolved_path.parent.parent != resolved_root:
             raise
         historical = load_historical_managed_bundle(path, root=bundle_root)
+        expected_historical_types = (
+            (
+                HistoricalRelaxedProjectedBundleV1,
+                HistoricalStrictProjectedBundleV1,
+            )
+            if expected_type is ProjectedBundle
+            else (
+                HistoricalRelaxedConfirmedBundleV1,
+                HistoricalStrictConfirmedBundleV1,
+            )
+        )
         if (
             not isinstance(historical, ReplayOnlyPregameBundle)
+            or type(historical.bundle) not in expected_historical_types
+            or historical.bundle.schema_version != 1
             or historical.bundle.stage != expected_stage
         ):
             raise OperatorPreconditionError(
-                "historical replay stage/type mismatch"
+                "schema-v1 pregame replay stage/type mismatch"
             )
         return _PregameBundleLoad(
             bundle=None,
@@ -340,6 +361,7 @@ def projected(
                 bundle_root=bundle_root,
             )
         else:
+            assert type(loaded.bundle) is ProjectedBundle
             result = run_projected(
                 loaded.bundle,
                 ledger_path=ledger,
@@ -380,6 +402,7 @@ def confirmed(
                 bundle_root=bundle_root,
             )
         else:
+            assert type(loaded.bundle) is ConfirmedBundle
             result = run_confirmed(
                 loaded.bundle,
                 ledger_path=ledger,

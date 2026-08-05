@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 import analysis.operator.cli as cli_module
@@ -27,8 +28,10 @@ from analysis.operator.errors import (
 )
 from analysis.operator.schemas import (
     ConfirmedBundle,
-    HistoricalConfirmedBundle,
-    HistoricalProjectedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     ReviewBundle,
     parse_confirmed_bundle_json,
@@ -39,9 +42,9 @@ from analysis.operator.schemas import (
 )
 from tests.test_forecasting_engine import _complete_game
 from tests.test_operator_schemas import (
-    _complete_legacy_decision_mapping,
     _raw,
     confirmed_bundle_mapping,
+    historical_bundle_mapping,
     projected_bundle_mapping,
     review_bundle_mapping,
 )
@@ -121,26 +124,31 @@ def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:
 
 def _historical_pregame_bundle(
     command: str,
-) -> HistoricalProjectedBundle | HistoricalConfirmedBundle:
-    raw = _historical_pregame_raw(command)
+    candidate_contract: str = "relaxed",
+) -> (
+    HistoricalRelaxedProjectedBundleV1
+    | HistoricalStrictProjectedBundleV1
+    | HistoricalRelaxedConfirmedBundleV1
+    | HistoricalStrictConfirmedBundleV1
+):
+    raw = _historical_pregame_raw(command, candidate_contract)
     if command == "projected":
         return parse_historical_projected_bundle_json(raw)
     return parse_historical_confirmed_bundle_json(raw)
 
 
-def _historical_pregame_raw(command: str) -> str:
-    mapping = (
-        projected_bundle_mapping()
+def _historical_pregame_raw(
+    command: str,
+    candidate_contract: str = "relaxed",
+) -> str:
+    mapping_factory = (
+        projected_bundle_mapping
         if command == "projected"
-        else confirmed_bundle_mapping()
+        else confirmed_bundle_mapping
     )
-    mapping["payload"]["legacy_decision"] = (
-        _complete_legacy_decision_mapping()
+    return _raw(
+        historical_bundle_mapping(mapping_factory, candidate_contract)
     )
-    del mapping["payload"]["legacy_decision"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
-    return _raw(mapping)
 
 
 def _write_hash_named_managed_bundle(
@@ -149,9 +157,14 @@ def _write_hash_named_managed_bundle(
     *,
     game_pk: int,
     stage: str,
+    schema_version: int = 1,
 ) -> Path:
     bundle_hash = hashlib.sha256(raw).hexdigest()
-    path = root / str(game_pk) / f"{stage}-v1-{bundle_hash[:16]}.json"
+    path = (
+        root
+        / str(game_pk)
+        / f"{stage}-v{schema_version}-{bundle_hash[:16]}.json"
+    )
     path.parent.mkdir(parents=True)
     path.write_bytes(raw)
     return path
@@ -200,6 +213,237 @@ def test_pregame_loader_classifies_managed_pre_change_path_as_historical(
     assert loaded.bundle is None
     assert loaded.historical_path == managed_path.resolve()
     assert calls == [(managed_path, bundle_root)]
+
+
+def test_pregame_loader_rejects_non_v1_historical_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    managed_path = bundle_root / "900001" / "projected-v1-deadbeefdeadbeef.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text("historical", encoding="utf-8")
+    non_v1 = _historical_pregame_bundle("projected").model_copy(
+        update={"schema_version": 2}
+    )
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bundle",
+        lambda path: (_ for _ in ()).throw(
+            BundleValidationError("not a current bundle")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        lambda path, *, root: ReplayOnlyPregameBundle(
+            bundle=non_v1,
+            managed_bundle=ManagedBundleCopy(
+                path=managed_path,
+                bundle_hash="historical-bundle-sha256",
+                replayed=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="schema-v1 pregame replay stage/type mismatch",
+    ):
+        cli_module._load_pregame_bundle(
+            managed_path,
+            expected_type=ProjectedBundle,
+            expected_stage="projected",
+            bundle_root=bundle_root,
+        )
+
+
+def test_pregame_loader_rejects_wrong_historical_runtime_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    managed_path = bundle_root / "900001" / "projected-v1-deadbeefdeadbeef.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text("historical", encoding="utf-8")
+    wrong_type = _historical_pregame_bundle("confirmed").model_copy(
+        update={"stage": "projected"}
+    )
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bundle",
+        lambda path: (_ for _ in ()).throw(
+            BundleValidationError("not a current bundle")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        lambda path, *, root: ReplayOnlyPregameBundle(
+            bundle=wrong_type,
+            managed_bundle=ManagedBundleCopy(
+                path=managed_path,
+                bundle_hash="historical-bundle-sha256",
+                replayed=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="schema-v1 pregame replay stage/type mismatch",
+    ):
+        cli_module._load_pregame_bundle(
+            managed_path,
+            expected_type=ProjectedBundle,
+            expected_stage="projected",
+            bundle_root=bundle_root,
+        )
+
+
+@pytest.mark.parametrize("command", ("projected", "confirmed"))
+@pytest.mark.parametrize(
+    ("authority_case", "expected_route"),
+    (
+        ("v2-current", "normal"),
+        ("v1-relaxed-managed", "replay"),
+        ("v1-strict-managed", "replay"),
+        ("v1-relaxed-outside", "reject"),
+        ("v1-strict-outside", "reject"),
+        ("v2-missing-authority", "reject"),
+        ("v2-wrong-authority", "reject"),
+    ),
+)
+def test_pregame_cli_dispatches_by_bundle_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    authority_case: str,
+    expected_route: str,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    mapping_factory = (
+        projected_bundle_mapping
+        if command == "projected"
+        else confirmed_bundle_mapping
+    )
+    if authority_case.startswith("v1-relaxed"):
+        mapping = historical_bundle_mapping(mapping_factory, "relaxed")
+    elif authority_case.startswith("v1-strict"):
+        mapping = historical_bundle_mapping(mapping_factory, "strict")
+    else:
+        mapping = mapping_factory()
+    authority_secret = "authority-api-token-secret"
+    if authority_case == "v2-missing-authority":
+        mapping.pop("authority")
+    elif authority_case == "v2-wrong-authority":
+        mapping["authority"] = authority_secret
+
+    raw = _raw(mapping).encode("utf-8")
+    managed_case = authority_case.endswith("managed") or (
+        authority_case.startswith("v2-")
+        and authority_case != "v2-current"
+    )
+    if managed_case:
+        source = _write_hash_named_managed_bundle(
+            bundle_root,
+            raw,
+            game_pk=900001,
+            stage=command,
+            schema_version=mapping["schema_version"],
+        )
+    else:
+        source = tmp_path / "outside" / f"{command}-{authority_case}.json"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(raw)
+
+    normal_calls: list[tuple[object, dict[str, object]]] = []
+    replay_calls: list[tuple[Path, dict[str, object]]] = []
+
+    def normal_service(bundle: object, **kwargs: object) -> _PregameResult:
+        normal_calls.append((bundle, kwargs))
+        return _pregame_result(command, replayed=False)
+
+    def replay_service(path: Path, **kwargs: object) -> _PregameResult:
+        replay_calls.append((path, kwargs))
+        return _pregame_result(command, replayed=True)
+
+    def forbidden_service(*args: object, **kwargs: object) -> _PregameResult:
+        del args, kwargs
+        raise AssertionError("rejected or opposite route reached a service")
+
+    if expected_route == "normal":
+        monkeypatch.setattr(cli_module, f"run_{command}", normal_service)
+        monkeypatch.setattr(
+            cli_module,
+            f"replay_historical_{command}",
+            forbidden_service,
+        )
+    elif expected_route == "replay":
+        monkeypatch.setattr(cli_module, f"run_{command}", forbidden_service)
+        monkeypatch.setattr(
+            cli_module,
+            f"replay_historical_{command}",
+            replay_service,
+        )
+    else:
+        monkeypatch.setattr(cli_module, f"run_{command}", forbidden_service)
+        monkeypatch.setattr(
+            cli_module,
+            f"replay_historical_{command}",
+            forbidden_service,
+        )
+    if authority_case.endswith("outside"):
+        monkeypatch.setattr(
+            cli_module,
+            "load_historical_managed_bundle",
+            forbidden_service,
+        )
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--bundle",
+            str(source),
+            "--ledger",
+            str(ledger_path),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    expected_kwargs = {
+        "ledger_path": ledger_path,
+        "bundle_root": bundle_root,
+    }
+    if expected_route == "normal":
+        current_type = (
+            ProjectedBundle if command == "projected" else ConfirmedBundle
+        )
+        assert result.exit_code == 0, result.output
+        assert len(normal_calls) == 1
+        assert type(normal_calls[0][0]) is current_type
+        assert normal_calls[0][0].schema_version == 2
+        assert normal_calls[0][0].authority == "current"
+        assert normal_calls[0][1] == expected_kwargs
+        assert replay_calls == []
+    elif expected_route == "replay":
+        assert result.exit_code == 0, result.output
+        assert normal_calls == []
+        assert replay_calls == [(source.resolve(), expected_kwargs)]
+    else:
+        assert result.exit_code == 3, result.output
+        assert normal_calls == []
+        assert replay_calls == []
+        assert result.output.startswith("error: ")
+        assert authority_secret not in result.output
+        assert "input_value" not in result.output
+        assert "errors.pydantic.dev" not in result.output
+        assert "Traceback" not in result.output
 
 
 @pytest.mark.parametrize("command", ("projected", "confirmed"))
@@ -276,6 +520,78 @@ def test_historical_managed_path_dispatches_only_to_replay_service(
     assert calls == [(managed_path.resolve(), ledger_path, bundle_root)]
 
 
+@pytest.mark.parametrize("command", ("projected", "confirmed"))
+def test_empty_candidate_v1_managed_bundle_replays_by_path_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    raw = _historical_pregame_raw(command, "empty").encode("utf-8")
+    source = _write_hash_named_managed_bundle(
+        bundle_root,
+        raw,
+        game_pk=900001,
+        stage=command,
+    )
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    def forbidden_normal(*args: object, **kwargs: object) -> _PregameResult:
+        del args, kwargs
+        raise AssertionError("empty v1 input must not reach the normal runner")
+
+    def replay_service(path: Path, **kwargs: object) -> _PregameResult:
+        calls.append((path, kwargs))
+        return _pregame_result(command, replayed=True)
+
+    monkeypatch.setattr(cli_module, f"run_{command}", forbidden_normal)
+    monkeypatch.setattr(
+        cli_module,
+        f"replay_historical_{command}",
+        replay_service,
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--bundle",
+            str(source),
+            "--ledger",
+            str(ledger_path),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (
+            source.resolve(),
+            {"ledger_path": ledger_path, "bundle_root": bundle_root},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "current_type"),
+    (
+        ("projected", ProjectedBundle),
+        ("confirmed", ConfirmedBundle),
+    ),
+)
+def test_empty_candidate_v1_from_attributes_cannot_create_current_bundle(
+    command: str,
+    current_type: type[ProjectedBundle] | type[ConfirmedBundle],
+) -> None:
+    historical = _historical_pregame_bundle(command, "empty")
+    assert historical.payload.legacy_decision.candidates == ()
+
+    with pytest.raises(ValidationError):
+        current_type.model_validate(historical, from_attributes=True)
+
+
 @pytest.mark.parametrize(
     ("bundle", "historical_path"),
     (
@@ -328,27 +644,26 @@ def test_historical_pregame_outside_managed_root_is_not_classified(
     assert "Traceback" not in result.output
 
 
-def test_strict_wrong_stage_under_managed_root_never_enters_replay(
+def test_historical_wrong_stage_under_managed_root_never_dispatches_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle_root = tmp_path / "managed"
-    raw = _raw(confirmed_bundle_mapping()).encode("utf-8")
+    raw = _historical_pregame_raw("confirmed", "strict").encode("utf-8")
     source = _write_hash_named_managed_bundle(
         bundle_root,
         raw,
-        game_pk=744_001,
-        stage="projected",
+        game_pk=900001,
+        stage="confirmed",
     )
 
-    def forbidden_historical_loader(*args: object, **kwargs: object) -> object:
+    def forbidden_service(*args: object, **kwargs: object) -> object:
         del args, kwargs
-        raise AssertionError("strict wrong-stage input must not enter replay")
+        raise AssertionError("wrong historical stage must not dispatch")
 
+    monkeypatch.setattr(cli_module, "run_projected", forbidden_service)
     monkeypatch.setattr(
-        cli_module,
-        "load_historical_managed_bundle",
-        forbidden_historical_loader,
+        cli_module, "replay_historical_projected", forbidden_service
     )
 
     result = runner.invoke(
@@ -363,7 +678,7 @@ def test_strict_wrong_stage_under_managed_root_never_enters_replay(
     )
 
     assert result.exit_code == 4
-    assert "bundle stage/type mismatch" in result.output
+    assert "schema-v1 pregame replay stage/type mismatch" in result.output
     assert "Traceback" not in result.output
 
 
@@ -450,13 +765,13 @@ def test_review_never_classifies_historical_pregame_input(
 
 
 @pytest.mark.parametrize("command", ("projected", "confirmed"))
-def test_strict_current_path_dispatches_only_to_normal_runner(
+def test_v2_current_path_dispatches_only_to_normal_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     command: str,
 ) -> None:
     bundle_root = tmp_path / "managed"
-    current_path = bundle_root / "900001" / f"{command}-v1-deadbeefdeadbeef.json"
+    current_path = bundle_root / "900001" / f"{command}-v2-deadbeefdeadbeef.json"
     current_path.parent.mkdir(parents=True)
     current_path.write_text("strict", encoding="utf-8")
     strict_bundle = _bundle(command)
