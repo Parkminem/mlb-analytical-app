@@ -19,7 +19,11 @@ from analysis.forecasting.validation import (
     PregameTimingError,
 )
 from analysis.ledger import LedgerStore
-from analysis.operator.bundles import ManagedBundleCopy, ReplayOnlyPregameBundle
+from analysis.operator.bundles import (
+    ManagedBundleCopy,
+    ReplayOnlyPregameBundle,
+    load_historical_managed_bundle,
+)
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorIOError,
@@ -444,6 +448,79 @@ def test_pregame_cli_dispatches_by_bundle_authority(
         assert "input_value" not in result.output
         assert "errors.pydantic.dev" not in result.output
         assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("command", ("projected", "confirmed"))
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
+def test_historical_cli_replay_uses_authenticated_path_through_ancestor_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    candidate_contract: str,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    bundle_root = alias_parent / "managed"
+    raw = _historical_pregame_raw(
+        command,
+        candidate_contract,
+    ).encode("utf-8")
+    source = _write_hash_named_managed_bundle(
+        bundle_root,
+        raw,
+        game_pk=900001,
+        stage=command,
+    )
+    replay_paths: list[Path] = []
+
+    assert alias_parent.is_symlink()
+    assert not bundle_root.is_symlink()
+    assert not source.parent.is_symlink()
+    assert not source.is_symlink()
+    assert source != source.resolve()
+
+    def forbidden_normal(*args: object, **kwargs: object) -> _PregameResult:
+        del args, kwargs
+        raise AssertionError("historical input must not reach normal execution")
+
+    def replay_service(
+        path: Path,
+        *,
+        ledger_path: Path,
+        bundle_root: Path,
+    ) -> _PregameResult:
+        del ledger_path
+        replay_paths.append(path)
+        artifact = load_historical_managed_bundle(path, root=bundle_root)
+        assert isinstance(artifact, ReplayOnlyPregameBundle)
+        assert artifact.bundle.schema_version == 1
+        assert artifact.bundle.stage == command
+        return _pregame_result(command, replayed=True)
+
+    monkeypatch.setattr(cli_module, f"run_{command}", forbidden_normal)
+    monkeypatch.setattr(
+        cli_module,
+        f"replay_historical_{command}",
+        replay_service,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--bundle",
+            str(source),
+            "--ledger",
+            str(tmp_path / "ledger.jsonl"),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert replay_paths == [source]
 
 
 @pytest.mark.parametrize("command", ("projected", "confirmed"))

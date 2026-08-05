@@ -229,7 +229,7 @@ def _load_pregame_bundle(
             )
         return _PregameBundleLoad(
             bundle=None,
-            historical_path=resolved_path,
+            historical_path=historical.managed_bundle.path,
         )
     return _PregameBundleLoad(bundle=bundle, historical_path=None)
 
