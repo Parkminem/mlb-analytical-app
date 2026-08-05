@@ -1,7 +1,6 @@
 """Strict JSON bundle schemas for shadow operator stages."""
 
 from collections.abc import Callable, Mapping
-from copy import deepcopy as _deepcopy_value
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 import hashlib
@@ -49,6 +48,7 @@ CURRENT_PREGAME_AUTHORITY = "current"
 @dataclass(frozen=True)
 class _IdentityAuthority:
     value_ref: ReferenceType[object]
+    issued_type: type[object]
     graph: tuple[object, ...]
     digest: bytes
 
@@ -129,17 +129,6 @@ def _identity_graph(root: object) -> tuple[object, ...]:
     return tuple(graph)
 
 
-def _copy_memo_is_clean(
-    root: object,
-    memo: dict[int, object] | None,
-) -> bool:
-    if not memo:
-        return True
-    return id(root) not in memo and all(
-        id(value) not in memo for value in _identity_graph(root)
-    )
-
-
 def _register_authority(
     registry: _AuthorityRegistry,
     value: object,
@@ -157,21 +146,12 @@ def _register_authority(
     value_ref = ref(value, remove)
     authority = _IdentityAuthority(
         value_ref=value_ref,
+        issued_type=type(value),
         graph=graph,
         digest=digest,
     )
     with _AUTHORITY_LOCK:
         registry[identity] = authority
-
-
-def _discard_authority(
-    registry: _AuthorityRegistry,
-    value: object,
-) -> None:
-    with _AUTHORITY_LOCK:
-        current = registry.get(id(value))
-        if current is not None and current.value_ref() is value:
-            registry.pop(id(value), None)
 
 
 def _has_authority(
@@ -185,7 +165,11 @@ def _has_authority(
         return False
     with _AUTHORITY_LOCK:
         authority = registry.get(id(value))
-        if authority is None or authority.value_ref() is not value:
+        if (
+            authority is None
+            or authority.value_ref() is not value
+            or authority.issued_type is not type(value)
+        ):
             return False
         return (
             len(authority.graph) == len(graph)
@@ -198,36 +182,7 @@ def _has_authority(
 
 
 class _CurrentLegacyDecisionSnapshot(LegacyDecisionSnapshot):
-    """Strict current decision domain value with deliberate copy semantics."""
-
-    def __copy__(self) -> "_CurrentLegacyDecisionSnapshot":
-        copied = type(self)(
-            model_version=self.model_version,
-            candidates=self.candidates,
-            final_priority=self.final_priority,
-            review_bindings=self.review_bindings,
-            notes=self.notes,
-        )
-        _authorize_current_decision_copy(self, copied)
-        return copied
-
-    def __deepcopy__(
-        self,
-        memo: dict[int, object] | None = None,
-    ) -> "_CurrentLegacyDecisionSnapshot":
-        memo = {} if memo is None else memo
-        authorize_copy = _copy_memo_is_clean(self, memo)
-        copied = type(self)(
-            model_version=_deepcopy_value(self.model_version, memo),
-            candidates=_deepcopy_value(self.candidates, memo),
-            final_priority=_deepcopy_value(self.final_priority, memo),
-            review_bindings=_deepcopy_value(self.review_bindings, memo),
-            notes=_deepcopy_value(self.notes, memo),
-        )
-        memo[id(self)] = copied
-        if authorize_copy:
-            _authorize_current_decision_copy(self, copied)
-        return copied
+    """Strict current decision domain value issued by explicit validation."""
 
 
 def _authority_digest(value: object) -> bytes:
@@ -315,28 +270,6 @@ def _has_current_decision_authority(value: object) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     return _has_authority(_DECISION_AUTHORITIES, value, digest)
-
-
-def _authorize_current_decision_copy(
-    source: object,
-    copied: object,
-) -> None:
-    if (
-        not _has_current_decision_authority(source)
-        or type(copied) is not _CurrentLegacyDecisionSnapshot
-    ):
-        return
-    try:
-        source_digest = _decision_authority_digest(source)
-        copied_digest = _decision_authority_digest(copied)
-    except (AttributeError, TypeError, ValueError):
-        return
-    if hmac.compare_digest(source_digest, copied_digest):
-        _register_authority(
-            _DECISION_AUTHORITIES,
-            copied,
-            copied_digest,
-        )
 
 
 class PregamePayload(BaseModel):
@@ -555,6 +488,49 @@ class _CurrentPregamePayload(BaseModel):
     legacy_decision: _CurrentLegacyDecision
     forecast_config_version: str
 
+    @field_validator("legacy_decision", mode="before")
+    @classmethod
+    def _require_raw_current_decision_mapping(cls, value: object) -> object:
+        if isinstance(value, _CurrentLegacyDecisionInput) or not isinstance(
+            value,
+            Mapping,
+        ):
+            raise ValueError(
+                "current legacy_decision must be supplied as a raw mapping"
+            )
+        normalized = dict(value)
+        for field_name in ("final_priority", "notes"):
+            field_value = normalized.get(field_name)
+            if isinstance(field_value, list):
+                normalized[field_name] = tuple(field_value)
+
+        review_bindings = normalized.get("review_bindings")
+        if isinstance(review_bindings, (list, tuple)):
+            normalized_bindings = []
+            for binding in review_bindings:
+                if not isinstance(binding, Mapping):
+                    normalized_bindings.append(binding)
+                    continue
+                binding_mapping = dict(binding)
+                principal_paths = binding_mapping.get("principal_paths")
+                if isinstance(principal_paths, (list, tuple)):
+                    normalized_paths = []
+                    for path in principal_paths:
+                        if not isinstance(path, Mapping):
+                            normalized_paths.append(path)
+                            continue
+                        path_mapping = dict(path)
+                        component_ids = path_mapping.get("component_ids")
+                        if isinstance(component_ids, list):
+                            path_mapping["component_ids"] = tuple(component_ids)
+                        normalized_paths.append(path_mapping)
+                    binding_mapping["principal_paths"] = tuple(
+                        normalized_paths
+                    )
+                normalized_bindings.append(binding_mapping)
+            normalized["review_bindings"] = tuple(normalized_bindings)
+        return normalized
+
     @field_validator("forecast_config_version")
     @classmethod
     def _require_config_version(cls, value: str) -> object:
@@ -583,36 +559,6 @@ class _CurrentPregamePayload(BaseModel):
         )
         return self
 
-    def __copy__(self) -> "_CurrentPregamePayload":
-        copied = super().__copy__()
-        _authorize_current_payload_copy(self, copied)
-        return copied
-
-    def __deepcopy__(
-        self,
-        memo: dict[int, object] | None = None,
-    ) -> "_CurrentPregamePayload":
-        authorize_copy = _copy_memo_is_clean(self, memo)
-        copied = super().__deepcopy__(memo)
-        if authorize_copy:
-            _authorize_current_decision_copy(
-                self.legacy_decision,
-                copied.legacy_decision,
-            )
-            _authorize_current_payload_copy(self, copied)
-        return copied
-
-    def model_copy(
-        self,
-        *,
-        update: Mapping[str, object] | None = None,
-        deep: bool = False,
-    ) -> "_CurrentPregamePayload":
-        copied = super().model_copy(update=update, deep=deep)
-        if update is not None:
-            _discard_authority(_PAYLOAD_AUTHORITIES, copied)
-        return copied
-
 
 def is_current_pregame_payload(value: object) -> bool:
     """Return whether value retains its validated current-runtime authority."""
@@ -635,37 +581,6 @@ def is_current_pregame_payload(value: object) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     return _has_authority(_PAYLOAD_AUTHORITIES, value, digest)
-
-
-def _authorize_current_payload_copy(
-    source: object,
-    copied: object,
-) -> None:
-    if (
-        not is_current_pregame_payload(source)
-        or type(copied) is not _CurrentPregamePayload
-        or not _has_current_decision_authority(copied.legacy_decision)
-    ):
-        return
-    try:
-        source_digest = _payload_authority_digest(
-            source.game_input,
-            source.legacy_decision,
-            source.forecast_config_version,
-        )
-        copied_digest = _payload_authority_digest(
-            copied.game_input,
-            copied.legacy_decision,
-            copied.forecast_config_version,
-        )
-    except (AttributeError, TypeError, ValueError):
-        return
-    if hmac.compare_digest(source_digest, copied_digest):
-        _register_authority(
-            _PAYLOAD_AUTHORITIES,
-            copied,
-            copied_digest,
-        )
 
 
 _CurrentPregamePayloadSource = (
@@ -722,6 +637,15 @@ class _CurrentPregameBundle(_PregameBundle):
     def _mark_current_validation(cls, value: str) -> object:
         return _issue_validation_event(value)
 
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _require_raw_current_payload_mapping(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "current payload must be supplied as a raw mapping"
+            )
+        return value
+
     @field_validator("payload", mode="after")
     @classmethod
     def _materialize_current_payload(
@@ -735,7 +659,7 @@ class _CurrentPregameBundle(_PregameBundle):
             return value
         if not isinstance(value, Mapping):
             raise ValueError(
-                "current payload must be a mapping or exact current payload"
+                "current payload must be supplied as a raw mapping"
             )
         if info.mode == "json":
             return _CurrentPregamePayload.model_validate_json(
@@ -771,37 +695,6 @@ class _CurrentPregameBundle(_PregameBundle):
         )
         return self
 
-    def __copy__(self) -> "_CurrentPregameBundle":
-        copied = super().__copy__()
-        _authorize_current_bundle_copy(self, copied)
-        return copied
-
-    def __deepcopy__(
-        self,
-        memo: dict[int, object] | None = None,
-    ) -> "_CurrentPregameBundle":
-        authorize_copy = _copy_memo_is_clean(self, memo)
-        copied = super().__deepcopy__(memo)
-        if authorize_copy:
-            _authorize_current_decision_copy(
-                self.payload.legacy_decision,
-                copied.payload.legacy_decision,
-            )
-            _authorize_current_payload_copy(self.payload, copied.payload)
-            _authorize_current_bundle_copy(self, copied)
-        return copied
-
-    def model_copy(
-        self,
-        *,
-        update: Mapping[str, object] | None = None,
-        deep: bool = False,
-    ) -> "_CurrentPregameBundle":
-        copied = super().model_copy(update=update, deep=deep)
-        if update is not None:
-            _discard_authority(_BUNDLE_AUTHORITIES, copied)
-        return copied
-
     @field_serializer("payload", return_type=_CurrentPregamePayload)
     def _serialize_current_payload(
         self,
@@ -832,20 +725,32 @@ def is_current_pregame_bundle(
     expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
     expected_stage: Literal["projected", "confirmed"],
 ) -> bool:
-    """Verify validation-event authority for the complete runtime graph.
+    """Verify raw-validation authority for the exact current object graph."""
 
-    Untouched shallow and deep copies receive deliberate identity-bound
-    authority from an authorized source. Any update-bearing Pydantic copy must
-    be revalidated from an explicit current-v2 mapping before normal execution;
-    caller-supplied deep-copy graph substitutions are likewise untrusted.
-    """
+    return (
+        _current_pregame_bundle_authority_fingerprint(
+            value,
+            expected_type=expected_type,
+            expected_stage=expected_stage,
+        )
+        is not None
+    )
+
+
+def _current_pregame_bundle_authority_fingerprint(
+    value: object,
+    *,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_stage: Literal["projected", "confirmed"],
+) -> bytes | None:
+    """Return the authenticated value fingerprint for an exact runtime graph."""
 
     if not _has_current_bundle_invariants(
         value,
         expected_type=expected_type,
         expected_stage=expected_stage,
     ):
-        return False
+        return None
     try:
         digest = _bundle_authority_digest(
             schema_version=value.schema_version,
@@ -856,8 +761,10 @@ def is_current_pregame_bundle(
             payload=value.payload,
         )
     except (AttributeError, TypeError, ValueError):
-        return False
-    return _has_authority(_BUNDLE_AUTHORITIES, value, digest)
+        return None
+    if not _has_authority(_BUNDLE_AUTHORITIES, value, digest):
+        return None
+    return digest
 
 
 def _has_current_bundle_invariants(
@@ -886,55 +793,6 @@ def _has_current_bundle_invariants(
         )
     except (AttributeError, TypeError, ValueError):
         return False
-
-
-def _authorize_current_bundle_copy(source: object, copied: object) -> None:
-    if type(source) is ProjectedBundle:
-        expected_type = ProjectedBundle
-        expected_stage = "projected"
-    elif type(source) is ConfirmedBundle:
-        expected_type = ConfirmedBundle
-        expected_stage = "confirmed"
-    else:
-        return
-    if (
-        not is_current_pregame_bundle(
-            source,
-            expected_type=expected_type,
-            expected_stage=expected_stage,
-        )
-        or not _has_current_bundle_invariants(
-            copied,
-            expected_type=expected_type,
-            expected_stage=expected_stage,
-        )
-    ):
-        return
-    try:
-        source_digest = _bundle_authority_digest(
-            schema_version=source.schema_version,
-            authority=source.authority,
-            stage=source.stage,
-            game_pk=source.game_pk,
-            created_at=source.created_at,
-            payload=source.payload,
-        )
-        copied_digest = _bundle_authority_digest(
-            schema_version=copied.schema_version,
-            authority=copied.authority,
-            stage=copied.stage,
-            game_pk=copied.game_pk,
-            created_at=copied.created_at,
-            payload=copied.payload,
-        )
-    except (AttributeError, TypeError, ValueError):
-        return
-    if hmac.compare_digest(source_digest, copied_digest):
-        _register_authority(
-            _BUNDLE_AUTHORITIES,
-            copied,
-            copied_digest,
-        )
 
 
 class HistoricalRelaxedProjectedBundleV1(_HistoricalPregameBundleV1):

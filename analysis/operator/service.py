@@ -3,6 +3,7 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 import hashlib
+import hmac
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeVar
@@ -68,6 +69,7 @@ from .bundles import (
     DEFAULT_BUNDLE_ROOT,
     ManagedBundleCopy,
     ReplayOnlyPregameBundle,
+    bundle_canonical_bytes,
     intrinsic_capture_key,
     load_historical_managed_bundle,
     persist_managed_bundle,
@@ -96,7 +98,9 @@ from .schemas import (
     HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     ReviewBundle,
-    is_current_pregame_bundle,
+    _current_pregame_bundle_authority_fingerprint,
+    parse_confirmed_bundle_json,
+    parse_projected_bundle_json,
 )
 
 
@@ -230,6 +234,55 @@ def _open_ledger(path: str | Path) -> LedgerStore:
         "unable to open shadow ledger",
         lambda: LedgerStore(path),
     )
+
+
+def _authenticated_current_snapshot(
+    bundle: _Bundle,
+    *,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_stage: str,
+    parser: Callable[[bytes], _Bundle],
+) -> _Bundle:
+    error = TypeError(
+        "normal pregame runner requires a strict current bundle: "
+        f"{expected_type.__name__}"
+    )
+    before = _current_pregame_bundle_authority_fingerprint(
+        bundle,
+        expected_type=expected_type,
+        expected_stage=expected_stage,
+    )
+    if before is None:
+        raise error
+
+    try:
+        snapshot = parser(bundle_canonical_bytes(bundle))
+    except (
+        AttributeError,
+        BundleValidationError,
+        TypeError,
+        ValueError,
+    ) as cause:
+        raise error from cause
+
+    after = _current_pregame_bundle_authority_fingerprint(
+        bundle,
+        expected_type=expected_type,
+        expected_stage=expected_stage,
+    )
+    snapshot_fingerprint = _current_pregame_bundle_authority_fingerprint(
+        snapshot,
+        expected_type=expected_type,
+        expected_stage=expected_stage,
+    )
+    if (
+        after is None
+        or snapshot_fingerprint is None
+        or not hmac.compare_digest(before, after)
+        or not hmac.compare_digest(before, snapshot_fingerprint)
+    ):
+        raise error
+    return snapshot
 
 
 def _require_stage(bundle: _Bundle, expected_stage: str) -> None:
@@ -931,17 +984,14 @@ def run_projected(
 ) -> PregameRunResult:
     """Append or replay one projected-lineup shadow forecast."""
 
-    if not is_current_pregame_bundle(
+    snapshot = _authenticated_current_snapshot(
         bundle,
         expected_type=ProjectedBundle,
         expected_stage="projected",
-    ):
-        raise TypeError(
-            "normal pregame runner requires a strict current bundle: "
-            "ProjectedBundle"
-        )
+        parser=parse_projected_bundle_json,
+    )
     return _run_pregame(
-        bundle,
+        snapshot,
         expected_stage="projected",
         ledger_path=ledger_path,
         bundle_root=bundle_root,
@@ -958,17 +1008,14 @@ def run_confirmed(
 ) -> PregameRunResult:
     """Append or replay one confirmed-lineup shadow forecast."""
 
-    if not is_current_pregame_bundle(
+    snapshot = _authenticated_current_snapshot(
         bundle,
         expected_type=ConfirmedBundle,
         expected_stage="confirmed",
-    ):
-        raise TypeError(
-            "normal pregame runner requires a strict current bundle: "
-            "ConfirmedBundle"
-        )
+        parser=parse_confirmed_bundle_json,
+    )
     return _run_pregame(
-        bundle,
+        snapshot,
         expected_stage="confirmed",
         ledger_path=ledger_path,
         bundle_root=bundle_root,

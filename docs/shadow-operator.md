@@ -30,6 +30,8 @@ Shadow Operator는 외부에서 준비한 버전 고정 JSON 번들을 받아 �
 
 각 버전 번들은 역할이 섞이지 않습니다. `projected` 번들을 `confirmed` 명령에 넘기는 식의 stage/type 불일치는 실패합니다. 원본 MLB, RotoWire, Savant/Statcast, market 데이터를 가져와 domain 값과 provenance로 정규화하는 작업은 계속 외부 또는 수동 책임입니다. 전체 schema를 문서에 복제하지 않으며 실제 계약은 `analysis/operator/schemas.py`와 domain dataclass가 기준입니다.
 
+Fresh pregame 실행 객체는 raw mapping 또는 JSON을 public `ProjectedBundle`/`ConfirmedBundle` validation 경로로 검증해 반환된 정확한 객체 graph만 지원합니다. `model_construct`, `copy.copy`, `copy.deepcopy`, `model_copy`로 만든 bundle/payload/decision graph와 미리 만든 nested decision input은 새 실행 권한을 이어받지 않습니다. 별도 실행 객체가 필요하면 원본을 canonical current JSON으로 serialize한 뒤 public parser로 다시 검증해야 합니다. Runner는 caller graph의 권한과 불변식을 확인하고 같은 canonical bytes를 strict parse한 내부 snapshot만 `_run_pregame`에 전달하므로 snapshot 생성 뒤 caller 변경은 실행이나 저장 결과에 반영되지 않습니다. 임의의 private `object.__setattr__` 또는 `__class__` 변경은 지원 caller API가 아닙니다.
+
 모든 schema-v1 `projected`/`confirmed` shape은 candidate compatibility 필드가 없는 relaxed v1과 필드가 있는 strict v1 모두 역사적 exact replay 전용입니다. 입력은 설정된 관리 번들 루트의 인증된 불변 파일이어야 하고 ledger에 정확히 일치하는 capture, forecast, link가 이미 있어야 합니다. 관리 루트 밖의 v1, exact ledger 관계가 없는 v1, 아직 실행하지 않은 pending v1은 fresh 실행으로 승격되지 않습니다. Pending v1은 schema v2/current 번들로 다시 생성해야 하며, 거부 시 ledger나 관리 번들 bytes를 쓰거나 바꾸지 않습니다.
 
 고정 MLB 모델 버전 `2026-08-03`은 번들 schema version과 독립적입니다. Schema v2 전환은 MLB 점수화, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority, Shadow의 비권위 비교 모드를 변경하지 않습니다.
