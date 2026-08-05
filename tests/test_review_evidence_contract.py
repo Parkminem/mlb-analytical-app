@@ -171,6 +171,23 @@ def test_playable_ml_without_a_bound_starter_path_is_capped() -> None:
     assert _admission_score(assessment) == 71
 
 
+def test_assessment_cannot_cap_a_different_priority_market() -> None:
+    assessment = assess_priority_evidence_contract(
+        _candidate("ml"),
+        _binding("ml"),
+        _market(MarketType.ML, "away"),
+    )
+
+    with pytest.raises(ValueError, match="evidence_assessment_market_mismatch"):
+        evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="over",
+                proposed_score=80,
+                evidence_assessment=assessment,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("path", "selected_side"),
     (
@@ -228,6 +245,45 @@ def test_high_total_over_with_one_scoring_side_is_capped() -> None:
     assert assessment.reason_codes == (
         "missing_high_total_two_sided_over_evidence",
     )
+
+
+def test_full_total_requires_over_or_under_selected_side() -> None:
+    with pytest.raises(ValueError, match="full_total_selected_side"):
+        assess_priority_evidence_contract(
+            _candidate("full_total"),
+            _binding("full_total"),
+            _market(MarketType.FULL_TOTAL, "away", line=9.0),
+        )
+
+
+def test_contract_validates_cross_path_compatibility_before_assessment() -> None:
+    suppression = _starter_suppression("away")
+    collapse = _starter_collapse("away")
+    candidate = _candidate(
+        "ml",
+        paths=frozenset({suppression.evidence_path, collapse.evidence_path}),
+    )
+
+    with pytest.raises(ValueError, match="cannot target the same pitching side"):
+        assess_priority_evidence_contract(
+            candidate,
+            _binding("ml", suppression, collapse),
+            _market(MarketType.ML, "away"),
+        )
+
+
+def test_contract_rejects_duck_typed_review_binding() -> None:
+    class ImpostorBinding:
+        legacy_market = "ml"
+        market_key = "market:1"
+        principal_paths: tuple[PrincipalPathBinding, ...] = ()
+
+    with pytest.raises(TypeError, match="CandidateReviewBinding"):
+        assess_priority_evidence_contract(
+            _candidate("ml"),
+            ImpostorBinding(),
+            _market(MarketType.ML, "away"),
+        )
 
 
 @pytest.mark.parametrize(

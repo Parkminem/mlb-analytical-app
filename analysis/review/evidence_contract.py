@@ -27,10 +27,25 @@ _SCORING_SIDES = frozenset(("away", "home"))
 class PriorityEvidenceAssessment:
     """Immutable, negative-only admission result from frozen evidence."""
 
+    market_key: str
+    market_type: MarketType
+    selected_side: str
+    priority_market: str
     score_cap: int | None = None
     reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.market_key, str) or not self.market_key:
+            raise ValueError("market_key must be a nonempty string")
+        if not isinstance(self.market_type, MarketType):
+            raise ValueError("market_type must be MarketType")
+        if not isinstance(self.selected_side, str) or not self.selected_side:
+            raise ValueError("selected_side must be a nonempty string")
+        if self.priority_market != _priority_market(
+            self.market_type,
+            self.selected_side,
+        ):
+            raise ValueError("priority_market must match market identity")
         if self.score_cap is not None and (
             isinstance(self.score_cap, bool)
             or not isinstance(self.score_cap, int)
@@ -50,16 +65,19 @@ def _validate_identity(
     binding: object,
     market_input: object,
 ) -> tuple[PriorityMarketCandidate, tuple[PrincipalPathBinding, ...], MarketInput]:
+    # Import locally because shadow eventually consumes this helper.
+    from analysis.shadow import CandidateReviewBinding
+
     if not isinstance(candidate, PriorityMarketCandidate):
         raise TypeError("candidate must be PriorityMarketCandidate")
+    if not isinstance(binding, CandidateReviewBinding):
+        raise TypeError("binding must be CandidateReviewBinding")
     if not isinstance(market_input, MarketInput):
         raise TypeError("market_input must be MarketInput")
 
-    legacy_market = getattr(binding, "legacy_market", None)
-    market_key = getattr(binding, "market_key", None)
-    principal_paths = getattr(binding, "principal_paths", None)
-    if not isinstance(legacy_market, str) or not isinstance(market_key, str):
-        raise TypeError("binding must provide canonical market identity")
+    legacy_market = binding.legacy_market
+    market_key = binding.market_key
+    principal_paths = binding.principal_paths
     if not isinstance(principal_paths, tuple) or any(
         not isinstance(path, PrincipalPathBinding) for path in principal_paths
     ):
@@ -70,6 +88,11 @@ def _validate_identity(
         raise ValueError("market_key_mismatch")
     if candidate.market != market_input.market_type.value:
         raise ValueError("market_type_mismatch")
+    if (
+        market_input.market_type is MarketType.FULL_TOTAL
+        and market_input.selected_side not in {"over", "under"}
+    ):
+        raise ValueError("full_total_selected_side_must_be_over_or_under")
     if not isinstance(candidate.evidence_paths, frozenset) or any(
         not isinstance(path, PriorityEvidencePath) for path in candidate.evidence_paths
     ):
@@ -79,6 +102,42 @@ def _validate_identity(
     if not isinstance(candidate.decision_rating, str):
         raise ValueError("candidate_decision_rating_must_be_a_string")
     return candidate, principal_paths, market_input
+
+
+def _priority_market(market_type: MarketType, selected_side: str) -> str:
+    if market_type is MarketType.F5_SIDE:
+        return "f5"
+    if market_type is MarketType.ML:
+        return "ml"
+    if market_type is MarketType.PLUS_1_5:
+        return "plus_1_5"
+    if market_type in {MarketType.F5_TOTAL, MarketType.FULL_TOTAL}:
+        if market_type is MarketType.FULL_TOTAL and selected_side not in {
+            "over",
+            "under",
+        }:
+            raise ValueError("full_total_selected_side_must_be_over_or_under")
+        return selected_side
+    raise ValueError("unsupported market_type")
+
+
+def _assessment(
+    market_input: MarketInput,
+    *,
+    score_cap: int | None = None,
+    reason_codes: tuple[str, ...] = (),
+) -> PriorityEvidenceAssessment:
+    return PriorityEvidenceAssessment(
+        market_key=market_input.market_key,
+        market_type=market_input.market_type,
+        selected_side=market_input.selected_side,
+        priority_market=_priority_market(
+            market_input.market_type,
+            market_input.selected_side,
+        ),
+        score_cap=score_cap,
+        reason_codes=reason_codes,
+    )
 
 
 def _is_playable_non_pass(candidate: PriorityMarketCandidate) -> bool:
@@ -165,15 +224,17 @@ def assess_priority_evidence_contract(
         binding,
         market_input,
     )
+    validate_principal_path_bindings(market_input.market_type, principal_paths)
     if not _is_playable_non_pass(candidate):
-        return PriorityEvidenceAssessment()
+        return _assessment(market_input)
 
     if market_input.market_type is MarketType.ML and not _ml_has_starter_path(
         candidate,
         principal_paths,
         market_input.selected_side,
     ):
-        return PriorityEvidenceAssessment(
+        return _assessment(
+            market_input,
             score_cap=_ML_STARTER_EVIDENCE_CAP,
             reason_codes=("missing_ml_starter_evidence",),
         )
@@ -185,9 +246,10 @@ def assess_priority_evidence_contract(
         and market_input.line >= 9.0
         and _full_total_scoring_sides(candidate, principal_paths) != _SCORING_SIDES
     ):
-        return PriorityEvidenceAssessment(
+        return _assessment(
+            market_input,
             score_cap=_HIGH_TOTAL_TWO_SIDED_OVER_CAP,
             reason_codes=("missing_high_total_two_sided_over_evidence",),
         )
 
-    return PriorityEvidenceAssessment()
+    return _assessment(market_input)

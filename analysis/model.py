@@ -525,6 +525,8 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
                 "evidence_assessment must be PriorityEvidenceAssessment or None"
             )
         if context.evidence_assessment.score_cap is not None:
+            if context.market != context.evidence_assessment.priority_market:
+                raise ValueError("evidence_assessment_market_mismatch")
             score = min(score, context.evidence_assessment.score_cap)
             notes.extend(context.evidence_assessment.reason_codes)
 
