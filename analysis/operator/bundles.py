@@ -25,6 +25,8 @@ from .fdio import (
 )
 from .schemas import (
     ConfirmedBundle,
+    HistoricalConfirmedBundle,
+    HistoricalProjectedBundle,
     ProjectedBundle,
     ReviewBundle,
     bundle_stage_from_json,
@@ -76,7 +78,7 @@ class ManagedBundleCopy:
 class ReplayOnlyPregameBundle:
     """Authenticated pre-change data for the path-based replay service only."""
 
-    bundle: ProjectedBundle | ConfirmedBundle
+    bundle: HistoricalProjectedBundle | HistoricalConfirmedBundle
     managed_bundle: ManagedBundleCopy
 
 

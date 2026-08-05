@@ -86,7 +86,13 @@ from .reporting import (
     build_report_mapping,
     write_calibration_reports,
 )
-from .schemas import ConfirmedBundle, ProjectedBundle, ReviewBundle
+from .schemas import (
+    ConfirmedBundle,
+    HistoricalConfirmedBundle,
+    HistoricalProjectedBundle,
+    ProjectedBundle,
+    ReviewBundle,
+)
 
 
 DEFAULT_LEDGER_PATH = (
@@ -94,6 +100,12 @@ DEFAULT_LEDGER_PATH = (
 )
 
 _Bundle = ProjectedBundle | ConfirmedBundle
+_ReplayBundle = (
+    ProjectedBundle
+    | ConfirmedBundle
+    | HistoricalProjectedBundle
+    | HistoricalConfirmedBundle
+)
 _T = TypeVar("_T")
 _HEAD_CAS_MAX_ATTEMPTS = 3
 _REPORT_PUBLICATION_MAX_ATTEMPTS = 3
@@ -224,7 +236,7 @@ def _require_stage(bundle: _Bundle, expected_stage: str) -> None:
         )
 
 
-def _validate_game(bundle: _Bundle, expected_stage: str) -> None:
+def _validate_game(bundle: _ReplayBundle, expected_stage: str) -> None:
     game = bundle.payload.game_input
     _pregame_operation(lambda: validate_pregame_input(game))
 
@@ -240,7 +252,7 @@ def _validate_game(bundle: _Bundle, expected_stage: str) -> None:
         )
 
 
-def _capture_command(bundle: _Bundle) -> CaptureCommand:
+def _capture_command(bundle: _ReplayBundle) -> CaptureCommand:
     return _pregame_operation(
         lambda: build_shadow_capture_command(bundle.payload.game_input)
     )
@@ -403,7 +415,7 @@ def _capture_matches_command(
 def _forecast_outputs_match(
     forecast: ForecastRecord,
     link: CaptureForecastLink,
-    bundle: _Bundle,
+    bundle: _ReplayBundle,
     config: SimulationConfig,
     forecast_run_id: str,
 ) -> bool:
@@ -459,7 +471,7 @@ def _forecast_outputs_match(
 
 def _exact_pregame_replay(
     lookup: PregameLookup,
-    bundle: _Bundle,
+    bundle: _ReplayBundle,
     *,
     expected_stage: str,
     command: CaptureCommand,
@@ -501,7 +513,7 @@ def _exact_pregame_replay(
 
 def _existing_exact_pregame_replay(
     ledger_path: str | Path,
-    bundle: _Bundle,
+    bundle: _ReplayBundle,
     *,
     expected_stage: str,
     command: CaptureCommand,
@@ -912,7 +924,9 @@ def _replay_historical_pregame(
     path: str | Path,
     *,
     expected_stage: str,
-    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_type: (
+        type[HistoricalProjectedBundle] | type[HistoricalConfirmedBundle]
+    ),
     ledger_path: str | Path,
     bundle_root: str | Path,
     registry_root: str | Path | None,
@@ -983,7 +997,7 @@ def replay_historical_projected(
     return _replay_historical_pregame(
         path,
         expected_stage="projected",
-        expected_type=ProjectedBundle,
+        expected_type=HistoricalProjectedBundle,
         ledger_path=ledger_path,
         bundle_root=bundle_root,
         registry_root=registry_root,
@@ -1002,7 +1016,7 @@ def replay_historical_confirmed(
     return _replay_historical_pregame(
         path,
         expected_stage="confirmed",
-        expected_type=ConfirmedBundle,
+        expected_type=HistoricalConfirmedBundle,
         ledger_path=ledger_path,
         bundle_root=bundle_root,
         registry_root=registry_root,

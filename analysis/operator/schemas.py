@@ -86,6 +86,22 @@ class ConfirmedBundle(_PregameBundle):
     stage: Literal["confirmed"]
 
 
+class HistoricalProjectedBundle(_PregameBundle):
+    """Runtime-distinct representation of a pre-field projected bundle."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: Literal["projected"]
+
+
+class HistoricalConfirmedBundle(_PregameBundle):
+    """Runtime-distinct representation of a pre-field confirmed bundle."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: Literal["confirmed"]
+
+
 class ReviewPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -154,6 +170,8 @@ class ReviewBundle(_BundleEnvelope):
 
 _PROJECTED_ADAPTER = TypeAdapter(ProjectedBundle)
 _CONFIRMED_ADAPTER = TypeAdapter(ConfirmedBundle)
+_HISTORICAL_PROJECTED_ADAPTER = TypeAdapter(HistoricalProjectedBundle)
+_HISTORICAL_CONFIRMED_ADAPTER = TypeAdapter(HistoricalConfirmedBundle)
 _REVIEW_ADAPTER = TypeAdapter(ReviewBundle)
 _BundleType = TypeVar("_BundleType", bound=BaseModel)
 _AuditPresenceCheck = Callable[[object], None]
@@ -574,12 +592,12 @@ def parse_review_bundle_json(
 
 def parse_historical_projected_bundle_json(
     raw: str | bytes | bytearray,
-) -> ProjectedBundle:
+) -> HistoricalProjectedBundle:
     """Parse a persisted pre-field schema-v1 projected bundle."""
 
     return _parse_bundle_json(
         raw,
-        _PROJECTED_ADAPTER,
+        _HISTORICAL_PROJECTED_ADAPTER,
         _require_historical_pregame_audit_fields,
         _PROJECTED_TRUSTED_FIELDS,
         _PROJECTED_DYNAMIC_MAPPING_FIELDS,
@@ -588,12 +606,12 @@ def parse_historical_projected_bundle_json(
 
 def parse_historical_confirmed_bundle_json(
     raw: str | bytes | bytearray,
-) -> ConfirmedBundle:
+) -> HistoricalConfirmedBundle:
     """Parse a persisted pre-field schema-v1 confirmed bundle."""
 
     return _parse_bundle_json(
         raw,
-        _CONFIRMED_ADAPTER,
+        _HISTORICAL_CONFIRMED_ADAPTER,
         _require_historical_pregame_audit_fields,
         _CONFIRMED_TRUSTED_FIELDS,
         _CONFIRMED_DYNAMIC_MAPPING_FIELDS,

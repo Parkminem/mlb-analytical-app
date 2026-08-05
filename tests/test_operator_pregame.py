@@ -1057,6 +1057,60 @@ def test_normal_runner_rejects_historical_artifact(
 
 
 @pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+def test_normal_runner_rejects_historical_parsed_bundle(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+) -> None:
+    _, bundles = _run_paths(tmp_path)
+    empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = json.loads(bundle_canonical_bytes(bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    historical_artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+    assert isinstance(historical_artifact, ReplayOnlyPregameBundle)
+    managed_files_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(
+            historical_artifact.bundle,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+
+    assert not empty_ledger.exists()
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == managed_files_before
+
+
+@pytest.mark.parametrize(
     ("stage", "runner", "historical_replay", "game_factory"),
     (
         (
