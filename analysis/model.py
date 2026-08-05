@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from analysis.review.evidence_contract import PriorityEvidenceAssessment
 
 
 HIGH_LEVERAGE_ROLES = {"closer", "setup", "high"}
@@ -343,6 +348,7 @@ class PriorityAdmissionContext:
     lineup_neutral_slots: int = 0
     lower_order_or_walk_path: bool = True
     bullpen_over_path: bool = False
+    evidence_assessment: PriorityEvidenceAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -510,6 +516,17 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
     if discontinuous_over_path:
         score = min(score, 69)
         notes.append("discontinuous lineup lacks an independent over path")
+
+    if context.evidence_assessment is not None:
+        from analysis.review.evidence_contract import PriorityEvidenceAssessment
+
+        if not isinstance(context.evidence_assessment, PriorityEvidenceAssessment):
+            raise TypeError(
+                "evidence_assessment must be PriorityEvidenceAssessment or None"
+            )
+        if context.evidence_assessment.score_cap is not None:
+            score = min(score, context.evidence_assessment.score_cap)
+            notes.extend(context.evidence_assessment.reason_codes)
 
     if score >= 80:
         tier = "primary"
