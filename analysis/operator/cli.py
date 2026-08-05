@@ -1,6 +1,7 @@
 """Typer command boundary for the three-stage shadow operator workflow."""
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -15,6 +16,7 @@ from .bundles import (
     load_historical_managed_bundle,
 )
 from .errors import (
+    BundleValidationError,
     OperatorError,
     OperatorPartialProgress,
     OperatorPreconditionError,
@@ -25,6 +27,8 @@ from .service import (
     DEFAULT_REPORT_DIR,
     PregameRunResult,
     ReviewRunResult,
+    replay_historical_confirmed,
+    replay_historical_projected,
     run_confirmed,
     run_projected,
     run_review,
@@ -46,6 +50,20 @@ _BundleT = TypeVar(
     ReviewBundle,
 )
 _SummaryRows = Iterable[tuple[str, object]]
+
+
+@dataclass(frozen=True)
+class _PregameBundleLoad:
+    """A strict current bundle or an authenticated historical source path."""
+
+    bundle: ProjectedBundle | ConfirmedBundle | None
+    historical_path: Path | None
+
+    def __post_init__(self) -> None:
+        if (self.bundle is None) == (self.historical_path is None):
+            raise ValueError(
+                "pregame load must contain exactly one dispatch target"
+            )
 
 
 def _scalar_text(value: object) -> str:
@@ -146,18 +164,9 @@ def _load_stage_bundle(
     expected_type: type[_BundleT],
     expected_stage: str,
     bundle_root: Path,
-) -> _BundleT | ReplayOnlyPregameBundle:
-    resolved_path = path.expanduser().resolve(strict=False)
-    resolved_root = bundle_root.expanduser().resolve(strict=False)
-    if resolved_path.parent.parent == resolved_root:
-        bundle = load_historical_managed_bundle(path, root=bundle_root)
-    else:
-        bundle = load_bundle(path)
-    validated_bundle = (
-        bundle.bundle
-        if isinstance(bundle, ReplayOnlyPregameBundle)
-        else bundle
-    )
+) -> _BundleT:
+    del bundle_root
+    validated_bundle = load_bundle(path)
     if (
         type(validated_bundle) is not expected_type
         or validated_bundle.stage != expected_stage
@@ -167,7 +176,41 @@ def _load_stage_bundle(
             f"{expected_stage} requires {expected_type.__name__} with stage "
             f"{expected_stage!r}"
         )
-    return bundle
+    return validated_bundle
+
+
+def _load_pregame_bundle(
+    path: Path,
+    *,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_stage: str,
+    bundle_root: Path,
+) -> _PregameBundleLoad:
+    resolved_path = path.expanduser().resolve(strict=False)
+    resolved_root = bundle_root.expanduser().resolve(strict=False)
+    try:
+        bundle = _load_stage_bundle(
+            path,
+            expected_type=expected_type,
+            expected_stage=expected_stage,
+            bundle_root=bundle_root,
+        )
+    except BundleValidationError:
+        if resolved_path.parent.parent != resolved_root:
+            raise
+        historical = load_historical_managed_bundle(path, root=bundle_root)
+        if (
+            not isinstance(historical, ReplayOnlyPregameBundle)
+            or historical.bundle.stage != expected_stage
+        ):
+            raise OperatorPreconditionError(
+                "historical replay stage/type mismatch"
+            )
+        return _PregameBundleLoad(
+            bundle=None,
+            historical_path=resolved_path,
+        )
+    return _PregameBundleLoad(bundle=bundle, historical_path=None)
 
 
 def _print_pregame(result: PregameRunResult) -> None:
@@ -284,17 +327,24 @@ def projected(
     """Record or replay a projected-lineup shadow forecast."""
 
     def execute() -> None:
-        loaded = _load_stage_bundle(
+        loaded = _load_pregame_bundle(
             bundle,
             expected_type=ProjectedBundle,
             expected_stage="projected",
             bundle_root=bundle_root,
         )
-        result = run_projected(
-            loaded,
-            ledger_path=ledger,
-            bundle_root=bundle_root,
-        )
+        if loaded.historical_path is not None:
+            result = replay_historical_projected(
+                loaded.historical_path,
+                ledger_path=ledger,
+                bundle_root=bundle_root,
+            )
+        else:
+            result = run_projected(
+                loaded.bundle,
+                ledger_path=ledger,
+                bundle_root=bundle_root,
+            )
         _print_pregame(result)
 
     _run_at_cli_boundary(execute)
@@ -317,17 +367,24 @@ def confirmed(
     """Record or replay a confirmed-lineup shadow forecast."""
 
     def execute() -> None:
-        loaded = _load_stage_bundle(
+        loaded = _load_pregame_bundle(
             bundle,
             expected_type=ConfirmedBundle,
             expected_stage="confirmed",
             bundle_root=bundle_root,
         )
-        result = run_confirmed(
-            loaded,
-            ledger_path=ledger,
-            bundle_root=bundle_root,
-        )
+        if loaded.historical_path is not None:
+            result = replay_historical_confirmed(
+                loaded.historical_path,
+                ledger_path=ledger,
+                bundle_root=bundle_root,
+            )
+        else:
+            result = run_confirmed(
+                loaded.bundle,
+                ledger_path=ledger,
+                bundle_root=bundle_root,
+            )
         _print_pregame(result)
 
     _run_at_cli_boundary(execute)

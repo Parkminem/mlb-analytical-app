@@ -17,7 +17,7 @@ from analysis.forecasting.validation import (
     PregameTimingError,
 )
 from analysis.ledger import LedgerStore
-from analysis.operator.bundles import ManagedBundleCopy
+from analysis.operator.bundles import ManagedBundleCopy, ReplayOnlyPregameBundle
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorIOError,
@@ -113,7 +113,7 @@ def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:
     return parse_review_bundle_json(_raw(review_bundle_mapping()))
 
 
-def test_stage_loader_uses_historical_reader_only_for_managed_path(
+def test_pregame_loader_classifies_managed_pre_change_path_as_historical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,25 +128,163 @@ def test_stage_loader_uses_historical_reader_only_for_managed_path(
         cli_module,
         "load_bundle",
         lambda path: (_ for _ in ()).throw(
-            AssertionError("managed artifact must not use fresh parser")
+            BundleValidationError("pre-change managed artifact")
         ),
     )
     monkeypatch.setattr(
         cli_module,
         "load_historical_managed_bundle",
-        lambda path, *, root: calls.append((path, root)) or expected,
+        lambda path, *, root: calls.append((path, root))
+        or ReplayOnlyPregameBundle(
+            bundle=expected,
+            managed_bundle=ManagedBundleCopy(
+                path=managed_path,
+                bundle_hash="historical-bundle-sha256",
+                replayed=True,
+            ),
+        ),
         raising=False,
     )
 
-    loaded = cli_module._load_stage_bundle(
+    loaded = cli_module._load_pregame_bundle(
         managed_path,
         expected_type=ProjectedBundle,
         expected_stage="projected",
         bundle_root=bundle_root,
     )
 
-    assert loaded is expected
+    assert loaded.bundle is None
+    assert loaded.historical_path == managed_path.resolve()
     assert calls == [(managed_path, bundle_root)]
+
+
+@pytest.mark.parametrize("command", ("projected", "confirmed"))
+def test_historical_managed_path_dispatches_only_to_replay_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    managed_path = bundle_root / "900001" / f"{command}-v1-deadbeefdeadbeef.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text("historical", encoding="utf-8")
+    pregame_result = _pregame_result(command, replayed=True)
+    calls: list[tuple[Path, Path, Path]] = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bundle",
+        lambda path: (_ for _ in ()).throw(
+            BundleValidationError("pre-change managed artifact")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        lambda path, *, root: ReplayOnlyPregameBundle(
+            bundle=_bundle(command),
+            managed_bundle=ManagedBundleCopy(
+                path=managed_path,
+                bundle_hash="historical-bundle-sha256",
+                replayed=True,
+            ),
+        ),
+    )
+
+    def fake_historical(
+        path: Path,
+        *,
+        ledger_path: Path,
+        bundle_root: Path,
+        registry_root: Path | None = None,
+    ) -> _PregameResult:
+        assert registry_root is None
+        calls.append((path, ledger_path, bundle_root))
+        return pregame_result
+
+    def forbidden_normal(*args: object, **kwargs: object) -> _PregameResult:
+        del args, kwargs
+        raise AssertionError("historical input must not reach normal runner")
+
+    monkeypatch.setattr(
+        cli_module,
+        f"replay_historical_{command}",
+        fake_historical,
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module, f"run_{command}", forbidden_normal)
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--bundle",
+            str(managed_path),
+            "--ledger",
+            str(ledger_path),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(managed_path.resolve(), ledger_path, bundle_root)]
+
+
+@pytest.mark.parametrize("command", ("projected", "confirmed"))
+def test_strict_current_path_dispatches_only_to_normal_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    current_path = bundle_root / "900001" / f"{command}-v1-deadbeefdeadbeef.json"
+    current_path.parent.mkdir(parents=True)
+    current_path.write_text("strict", encoding="utf-8")
+    strict_bundle = _bundle(command)
+    pregame_result = _pregame_result(command, replayed=False)
+    calls: list[tuple[object, Path, Path]] = []
+
+    monkeypatch.setattr(cli_module, "load_bundle", lambda path: strict_bundle)
+
+    def forbidden_historical(*args: object, **kwargs: object) -> _PregameResult:
+        del args, kwargs
+        raise AssertionError("strict input must not reach historical replay")
+
+    def fake_normal(
+        bundle: object,
+        *,
+        ledger_path: Path,
+        bundle_root: Path,
+    ) -> _PregameResult:
+        calls.append((bundle, ledger_path, bundle_root))
+        return pregame_result
+
+    monkeypatch.setattr(
+        cli_module,
+        f"replay_historical_{command}",
+        forbidden_historical,
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module, f"run_{command}", fake_normal)
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--bundle",
+            str(current_path),
+            "--ledger",
+            str(ledger_path),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(strict_bundle, ledger_path, bundle_root)]
 
 
 def _pregame_result(command: str, *, replayed: bool) -> _PregameResult:
