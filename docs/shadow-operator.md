@@ -10,15 +10,29 @@ Shadow Operator는 외부에서 준비한 버전 고정 JSON 번들을 받아 �
 | "확정 라인업으로 다시 기록하고 동결해줘" | `confirmed` | `.venv/bin/python -m analysis.operator confirmed --bundle <path>` |
 | "공식 결과로 복기하고 보고서를 갱신해줘" | `review` | `.venv/bin/python -m analysis.operator review --bundle <path>` |
 
-세 명령 모두 strict JSON bundle만 받습니다. 현재 계약은 `schema_version: 1`이며 알 수 없는 필드, 잘못된 stage, 타입 강제 변환, 시간대 없는 timestamp를 거부합니다.
+세 명령 모두 strict JSON bundle만 받으며 알 수 없는 필드, 잘못된 stage, 타입 강제 변환, 시간대 없는 timestamp를 거부합니다. 새 `projected`와 `confirmed` 실행은 JSON integer `schema_version: 2`와 명시적인 `authority: "current"`를 모두 요구합니다. `review` 계약은 `schema_version: 1`로 유지됩니다.
+
+새 확정 라인업 pregame envelope의 축약 예시는 다음과 같습니다. 예상 라인업은 `stage`만 `projected`로 바꿉니다.
+
+```json
+{
+  "schema_version": 2,
+  "authority": "current",
+  "stage": "confirmed"
+}
+```
 
 ## 번들 역할
 
-- `projected`: 적어도 한 팀이 예상 라인업인 완전한 `game_input`, 동결된 `legacy_decision`, `forecast_config_version`을 담습니다. `captured_at`은 첫 투구 전이어야 합니다.
-- `confirmed`: 양 팀이 확정 라인업인 같은 종류의 pregame payload를 담습니다. 성공한 capture, forecast, link가 경기 후 review의 동결 기준입니다.
-- `review`: confirmed 성공 출력의 정확한 세 ID, 공식 MLB 결과 revision, 선택적 closing observation을 담습니다. 새 pregame 입력이나 forecast를 받지 않습니다.
+- `projected`: schema-v2/current envelope에 적어도 한 팀이 예상 라인업인 완전한 `game_input`, 동결된 `legacy_decision`, `forecast_config_version`을 담습니다. `captured_at`은 첫 투구 전이어야 합니다.
+- `confirmed`: schema-v2/current envelope에 양 팀이 확정 라인업인 같은 종류의 pregame payload를 담습니다. 성공한 capture, forecast, link가 경기 후 review의 동결 기준입니다.
+- `review`: schema v1을 유지하며 confirmed 성공 출력의 정확한 세 ID, 공식 MLB 결과 revision, 선택적 closing observation을 담습니다. 새 pregame 입력이나 forecast를 받지 않습니다.
 
 각 버전 번들은 역할이 섞이지 않습니다. `projected` 번들을 `confirmed` 명령에 넘기는 식의 stage/type 불일치는 실패합니다. 원본 MLB, RotoWire, Savant/Statcast, market 데이터를 가져와 domain 값과 provenance로 정규화하는 작업은 계속 외부 또는 수동 책임입니다. 전체 schema를 문서에 복제하지 않으며 실제 계약은 `analysis/operator/schemas.py`와 domain dataclass가 기준입니다.
+
+모든 schema-v1 `projected`/`confirmed` shape은 candidate compatibility 필드가 없는 relaxed v1과 필드가 있는 strict v1 모두 역사적 exact replay 전용입니다. 입력은 설정된 관리 번들 루트의 인증된 불변 파일이어야 하고 ledger에 정확히 일치하는 capture, forecast, link가 이미 있어야 합니다. 관리 루트 밖의 v1, exact ledger 관계가 없는 v1, 아직 실행하지 않은 pending v1은 fresh 실행으로 승격되지 않습니다. Pending v1은 schema v2/current 번들로 다시 생성해야 하며, 거부 시 ledger나 관리 번들 bytes를 쓰거나 바꾸지 않습니다.
+
+고정 MLB 모델 버전 `2026-08-03`은 번들 schema version과 독립적입니다. Schema v2 전환은 MLB 점수화, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority, Shadow의 비권위 비교 모드를 변경하지 않습니다.
 
 Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.json`의 완전한 불변 설정을 선택합니다. CLI에서 임의 설정 override나 precomputed forecast를 주입할 수 없습니다.
 
@@ -30,7 +44,7 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 - the Operator does not infer or inject the required bullpen path;
 - `pass` candidates are excluded from the hard gate;
 - static validation runs before simulation and dynamic validation before append;
-- exact replay of historical immutable commands is resolved before the fresh-version gate and remains available;
+- managed-root 인증과 exact ledger 관계가 있는 schema-v1 pregame artifact만 historical replay로 반환됩니다;
 - a stale legacy model version cannot create a new projected or confirmed record;
 - a rejection writes no pregame ledger or managed-bundle artifact.
 
@@ -53,7 +67,7 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 .venv/bin/python -m analysis.operator review --bundle <path> --ledger <path> --bundle-root <dir> --report-dir <dir>
 ```
 
-관리 번들은 `<bundle-root>/<game_pk>/<stage>-v<schema_version>-<canonical_sha256_앞16자리>.json`에 canonical bytes로 불변 저장됩니다. 같은 내용은 재사용하고 같은 경로의 bytes가 다르면 I/O 오류로 중단합니다. Ledger가 유일한 authoritative state이며 관리 번들과 보고서는 파생 운영 산출물입니다.
+관리 번들은 `<bundle-root>/<game_pk>/<stage>-v<schema_version>-<canonical_sha256_앞16자리>.json`에 canonical bytes로 불변 저장됩니다. Fresh pregame 성공은 v2 관리 번들을 만들고, 역사적 pregame v1은 이미 존재하는 해당 경로에서만 인증합니다. 같은 내용은 재사용하고 같은 경로의 bytes가 다르면 I/O 오류로 중단합니다. Ledger가 유일한 authoritative state이며 관리 번들과 보고서는 파생 운영 산출물입니다.
 
 ## Pregame 성공과 ID 인계
 
@@ -69,6 +83,8 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 
 ```json
 {
+  "schema_version": 1,
+  "stage": "review",
   "payload": {
     "capture_id": "<confirmed의 capture_id>",
     "forecast_run_id": "<confirmed의 forecast_run_id>",
@@ -93,7 +109,8 @@ Review는 이 세 ID가 같은 game의 active confirmed capture, 그 capture에 
 
 Operator capture key는 `(schema_version, stage, intrinsic CaptureCommand)`에서 자동 생성합니다. Intrinsic 내용에는 game, `captured_at`, first pitch, lineup state, eligibility, normalized input hash, canonical capture payload가 포함되고 `supersedes_capture_id`만 제외됩니다.
 
-- 같은 exact command는 기존 capture와 원래 supersession target을 먼저 찾고 capture, deterministic forecast, link를 replay하며, 관리 번들이 이미 저장되어 있으면 그 bytes도 replay합니다. 성공 또는 exact replay는 exit `0`입니다.
+- Fresh schema-v2/current command의 같은 exact command는 기존 capture와 원래 supersession target을 먼저 찾고 capture, deterministic forecast, link를 replay하며, 관리 번들이 이미 저장되어 있으면 그 bytes도 replay합니다. 성공 또는 exact replay는 exit `0`입니다.
+- Schema-v1 pregame 입력은 fresh 경로에 들어가지 않습니다. CLI가 관리 루트의 filename, stage, game, hash, bytes를 인증한 뒤 relaxed/strict v1 shape을 보존하고, ledger의 exact capture, forecast, link를 모두 찾은 경우에만 기존 records를 반환합니다. 하나라도 없으면 시뮬레이션, append, supersession, report, 관리 번들 저장 없이 거부합니다.
 - `forecast_run_id`가 같은 상태에서 운영자 note, legacy candidate 또는 review binding만 정정되면 immutable forecast record는 바꾸지 않습니다. 대신 정정된 `shadow_comparison`을 담은 새 capture-forecast link가 직전 exact link를 append-only로 supersede합니다. 이후 exact replay와 review에는 이 최신 관계 record ID를 사용합니다.
 - `captured_at`이나 audit provenance가 달라지면 forecast 의미가 같아도 새 capture가 생길 수 있고 같은 `forecast_run_id`를 재사용할 수 있습니다.
 - 새 projected/confirmed 상태는 최신 active pregame capture를 새 record로 supersede합니다. Active confirmed 이후 새 projected 상태는 거부되지만 이미 기록된 exact projected command의 역사적 replay는 허용됩니다.
@@ -163,4 +180,5 @@ JSON에는 resolved `ledger_path`, ledger 최대 append 시각인 `ledger_as_of`
 - CLI는 MLB, RotoWire, Savant/Statcast, market site를 live fetch하지 않습니다.
 - CLI와 보고서는 자동 model tuning, online learning, production promotion을 수행하지 않습니다.
 - 기존 legacy authority, `play`/`lean`/`pass`, `0-100` rank score, same-game assembler, 최종 priority와 model threshold를 변경하지 않습니다.
+- 고정 model version `2026-08-03`은 pregame schema v2 및 review schema v1과 별도로 버전 관리됩니다.
 - Forecast는 반드시 첫 투구 전에 `confirmed` 단계에서 동결합니다. `review`는 공식 결과를 받은 뒤에도 forecast를 다시 만들거나 바꾸지 않습니다.

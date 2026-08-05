@@ -29,17 +29,31 @@ python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 `analysis.pipeline`은 라이브 데이터를 스크래핑하지 않습니다. 분석에 필요한 단계, 출처 상태, 신뢰도 플래그가 고정 규칙과 맞는지 확인하는 재현성 도구입니다.
 `analysis.operator`도 라이브 데이터를 수집하거나 정규화하지 않습니다. 외부에서 준비한 엄격한 버전 번들을 받아 append-only 원장과 불변 운영 산출물을 기록합니다.
 
+Fresh `projected`/`confirmed` 번들은 JSON integer `schema_version: 2`와 명시적인 `authority: "current"`를 사용합니다. `review` 번들은 `schema_version: 1`을 유지합니다.
+
+```json
+{
+  "schema_version": 2,
+  "authority": "current",
+  "stage": "confirmed"
+}
+```
+
 ## Daily Workflow
 
 이 전달에서 라이브 출처 수집과 정규화는 운영자 또는 외부 수집 절차가 담당합니다. 자동 수집을 가정하지 않으며, 예측에 쓰는 모든 정규화 값은 원본 출처 관측치로 추적할 수 있어야 합니다.
 
-1. **예상 라인업:** 공식 MLB 선발과 오프너/벌크 구조, RotoWire 예상 라인업, Savant/Statcast 매치업, 최근 흐름, 불펜, 심판, 현재 소수 배당을 사용해 기존 고정 모델 분석을 수행합니다. F5, F5 O/U, ML, `+1.5`, O/U의 `play`/`lean`/`pass`와 최종 우선순위를 정한 뒤 `.venv/bin/python -m analysis.operator projected --bundle <path>`로 같은 상태를 기록합니다. 예상 라인업은 팀 강도가 아니라 신뢰도만 낮춥니다.
-2. **확정 라인업:** RotoWire 확정 라인업과 최신 선발 및 시장 상태로 번들을 새로 만들고 `.venv/bin/python -m analysis.operator confirmed --bundle <path>`를 실행합니다. CLI는 번들의 intrinsic capture 내용에서 idempotency를 도출하고 최신 active pregame capture를 immutable supersession lineage로 연결합니다. 의미가 같은 forecast는 재사용될 수 있으며 정확한 재실행은 원래 capture, forecast, link를 반환합니다.
-3. **경기 후:** `confirmed` 성공 출력의 정확한 `capture_id`, `forecast_run_id`, `capture_forecast_link_record_id`와 공식 MLB 결과로 review 번들을 만들고 `.venv/bin/python -m analysis.operator review --bundle <path>`를 실행합니다. CLI는 동결된 pregame 상태만 복기하고 calibration report를 갱신하며 새 forecast를 만들지 않습니다.
+1. **예상 라인업:** 공식 MLB 선발과 오프너/벌크 구조, RotoWire 예상 라인업, Savant/Statcast 매치업, 최근 흐름, 불펜, 심판, 현재 소수 배당을 사용해 기존 고정 모델 분석을 수행합니다. F5, F5 O/U, ML, `+1.5`, O/U의 `play`/`lean`/`pass`와 최종 우선순위를 정한 뒤 schema-v2/current `projected` 번들을 만들어 `.venv/bin/python -m analysis.operator projected --bundle <path>`로 같은 상태를 기록합니다. 예상 라인업은 팀 강도가 아니라 신뢰도만 낮춥니다.
+2. **확정 라인업:** RotoWire 확정 라인업과 최신 선발 및 시장 상태로 schema-v2/current `confirmed` 번들을 새로 만들고 `.venv/bin/python -m analysis.operator confirmed --bundle <path>`를 실행합니다. CLI는 번들의 intrinsic capture 내용에서 idempotency를 도출하고 최신 active pregame capture를 immutable supersession lineage로 연결합니다. 의미가 같은 forecast는 재사용될 수 있으며 정확한 재실행은 원래 capture, forecast, link를 반환합니다.
+3. **경기 후:** `confirmed` 성공 출력의 정확한 `capture_id`, `forecast_run_id`, `capture_forecast_link_record_id`와 공식 MLB 결과로 schema-v1 `review` 번들을 만들고 `.venv/bin/python -m analysis.operator review --bundle <path>`를 실행합니다. CLI는 동결된 pregame 상태만 복기하고 calibration report를 갱신하며 새 forecast를 만들지 않습니다.
+
+모든 pregame schema-v1 shape은 relaxed/strict candidate 형식과 관계없이 역사적 exact replay 전용입니다. 설정된 관리 번들 루트의 인증된 파일과 ledger의 정확한 capture, forecast, link가 모두 있을 때만 replay할 수 있습니다. 아직 실행하지 않은 pending v1 파일은 fresh 상태를 만들 수 없으므로 schema v2/current로 다시 생성해야 합니다. V1 거부는 ledger나 관리 번들 bytes를 변경하지 않습니다.
 
 번들 역할, 기본 경로, 재실행과 복구, 결과 정정, 보고서 해석은 `docs/shadow-operator.md`를 따릅니다.
 
 Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`/`lean`/`pass`, `0-100` 순위 점수, 최종 우선순위를 변경하거나 재정렬하거나 상향/하향할 수 없습니다. `0-100`은 확률이 아닌 legacy rank score입니다. 최소 100개의 확정 라인업 경기 전에는 production 의사결정에 영향을 줄 수 없고, 가능하면 시장군별 300개 decision 전에는 튜닝하지 않습니다. Production 우선권, 규칙 삭제, 가중치 변경은 별도 승인된 새 모델 버전과 설계가 필요합니다.
+
+고정 MLB model version은 `2026-08-03`이며 bundle schema version과 독립적입니다. Pregame schema v2 전환은 MLB scoring, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority 또는 Shadow 권한을 변경하지 않습니다.
 
 ## Local Shadow Ledger
 
@@ -52,7 +66,7 @@ Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`
 - 공식 결과가 선발 체인 실점과 불펜 실점을 모두 제공하면 각 투수진의 두 값은 음이 아닌 정수여야 하며 상대 최종 득점과 정확히 일치해야 합니다. 보존되지 않는 구성요소는 review 또는 calibration에 들어가기 전에 거부됩니다.
 - Pregame 조회는 ledger 옆의 rebuildable `checkpoint-v1` 파생 파일을 사용합니다. JSONL만 권위가 있으며 checkpoint는 삭제하거나 손상돼도 strict ledger scan으로 복구됩니다.
 - Historical 평문 forecast 배열은 계속 읽히고, 신규 20,000개 component 배열은 canonical JSON 기반으로 결정론적·무손실 압축됩니다. Decode 결과, review, calibration report mapping은 동일합니다.
-- 완전한 exact projected/confirmed replay만 시뮬레이션을 건너뜁니다. 동일 forecast의 legacy note/candidate/review binding 정정은 forecast를 바꾸지 않고 최신 exact link에 append-only로 기록합니다. 입력, config, 최신 link의 legacy snapshot, 저장된 score path에서 재계산한 market output 또는 frozen output 검증이 하나라도 다르면 기존 20,000회 forecast를 그대로 실행합니다.
+- Fresh schema-v2/current의 완전한 exact projected/confirmed replay만 일반 실행에서 시뮬레이션을 건너뜁니다. Historical schema-v1 pregame은 인증된 관리 번들과 exact ledger triplet을 조회해 기존 records만 반환합니다. 동일 forecast의 legacy note/candidate/review binding 정정은 forecast를 바꾸지 않고 최신 exact link에 append-only로 기록합니다. 입력, config, 최신 link의 legacy snapshot, 저장된 score path에서 재계산한 market output 또는 frozen output 검증이 하나라도 다르면 v2 일반 실행은 기존 20,000회 forecast를 그대로 실행합니다.
 
 ## Documentation
 

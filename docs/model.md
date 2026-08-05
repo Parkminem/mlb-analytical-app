@@ -43,16 +43,30 @@ Keep these output concepts separate:
 
 ### Three-Stage Daily Operation
 
-1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, prepare the versioned projected bundle, and run `.venv/bin/python -m analysis.operator projected --bundle <path>` to record the normalized pregame capture, deterministic shadow forecast, and exact capture-to-forecast link.
-2. Refresh with the RotoWire confirmed lineup and current starter and market state, prepare the confirmed bundle, and run `.venv/bin/python -m analysis.operator confirmed --bundle <path>`. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast.
-3. Put the exact frozen `capture_id`, `forecast_run_id`, and `capture_forecast_link_record_id` from the confirmed command into the review bundle with the official MLB result, then run `.venv/bin/python -m analysis.operator review --bundle <path>`. Review binds only to those records, performs the objective flow review, and builds the calibration report without forecasting again.
+1. Run the complete legacy analysis with the RotoWire projected lineup when a confirmed lineup is unavailable, prepare a schema-v2 projected bundle with explicit `authority: "current"`, and run `.venv/bin/python -m analysis.operator projected --bundle <path>` to record the normalized pregame capture, deterministic shadow forecast, and exact capture-to-forecast link.
+2. Refresh with the RotoWire confirmed lineup and current starter and market state, prepare a schema-v2 confirmed bundle with explicit `authority: "current"`, and run `.venv/bin/python -m analysis.operator confirmed --bundle <path>`. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast.
+3. Put the exact frozen `capture_id`, `forecast_run_id`, and `capture_forecast_link_record_id` from the confirmed command into the schema-v1 review bundle with the official MLB result, then run `.venv/bin/python -m analysis.operator review --bundle <path>`. Review binds only to those records, performs the objective flow review, and builds the calibration report without forecasting again.
+
+Fresh projected and confirmed envelopes use this contract, with `stage` set to the matching command:
+
+```json
+{
+  "schema_version": 2,
+  "authority": "current",
+  "stage": "confirmed"
+}
+```
+
+Every schema-v1 projected or confirmed artifact is historical and replay-only, whether its candidates use the relaxed or strict v1 shape. It must be loaded from the authenticated managed-bundle root and match an exact existing capture, forecast, and link in the ledger. A pending schema-v1 pregame file that has never executed cannot create fresh state and must be regenerated as schema v2. Rejection and failed replay leave ledger and managed-bundle bytes unchanged.
+
+The fixed MLB model version remains `2026-08-03`; model version and bundle schema version are independent. This bundle authority boundary does not change MLB scoring, F5 side or F5 total engines, full-game market engines, the same-game candidate assembler, legacy decision authority, or mandatory Shadow behavior.
 
 The operator derives capture idempotency intrinsically from the bundle schema version, stage, and exact capture command content except the supersession target. It searches that key before resolving lineage, so an exact replay returns the original immutable capture, forecast, link, and supersession target. New state appends a new capture and explicit supersession relationship; no prior ledger record is edited. Lower-level `record_shadow_run` remains an append-only API whose direct callers supply the capture key.
 
 - every new projected or confirmed `play`/`lean` candidate must be review-eligible;
 - `pass` candidates are excluded from the hard gate;
 - static validation runs before simulation and dynamic validation before append;
-- exact replay of historical immutable commands remains available;
+- authenticated exact replay of managed schema-v1 pregame artifacts remains available only when the ledger already contains their exact capture, forecast, and link;
 - a rejection writes no pregame ledger or managed-bundle artifact.
 
 Live source collection and normalization remain manual or external in this delivery. Every normalized value must carry provenance to its source observations; collection timestamps alone do not make an input eligible for out-of-sample evaluation.
