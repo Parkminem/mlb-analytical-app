@@ -77,10 +77,47 @@ class _PregameBundle(_BundleEnvelope):
         return self
 
 
-def _legacy_candidate_mappings(value: object) -> list[dict[str, object]]:
-    if not isinstance(value, dict):
-        return []
-    payload = value.get("payload")
+def _require_pair_compatibility_core_field(
+    schema: CoreSchema,
+    handler: GetCoreSchemaHandler,
+) -> CoreSchema:
+    # A native required field preserves JSON-mode strict datetime parsing.
+    legacy_reference = schema["schema"]["fields"]["legacy_decision"][
+        "schema"
+    ]
+    legacy_schema = handler.resolve_ref_schema(legacy_reference)
+    candidates_field = next(
+        field
+        for field in legacy_schema["schema"]["fields"]
+        if field["name"] == "candidates"
+    )
+    candidate_reference = candidates_field["schema"]["items_schema"][0]
+    candidate_schema = handler.resolve_ref_schema(candidate_reference)
+    compatibility_field = next(
+        field
+        for field in candidate_schema["schema"]["fields"]
+        if field["name"] == "same_game_pair_compatible"
+    )
+    field_schema = compatibility_field["schema"]
+    if field_schema["type"] == "default":
+        compatibility_field["schema"] = field_schema["schema"]
+    return schema
+
+
+class _CurrentPregamePayload(PregamePayload):
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        return _require_pair_compatibility_core_field(
+            handler(source),
+            handler,
+        )
+
+
+def _legacy_candidate_mappings(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, dict):
         return []
     legacy_decision = payload.get("legacy_decision")
@@ -90,6 +127,15 @@ def _legacy_candidate_mappings(value: object) -> list[dict[str, object]]:
     if not isinstance(candidates, (list, tuple)):
         return []
     return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+
+class _HistoricalPregamePayload(PregamePayload):
+    @model_serializer(mode="wrap")
+    def _preserve_missing_pair_compatibility(self, handler):
+        payload = handler(self)
+        for candidate in _legacy_candidate_mappings(payload):
+            candidate.pop("same_game_pair_compatible", None)
+        return payload
 
 
 def _has_explicit_pair_compatibility(value: object) -> bool:
@@ -116,6 +162,8 @@ def _has_explicit_pair_compatibility(value: object) -> bool:
 
 
 class _CurrentPregameBundle(_PregameBundle):
+    payload: _CurrentPregamePayload
+
     @classmethod
     def __get_pydantic_core_schema__(
         cls,
@@ -123,7 +171,8 @@ class _CurrentPregameBundle(_PregameBundle):
         handler: GetCoreSchemaHandler,
     ) -> CoreSchema:
         schema = handler(source)
-        # A Python-only wrapper preserves Pydantic's native strict JSON rules.
+        # JSON presence is structural; this guard also rejects materialized
+        # Python defaults without changing Pydantic's strict JSON semantics.
         return core_schema.json_or_python_schema(
             json_schema=schema,
             python_schema=core_schema.no_info_before_validator_function(
@@ -143,12 +192,7 @@ class _CurrentPregameBundle(_PregameBundle):
 
 
 class _HistoricalPregameBundle(_PregameBundle):
-    @model_serializer(mode="wrap")
-    def _preserve_missing_pair_compatibility(self, handler):
-        payload = handler(self)
-        for candidate in _legacy_candidate_mappings(payload):
-            candidate.pop("same_game_pair_compatible", None)
-        return payload
+    payload: _HistoricalPregamePayload
 
 
 class ProjectedBundle(_CurrentPregameBundle):

@@ -7,7 +7,7 @@ from pathlib import Path
 import warnings
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import analysis.operator.bundles as bundles_module
 import analysis.operator.cli as cli_module
@@ -1200,6 +1200,163 @@ def test_historical_public_dump_copy_cannot_create_current_pregame_run(
         "same_game_pair_compatible"
     ] = False
     assert type(current_type.model_validate(explicitly_fresh)) is current_type
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+def test_historical_json_dump_cannot_create_current_pregame_run(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = json.loads(bundle_canonical_bytes(bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+    historical = artifact.bundle
+    dumped_json = historical.model_dump_json()
+    dumped_candidate = json.loads(dumped_json)["payload"][
+        "legacy_decision"
+    ]["candidates"][0]
+    files_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+    adapter = TypeAdapter(current_type)
+
+    accepted = []
+    for validate in (
+        lambda: current_type.model_validate_json(dumped_json, strict=True),
+        lambda: adapter.validate_json(dumped_json, strict=True),
+    ):
+        try:
+            accepted.append(validate())
+        except ValidationError:
+            pass
+    for normal_input in accepted:
+        runner(
+            normal_input,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    explicitly_fresh = json.loads(dumped_json)
+    explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ] = False
+    fresh_json = json.dumps(explicitly_fresh)
+    assert type(
+        current_type.model_validate_json(fresh_json, strict=True)
+    ) is current_type
+    assert type(adapter.validate_json(fresh_json, strict=True)) is current_type
+    files_after = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    assert (
+        "same_game_pair_compatible" in dumped_candidate,
+        len(accepted),
+        ledger.exists(),
+        files_after == files_before,
+    ) == (False, 0, False, True)
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        ("projected", ProjectedBundle, run_projected, _projected_game),
+        ("confirmed", ConfirmedBundle, run_confirmed, _confirmed_game),
+    ),
+)
+def test_historical_nested_payload_dump_cannot_create_current_pregame_run(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    bundle = _bundle_with_legacy(
+        stage,
+        game_factory(),
+        _valid_recommended_legacy_mapping(),
+    )
+    mapping = json.loads(bundle_canonical_bytes(bundle))
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+    historical = artifact.bundle
+    laundered = historical.model_dump()
+    nested_payload = historical.payload.model_dump()
+    laundered["payload"] = nested_payload
+    nested_candidate = nested_payload["legacy_decision"]["candidates"][0]
+    files_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+    adapter = TypeAdapter(current_type)
+
+    accepted = []
+    for validate in (
+        lambda: current_type.model_validate(laundered),
+        lambda: adapter.validate_python(laundered),
+    ):
+        try:
+            accepted.append(validate())
+        except ValidationError:
+            pass
+    for normal_input in accepted:
+        runner(
+            normal_input,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+
+    explicitly_fresh = historical.model_dump()
+    explicitly_fresh["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ] = False
+    assert type(current_type.model_validate(explicitly_fresh)) is current_type
+    assert type(adapter.validate_python(explicitly_fresh)) is current_type
+    files_after = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    assert (
+        "same_game_pair_compatible" in nested_candidate,
+        len(accepted),
+        ledger.exists(),
+        files_after == files_before,
+    ) == (False, 0, False, True)
 
 
 @pytest.mark.parametrize(
