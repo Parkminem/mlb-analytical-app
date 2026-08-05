@@ -51,6 +51,8 @@ from analysis.operator.errors import (
     OperatorPreconditionError,
 )
 from analysis.operator.schemas import (
+    HistoricalConfirmedBundle,
+    HistoricalProjectedBundle,
     ProjectedBundle,
     parse_confirmed_bundle_json,
     parse_projected_bundle_json,
@@ -1214,6 +1216,124 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         for path in bundles.rglob("*")
         if path.is_file()
     } == files_before_replay
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "historical_replay", "historical_type"),
+    (
+        (
+            "projected",
+            run_projected,
+            replay_historical_projected,
+            HistoricalProjectedBundle,
+        ),
+        (
+            "confirmed",
+            run_confirmed,
+            replay_historical_confirmed,
+            HistoricalConfirmedBundle,
+        ),
+    ),
+)
+def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    historical_replay,
+    historical_type,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
+    game, legacy = _compatible_ml_over_case()
+    if stage == "confirmed":
+        game = replace(
+            game,
+            away_lineup=replace(game.away_lineup, state=LineupState.CONFIRMED),
+        )
+    base = _pregame_bundle(stage, game)
+    fresh_bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+    first = runner(
+        fresh_bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+    assert len(
+        first.forecast.outputs["shadow_comparison"]["legacy"]["candidates"]
+    ) == 2
+
+    historical_outputs = json.loads(canonical_json(first.forecast.outputs))
+    for candidate in historical_outputs["shadow_comparison"]["legacy"][
+        "candidates"
+    ]:
+        del candidate["same_game_pair_compatible"]
+    _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+
+    mapping = json.loads(bundle_canonical_bytes(fresh_bundle))
+    for candidate in mapping["payload"]["legacy_decision"]["candidates"]:
+        del candidate["same_game_pair_compatible"]
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    artifact = bundles_module.load_historical_managed_bundle(source, root=bundles)
+    assert isinstance(artifact, ReplayOnlyPregameBundle)
+    assert type(artifact.bundle) is historical_type
+    caller_constructed_artifact = ReplayOnlyPregameBundle(
+        bundle=artifact.bundle,
+        managed_bundle=ManagedBundleCopy(
+            path=source,
+            bundle_hash="caller-supplied-hash",
+            replayed=False,
+        ),
+    )
+    files_before = {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    }
+
+    returned = historical_replay(
+        source,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(
+            caller_constructed_artifact,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="historical replay requires a pre-change managed bundle",
+    ):
+        historical_replay(
+            first.managed_bundle.path,
+            ledger_path=empty_ledger,
+            bundle_root=bundles,
+        )
+
+    assert returned.managed_bundle.path == source.resolve()
+    assert returned.managed_bundle.bundle_hash == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+    assert (
+        returned.managed_bundle.bundle_hash
+        != caller_constructed_artifact.managed_bundle.bundle_hash
+    )
+    assert not empty_ledger.exists()
+    assert {
+        path.relative_to(bundles): path.read_bytes()
+        for path in bundles.rglob("*")
+        if path.is_file()
+    } == files_before
 
 
 def _rewrite_forecast_outputs(

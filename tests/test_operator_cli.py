@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
 from types import MappingProxyType
 import subprocess
@@ -26,14 +27,19 @@ from analysis.operator.errors import (
 )
 from analysis.operator.schemas import (
     ConfirmedBundle,
+    HistoricalConfirmedBundle,
+    HistoricalProjectedBundle,
     ProjectedBundle,
     ReviewBundle,
     parse_confirmed_bundle_json,
+    parse_historical_confirmed_bundle_json,
+    parse_historical_projected_bundle_json,
     parse_projected_bundle_json,
     parse_review_bundle_json,
 )
 from tests.test_forecasting_engine import _complete_game
 from tests.test_operator_schemas import (
+    _complete_legacy_decision_mapping,
     _raw,
     confirmed_bundle_mapping,
     projected_bundle_mapping,
@@ -113,6 +119,44 @@ def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:
     return parse_review_bundle_json(_raw(review_bundle_mapping()))
 
 
+def _historical_pregame_bundle(
+    command: str,
+) -> HistoricalProjectedBundle | HistoricalConfirmedBundle:
+    raw = _historical_pregame_raw(command)
+    if command == "projected":
+        return parse_historical_projected_bundle_json(raw)
+    return parse_historical_confirmed_bundle_json(raw)
+
+
+def _historical_pregame_raw(command: str) -> str:
+    mapping = (
+        projected_bundle_mapping()
+        if command == "projected"
+        else confirmed_bundle_mapping()
+    )
+    mapping["payload"]["legacy_decision"] = (
+        _complete_legacy_decision_mapping()
+    )
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    return _raw(mapping)
+
+
+def _write_hash_named_managed_bundle(
+    root: Path,
+    raw: bytes,
+    *,
+    game_pk: int,
+    stage: str,
+) -> Path:
+    bundle_hash = hashlib.sha256(raw).hexdigest()
+    path = root / str(game_pk) / f"{stage}-v1-{bundle_hash[:16]}.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    return path
+
+
 def test_pregame_loader_classifies_managed_pre_change_path_as_historical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -121,7 +165,7 @@ def test_pregame_loader_classifies_managed_pre_change_path_as_historical(
     managed_path = bundle_root / "900001" / "projected-v1-deadbeefdeadbeef.json"
     managed_path.parent.mkdir(parents=True)
     managed_path.write_text("historical", encoding="utf-8")
-    expected = _bundle("projected")
+    expected = _historical_pregame_bundle("projected")
     calls: list[tuple[Path, Path]] = []
 
     monkeypatch.setattr(
@@ -182,7 +226,7 @@ def test_historical_managed_path_dispatches_only_to_replay_service(
         cli_module,
         "load_historical_managed_bundle",
         lambda path, *, root: ReplayOnlyPregameBundle(
-            bundle=_bundle(command),
+            bundle=_historical_pregame_bundle(command),
             managed_bundle=ManagedBundleCopy(
                 path=managed_path,
                 bundle_hash="historical-bundle-sha256",
@@ -230,6 +274,179 @@ def test_historical_managed_path_dispatches_only_to_replay_service(
 
     assert result.exit_code == 0, result.output
     assert calls == [(managed_path.resolve(), ledger_path, bundle_root)]
+
+
+@pytest.mark.parametrize(
+    ("bundle", "historical_path"),
+    (
+        (None, None),
+        (_bundle("projected"), Path("historical.json")),
+    ),
+)
+def test_pregame_load_requires_exactly_one_dispatch_target(
+    bundle: ProjectedBundle | None,
+    historical_path: Path | None,
+) -> None:
+    with pytest.raises(ValueError, match="exactly one dispatch target"):
+        cli_module._PregameBundleLoad(
+            bundle=bundle,
+            historical_path=historical_path,
+        )
+
+
+def test_historical_pregame_outside_managed_root_is_not_classified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    source = tmp_path / "outside" / "projected.json"
+    source.parent.mkdir()
+    source.write_text(_historical_pregame_raw("projected"), encoding="utf-8")
+
+    def forbidden_historical_loader(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("outside paths must not enter historical loading")
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        forbidden_historical_loader,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "projected",
+            "--bundle",
+            str(source),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "Traceback" not in result.output
+
+
+def test_strict_wrong_stage_under_managed_root_never_enters_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    raw = _raw(confirmed_bundle_mapping()).encode("utf-8")
+    source = _write_hash_named_managed_bundle(
+        bundle_root,
+        raw,
+        game_pk=744_001,
+        stage="projected",
+    )
+
+    def forbidden_historical_loader(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("strict wrong-stage input must not enter replay")
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        forbidden_historical_loader,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "projected",
+            "--bundle",
+            str(source),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 4
+    assert "bundle stage/type mismatch" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_malformed_managed_pregame_never_dispatches_a_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    source = _write_hash_named_managed_bundle(
+        bundle_root,
+        b'{"stage":',
+        game_pk=744_001,
+        stage="projected",
+    )
+
+    def forbidden_service(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("malformed input must not dispatch a service")
+
+    monkeypatch.setattr(cli_module, "run_projected", forbidden_service)
+    monkeypatch.setattr(
+        cli_module,
+        "replay_historical_projected",
+        forbidden_service,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "projected",
+            "--bundle",
+            str(source),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "Traceback" not in result.output
+
+
+def test_review_never_classifies_historical_pregame_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    historical = _historical_pregame_bundle("projected")
+    raw = _historical_pregame_raw("projected").encode("utf-8")
+    source = _write_hash_named_managed_bundle(
+        bundle_root,
+        raw,
+        game_pk=historical.game_pk,
+        stage="projected",
+    )
+
+    def forbidden_historical_loader(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("review must use strict loading only")
+
+    def forbidden_review_runner(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("historical pregame input must not run review")
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        forbidden_historical_loader,
+    )
+    monkeypatch.setattr(cli_module, "run_review", forbidden_review_runner)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "review",
+            "--bundle",
+            str(source),
+            "--bundle-root",
+            str(bundle_root),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "Traceback" not in result.output
 
 
 @pytest.mark.parametrize("command", ("projected", "confirmed"))
