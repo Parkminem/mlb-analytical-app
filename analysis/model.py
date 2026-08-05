@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from analysis.forecasting.inputs import MarketType
     from analysis.review.evidence_contract import PriorityEvidenceAssessment
 
 
@@ -349,6 +350,7 @@ class PriorityAdmissionContext:
     lower_order_or_walk_path: bool = True
     bullpen_over_path: bool = False
     evidence_assessment: PriorityEvidenceAssessment | None = None
+    evidence_market_type: MarketType | None = None
 
 
 @dataclass(frozen=True)
@@ -524,9 +526,11 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
             raise TypeError(
                 "evidence_assessment must be PriorityEvidenceAssessment or None"
             )
+        if context.evidence_market_type is not context.evidence_assessment.market_type:
+            raise ValueError("evidence_assessment_market_type_mismatch")
+        if context.market != context.evidence_assessment.priority_market:
+            raise ValueError("evidence_assessment_market_mismatch")
         if context.evidence_assessment.score_cap is not None:
-            if context.market != context.evidence_assessment.priority_market:
-                raise ValueError("evidence_assessment_market_mismatch")
             score = min(score, context.evidence_assessment.score_cap)
             notes.extend(context.evidence_assessment.reason_codes)
 

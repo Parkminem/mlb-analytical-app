@@ -116,7 +116,11 @@ def _conversion(
     )
 
 
-def _admission_score(assessment: object, score: int = 80) -> int:
+def _admission_score(
+    assessment: object,
+    score: int = 80,
+    evidence_market_type: MarketType = MarketType.ML,
+) -> int:
     return evaluate_priority_admission(
         PriorityAdmissionContext(
             market="ml",
@@ -124,6 +128,7 @@ def _admission_score(assessment: object, score: int = 80) -> int:
             bullpen_performance_support_ok=True,
             full_game_margin_path=True,
             evidence_assessment=assessment,
+            evidence_market_type=evidence_market_type,
         )
     ).score
 
@@ -184,6 +189,38 @@ def test_assessment_cannot_cap_a_different_priority_market() -> None:
                 market="over",
                 proposed_score=80,
                 evidence_assessment=assessment,
+                evidence_market_type=MarketType.ML,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("assessment_market_type", "context_market_type"),
+    (
+        (MarketType.F5_TOTAL, MarketType.FULL_TOTAL),
+        (MarketType.FULL_TOTAL, MarketType.F5_TOTAL),
+    ),
+)
+def test_total_assessment_requires_the_exact_context_market_type(
+    assessment_market_type: MarketType,
+    context_market_type: MarketType,
+) -> None:
+    assessment = assess_priority_evidence_contract(
+        _candidate(assessment_market_type.value),
+        _binding(assessment_market_type.value),
+        _market(assessment_market_type, "over", line=9.0),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="evidence_assessment_market_type_mismatch",
+    ):
+        evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="over",
+                proposed_score=80,
+                evidence_assessment=assessment,
+                evidence_market_type=context_market_type,
             )
         )
 
