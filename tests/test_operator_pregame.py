@@ -4,6 +4,7 @@ from datetime import timedelta
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import warnings
 
 import pytest
@@ -217,6 +218,151 @@ def test_relaxed_v1_envelope_only_copy_cannot_launder_from_attributes(
     ):
         with pytest.raises(ValidationError):
             validate()
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "current_type",
+        "runner",
+        "historical_parser",
+    ),
+    (
+        (
+            "projected",
+            ProjectedBundle,
+            run_projected,
+            parse_historical_projected_bundle_json,
+        ),
+        (
+            "confirmed",
+            ConfirmedBundle,
+            run_confirmed,
+            parse_historical_confirmed_bundle_json,
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "payload_contract",
+    ("empty", "nonempty", "strict_historical"),
+)
+@pytest.mark.parametrize("validation_path", ("base_model", "type_adapter"))
+@pytest.mark.parametrize("root_kind", ("namespace", "plain_object"))
+def test_current_validation_rejects_attribute_root_before_authority_and_writes(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    historical_parser,
+    payload_contract: str,
+    validation_path: str,
+    root_kind: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game() if stage == "projected" else _confirmed_game()
+    if payload_contract == "nonempty":
+        current = _bundle_with_legacy(
+            stage,
+            game,
+            _valid_recommended_legacy_mapping(),
+        )
+    elif payload_contract == "strict_historical":
+        current = _bundle_with_legacy(
+            stage,
+            game,
+            _valid_recommended_legacy_mapping(),
+        )
+        historical = historical_parser(
+            _raw(
+                _historical_v1_mapping(
+                    json.loads(bundle_canonical_bytes(current)),
+                    candidate_contract="strict",
+                )
+            )
+        )
+    else:
+        current = _pregame_bundle(stage, game)
+    mapping = json.loads(bundle_canonical_bytes(current))
+    if payload_contract == "strict_historical":
+        mapping["payload"] = json.loads(
+            historical.model_dump_json(warnings="error")
+        )["payload"]
+
+    if root_kind == "namespace":
+        source = SimpleNamespace(**mapping)
+    else:
+        class AttributeRoot:
+            pass
+
+        source = AttributeRoot()
+        for field_name, value in mapping.items():
+            setattr(source, field_name, value)
+    registry_before = _current_authority_registry_snapshot()
+
+    with pytest.raises(ValidationError, match="raw mapping"):
+        if validation_path == "base_model":
+            forged = current_type.model_validate(
+                source,
+                from_attributes=True,
+            )
+        else:
+            forged = TypeAdapter(current_type).validate_python(
+                source,
+                from_attributes=True,
+            )
+        assert schemas_module.is_current_pregame_bundle(
+            forged,
+            expected_type=current_type,
+            expected_stage=stage,
+        )
+        runner(forged, ledger_path=ledger, bundle_root=bundles)
+
+    assert _current_authority_registry_snapshot() == registry_before
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "mapping_factory", "parser"),
+    (
+        (
+            "projected",
+            ProjectedBundle,
+            projected_bundle_mapping,
+            parse_projected_bundle_json,
+        ),
+        (
+            "confirmed",
+            ConfirmedBundle,
+            confirmed_bundle_mapping,
+            parse_confirmed_bundle_json,
+        ),
+    ),
+)
+@pytest.mark.parametrize("validation_path", ("base_model", "type_adapter"))
+def test_authorized_current_instance_reentry_does_not_mint_authority(
+    stage: str,
+    current_type,
+    mapping_factory,
+    parser,
+    validation_path: str,
+) -> None:
+    current = parser(_raw(mapping_factory()))
+    registry_before = _current_authority_registry_snapshot()
+
+    if validation_path == "base_model":
+        reentered = current_type.model_validate(
+            current,
+            from_attributes=True,
+        )
+    else:
+        reentered = TypeAdapter(current_type).validate_python(
+            current,
+            from_attributes=True,
+        )
+
+    assert reentered is current
+    assert _current_authority_registry_snapshot() == registry_before
 
 
 def _projected_game(**overrides: object):
@@ -457,6 +603,23 @@ def _legacy_decision_input_values(
         name: getattr(decision, name)
         for name in schemas_module._CurrentLegacyDecisionInput.model_fields
     }
+
+
+def _current_authority_registry_snapshot(
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    return tuple(
+        tuple(
+            sorted(
+                (identity, id(authority))
+                for identity, authority in registry.items()
+            )
+        )
+        for registry in (
+            schemas_module._DECISION_AUTHORITIES,
+            schemas_module._PAYLOAD_AUTHORITIES,
+            schemas_module._BUNDLE_AUTHORITIES,
+        )
+    )
 
 
 def _copy_pydantic_private_state(source: object, target: object) -> None:

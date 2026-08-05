@@ -632,6 +632,29 @@ class _CurrentPregameBundle(_PregameBundle):
     authority: Literal["current"]
     payload: _CurrentPregamePayloadSource = Field(union_mode="left_to_right")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _require_raw_current_bundle_mapping(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "current bundle must be supplied as a raw mapping"
+            )
+        created_at = value.get("created_at")
+        if info.mode == "json" and isinstance(created_at, str):
+            normalized = dict(value)
+            try:
+                normalized["created_at"] = datetime.fromisoformat(
+                    created_at
+                )
+            except ValueError:
+                pass
+            return normalized
+        return value
+
     @field_validator("authority", mode="after")
     @classmethod
     def _mark_current_validation(cls, value: str) -> object:
