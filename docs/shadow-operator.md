@@ -43,6 +43,8 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 - every new projected or confirmed `play`/`lean` candidate must be review-eligible;
 - the current legacy model version is `2026-08-05`, and every fresh recommended full-game ML must declare and bind `bullpen_protection` or `late_bullpen_exposure`;
 - every fresh recommended F5 or full-game under must bind same-namespace `starter_suppression` and `lineup_suppression` paths for two-sided review coverage;
+- a current full-game ML `play`/`lean` candidate with score `72` or higher needs a directionally valid starter path: `starter_suppression` binds the selected side's own starter run prevention, while `starter_collapse` binds opposing-starter failure. Missing evidence is capped at `71`, and a fresh submission above the cap is rejected;
+- a current `play`/`lean` candidate on a verified full-game over line of `9.0` or higher needs two distinct canonical routes covering away and home scoring directions. Conversion paths score for their batting side; `starter_collapse` and `late_bullpen_exposure` score for the side opposing the bound pitching side. Suppression/protection paths do not count as over scoring routes. Missing coverage is capped at `69`, and a fresh submission above the cap is rejected;
 - the Operator does not infer or inject the required bullpen path;
 - `pass` candidates are excluded from the hard gate;
 - static validation runs before simulation and dynamic validation before append;

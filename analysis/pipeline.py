@@ -29,6 +29,34 @@ _FORECASTING_REQUIRED_KEYS = frozenset(
     }
     | (_SIMULATION_CONFIG_KEYS - {"version"})
 )
+_APPROVED_PRIORITY_ADMISSION = {
+    "caps_only_no_positive_rescoring": True,
+    "require_ml_bullpen_review_path": True,
+    "require_two_sided_under_review_path": True,
+    "exclude_market_engine_pass_from_priority": True,
+    "canonical_evidence_paths_only": True,
+    "missing_evidence_blocks_multi_market_retention": True,
+    "same_game_candidate_assembler": "assemble_same_game_priority",
+    "multi_market_min_score": 72,
+    "one_candidate_per_full_game_family": True,
+    "allow_compatible_side_total_pair": True,
+    "require_distinct_canonical_evidence_paths_for_multi_market_retention": True,
+    "require_directional_coherence": True,
+    "apply_family_policy_to_f5": True,
+    "f5_market_engine_unchanged": True,
+    "traffic_only_side_cap": 74,
+    "matchup_only_side_requires_recent_run_conversion": True,
+    "incomplete_pitching_chain_cap": 74,
+    "late_bullpen_protection_cap": 71,
+    "full_game_bullpen_requires_performance_support": True,
+    "ml_requires_independent_full_game_margin_path": True,
+    "discontinuous_lineup_over_cap": 69,
+    "ml_starter_evidence_cap": 71,
+    "high_total_two_sided_over_cap": 69,
+    "high_total_two_sided_over_threshold": 9.0,
+    "fresh_review_requires_ml_starter_evidence_binding": True,
+    "fresh_review_requires_high_total_two_sided_bindings": True,
+}
 
 MODEL_LAYERS = (
     "data_integrity",
@@ -104,6 +132,20 @@ def _validate_model_config(config: object) -> None:
         raise ValueError(f"legacy model version must remain {LEGACY_MODEL_VERSION}")
     if config.get("fixed_model") is not True:
         raise ValueError("model configuration must declare fixed_model=true")
+    priority_admission = config.get("priority_admission")
+    if (
+        not isinstance(priority_admission, dict)
+        or set(priority_admission) != set(_APPROVED_PRIORITY_ADMISSION)
+        or any(
+            type(priority_admission[key]) is not type(expected)
+            or priority_admission[key] != expected
+            for key, expected in _APPROVED_PRIORITY_ADMISSION.items()
+        )
+    ):
+        raise ValueError(
+            "priority_admission configuration must use the complete approved "
+            "schema and fixed values"
+        )
     _validate_forecasting_config(config.get("forecasting"))
 
 

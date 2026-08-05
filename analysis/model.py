@@ -2,12 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
-
-
-if TYPE_CHECKING:
-    from analysis.forecasting.inputs import MarketType
-    from analysis.review.evidence_contract import PriorityEvidenceAssessment
 
 
 HIGH_LEVERAGE_ROLES = {"closer", "setup", "high"}
@@ -349,8 +343,6 @@ class PriorityAdmissionContext:
     lineup_neutral_slots: int = 0
     lower_order_or_walk_path: bool = True
     bullpen_over_path: bool = False
-    evidence_assessment: PriorityEvidenceAssessment | None = None
-    evidence_market_type: MarketType | None = None
 
 
 @dataclass(frozen=True)
@@ -467,6 +459,14 @@ class Recommendation:
 
 def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAdmission:
     """Apply final priority caps without rescoring any baseball input."""
+
+    return _evaluate_priority_admission(context)
+
+
+def _evaluate_priority_admission(
+    context: PriorityAdmissionContext,
+    evidence_assessment: object | None = None,
+) -> PriorityAdmission:
     valid_markets = {"f5", "ml", "plus_1_5", "over", "under"}
     if context.market not in valid_markets:
         raise ValueError(f"unsupported priority market: {context.market}")
@@ -519,20 +519,18 @@ def evaluate_priority_admission(context: PriorityAdmissionContext) -> PriorityAd
         score = min(score, 69)
         notes.append("discontinuous lineup lacks an independent over path")
 
-    if context.evidence_assessment is not None:
+    if evidence_assessment is not None:
         from analysis.review.evidence_contract import PriorityEvidenceAssessment
 
-        if not isinstance(context.evidence_assessment, PriorityEvidenceAssessment):
+        if not isinstance(evidence_assessment, PriorityEvidenceAssessment):
             raise TypeError(
                 "evidence_assessment must be PriorityEvidenceAssessment or None"
             )
-        if context.evidence_market_type is not context.evidence_assessment.market_type:
-            raise ValueError("evidence_assessment_market_type_mismatch")
-        if context.market != context.evidence_assessment.priority_market:
+        if context.market != evidence_assessment.priority_market:
             raise ValueError("evidence_assessment_market_mismatch")
-        if context.evidence_assessment.score_cap is not None:
-            score = min(score, context.evidence_assessment.score_cap)
-            notes.extend(context.evidence_assessment.reason_codes)
+        if evidence_assessment.score_cap is not None:
+            score = min(score, evidence_assessment.score_cap)
+            notes.extend(evidence_assessment.reason_codes)
 
     if score >= 80:
         tier = "primary"

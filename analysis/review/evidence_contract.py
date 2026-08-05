@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from analysis.forecasting.inputs import MarketInput, MarketType
-from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
+from analysis.model import (
+    PriorityAdmission,
+    PriorityAdmissionContext,
+    PriorityEvidencePath,
+    PriorityMarketCandidate,
+)
 
 from .classification import (
     PrincipalPathBinding,
@@ -21,6 +26,7 @@ _PLAYABLE_PRIORITY_MIN_SCORE = 72
 _ML_STARTER_EVIDENCE_CAP = 71
 _HIGH_TOTAL_TWO_SIDED_OVER_CAP = 69
 _SCORING_SIDES = frozenset(("away", "home"))
+_DECISION_RATINGS = frozenset(("play", "lean", "pass"))
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,12 @@ def _validate_identity(
         raise ValueError("market_key_mismatch")
     if candidate.market != market_input.market_type.value:
         raise ValueError("market_type_mismatch")
+    if (
+        market_input.market_type
+        in {MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5}
+        and market_input.selected_side not in _SCORING_SIDES
+    ):
+        raise ValueError("side_market_selected_side_must_be_away_or_home")
     if (
         market_input.market_type in {MarketType.F5_TOTAL, MarketType.FULL_TOTAL}
         and market_input.selected_side not in {"over", "under"}
@@ -250,3 +262,46 @@ def assess_priority_evidence_contract(
         )
 
     return _assessment(market_input)
+
+
+def evaluate_bound_priority_admission(
+    context: PriorityAdmissionContext,
+    *,
+    candidate: PriorityMarketCandidate,
+    candidate_index: int,
+    binding: "CandidateReviewBinding",
+    market_input: MarketInput,
+) -> PriorityAdmission:
+    """Apply evidence caps derived from one exact candidate-review binding."""
+
+    if not isinstance(context, PriorityAdmissionContext):
+        raise TypeError("context must be PriorityAdmissionContext")
+    if (
+        isinstance(candidate_index, bool)
+        or not isinstance(candidate_index, int)
+        or candidate_index < 0
+    ):
+        raise ValueError("candidate_index_must_be_a_nonnegative_integer")
+    candidate, _, market_input = _validate_identity(
+        candidate,
+        binding,
+        market_input,
+    )
+    if candidate.score != context.proposed_score:
+        raise ValueError("candidate_score_mismatch")
+    if candidate.decision_rating not in _DECISION_RATINGS:
+        raise ValueError("candidate_decision_rating_is_unsupported")
+    if binding.legacy_candidate_index != candidate_index:
+        raise ValueError("binding_candidate_index_mismatch")
+
+    assessment = assess_priority_evidence_contract(
+        candidate,
+        binding,
+        market_input,
+    )
+    if context.market != assessment.priority_market:
+        raise ValueError("priority_market_mapping_mismatch")
+
+    from analysis.model import _evaluate_priority_admission
+
+    return _evaluate_priority_admission(context, assessment)

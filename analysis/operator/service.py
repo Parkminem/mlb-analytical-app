@@ -791,9 +791,12 @@ def _run_pregame(
         )
 
     try:
+        resolved_game = _pregame_operation(
+            lambda: resolve_forecast_input(bundle.payload.game_input)
+        )
         validate_recommended_review_contract(
             bundle.payload.legacy_decision,
-            bundle.payload.game_input.markets,
+            resolved_game.markets,
         )
     except ValueError as error:
         exact_replay = _existing_exact_pregame_replay(

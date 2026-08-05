@@ -964,6 +964,64 @@ def test_2026_08_05_evidence_contract_rejects_before_forecast_or_artifacts(
     assert not bundles.exists()
 
 
+def test_current_operator_resolves_captured_team_alias_before_ml_evidence_validation(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    game = replace(
+        game,
+        markets=tuple(
+            replace(market, selected_side="SEA")
+            if market.market_key == "sea_ml"
+            else market
+            for market in game.markets
+        ),
+    )
+    bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=_ordered_legacy_decision(),
+    )
+
+    result = run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert (
+        result.forecast.outputs["market_inputs"]["sea_ml"]["selected_side"]
+        == "away"
+    )
+    assert len(tuple(LedgerStore(ledger).iter_records())) == 3
+    assert len(tuple(bundles.rglob("*.json"))) == 1
+
+
+def test_current_operator_rejects_unknown_team_alias_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    game = replace(
+        game,
+        markets=tuple(
+            replace(market, selected_side="UNKNOWN")
+            if market.market_key == "sea_ml"
+            else market
+            for market in game.markets
+        ),
+    )
+    bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=_ordered_legacy_decision(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="selected_side must be away, home, or match",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
 def test_exact_old_version_replay_precedes_fresh_evidence_version_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

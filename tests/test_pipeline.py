@@ -153,6 +153,41 @@ class ModelConfigTests(unittest.TestCase):
             },
         )
 
+    def test_loader_rejects_priority_admission_schema_and_value_drift(self):
+        base_config = load_model_config()
+        mutations = []
+        for field, value in base_config["priority_admission"].items():
+            if isinstance(value, bool):
+                changed = not value
+            elif isinstance(value, (int, float)):
+                changed = value + 1
+            else:
+                changed = f"{value}-changed"
+            mutations.append((field, changed))
+
+        for field, changed in mutations:
+            with self.subTest(field=field, changed=changed):
+                config = copy.deepcopy(base_config)
+                config["priority_admission"][field] = changed
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "priority_admission configuration",
+                ):
+                    self._load_config_payload(config)
+
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                config = copy.deepcopy(base_config)
+                if mutation == "missing":
+                    config["priority_admission"].pop("ml_starter_evidence_cap")
+                else:
+                    config["priority_admission"]["unapproved_contract"] = True
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "priority_admission configuration",
+                ):
+                    self._load_config_payload(config)
+
     def test_forecasting_addition_preserves_every_legacy_config_value(self):
         config = load_model_config()
         legacy_config = {
@@ -671,6 +706,23 @@ class CurrentRuntimeDocumentationTests(unittest.TestCase):
             "model versions `2026-08-03` and `2026-08-05`",
             template_text,
         )
+
+    def test_operator_docs_publish_current_priority_evidence_contracts(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for relative_path in (
+            "docs/analysis-output-template.md",
+            "docs/shadow-operator.md",
+        ):
+            with self.subTest(path=relative_path):
+                text = (project_root / relative_path).read_text(encoding="utf-8")
+                self.assertIn("score `72` or higher", text)
+                self.assertIn("capped at `71`", text)
+                self.assertIn("verified full-game over line of `9.0` or higher", text)
+                self.assertIn("capped at `69`", text)
+                self.assertIn(
+                    "suppression/protection paths do not count",
+                    text.lower(),
+                )
 
 
 if __name__ == "__main__":

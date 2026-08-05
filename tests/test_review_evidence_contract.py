@@ -1,3 +1,4 @@
+from dataclasses import fields
 from datetime import datetime, timezone
 
 import pytest
@@ -12,12 +13,12 @@ from analysis.model import (
     PriorityAdmissionContext,
     PriorityEvidencePath,
     PriorityMarketCandidate,
-    evaluate_priority_admission,
 )
 from analysis.review.classification import (
     ContradictionRule,
     PrincipalPathBinding,
 )
+import analysis.review.evidence_contract as evidence_contract_module
 from analysis.review.evidence_contract import assess_priority_evidence_contract
 from analysis.pipeline import load_model_config
 from analysis.shadow import CandidateReviewBinding
@@ -117,20 +118,32 @@ def _conversion(
     )
 
 
-def _admission_score(
-    assessment: object,
+def _admission_context(market: str, score: int = 80) -> PriorityAdmissionContext:
+    return PriorityAdmissionContext(
+        market=market,
+        proposed_score=score,
+        bullpen_performance_support_ok=True,
+        full_game_margin_path=True,
+    )
+
+
+def _bound_admission_score(
+    candidate: PriorityMarketCandidate,
+    binding: CandidateReviewBinding,
+    market: MarketInput,
+    *,
     score: int = 80,
-    evidence_market_type: MarketType = MarketType.ML,
+    candidate_index: int = 0,
 ) -> int:
-    return evaluate_priority_admission(
-        PriorityAdmissionContext(
-            market="ml",
-            proposed_score=score,
-            bullpen_performance_support_ok=True,
-            full_game_margin_path=True,
-            evidence_assessment=assessment,
-            evidence_market_type=evidence_market_type,
-        )
+    return evidence_contract_module.evaluate_bound_priority_admission(
+        _admission_context(
+            "over" if market.selected_side == "over" else candidate.market,
+            score,
+        ),
+        candidate=candidate,
+        candidate_index=candidate_index,
+        binding=binding,
+        market_input=market,
     ).score
 
 
@@ -147,7 +160,11 @@ def test_complete_ml_starter_suppression_keeps_priority_score() -> None:
 
     assert assessment.score_cap is None
     assert assessment.reason_codes == ()
-    assert _admission_score(assessment) == 80
+    assert _bound_admission_score(
+        candidate,
+        _binding("ml", _starter_suppression("away")),
+        _market(MarketType.ML, "away"),
+    ) == 80
 
 
 def test_complete_ml_opposing_starter_collapse_keeps_priority_score() -> None:
@@ -166,15 +183,20 @@ def test_complete_ml_opposing_starter_collapse_keeps_priority_score() -> None:
 
 def test_playable_ml_without_a_bound_starter_path_is_capped() -> None:
     candidate = _candidate("ml")
+    binding = _binding(
+        "ml",
+        _conversion(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away"),
+    )
+    market = _market(MarketType.ML, "away")
     assessment = assess_priority_evidence_contract(
         candidate,
-        _binding("ml", _conversion(PriorityEvidencePath.TOP_ORDER_MATCHUP, "away")),
-        _market(MarketType.ML, "away"),
+        binding,
+        market,
     )
 
     assert assessment.score_cap == 71
     assert assessment.reason_codes == ("missing_ml_starter_evidence",)
-    assert _admission_score(assessment) == 71
+    assert _bound_admission_score(candidate, binding, market) == 71
 
 
 def test_code_derived_caps_match_approved_model_config() -> None:
@@ -202,52 +224,77 @@ def test_code_derived_caps_match_approved_model_config() -> None:
     )
 
 
-def test_assessment_cannot_cap_a_different_priority_market() -> None:
-    assessment = assess_priority_evidence_contract(
-        _candidate("ml"),
-        _binding("ml"),
-        _market(MarketType.ML, "away"),
-    )
+def test_public_admission_context_does_not_accept_a_detached_assessment() -> None:
+    assert "evidence_assessment" not in {
+        field.name for field in fields(PriorityAdmissionContext)
+    }
+    assert "evidence_market_type" not in {
+        field.name for field in fields(PriorityAdmissionContext)
+    }
 
-    with pytest.raises(ValueError, match="evidence_assessment_market_mismatch"):
-        evaluate_priority_admission(
-            PriorityAdmissionContext(
-                market="over",
-                proposed_score=80,
-                evidence_assessment=assessment,
-                evidence_market_type=MarketType.ML,
-            )
+
+def test_bound_admission_rejects_candidate_score_mismatch() -> None:
+    candidate = _candidate("ml", score=72)
+
+    with pytest.raises(ValueError, match="candidate_score_mismatch"):
+        evidence_contract_module.evaluate_bound_priority_admission(
+            _admission_context("ml", 80),
+            candidate=candidate,
+            candidate_index=0,
+            binding=_binding("ml"),
+            market_input=_market(MarketType.ML, "away"),
         )
 
 
-@pytest.mark.parametrize(
-    ("assessment_market_type", "context_market_type"),
-    (
-        (MarketType.F5_TOTAL, MarketType.FULL_TOTAL),
-        (MarketType.FULL_TOTAL, MarketType.F5_TOTAL),
-    ),
-)
-def test_total_assessment_requires_the_exact_context_market_type(
-    assessment_market_type: MarketType,
-    context_market_type: MarketType,
-) -> None:
-    assessment = assess_priority_evidence_contract(
-        _candidate(assessment_market_type.value),
-        _binding(assessment_market_type.value),
-        _market(assessment_market_type, "over", line=9.0),
-    )
+def test_bound_admission_rejects_binding_candidate_index_mismatch() -> None:
+    candidate = _candidate("ml")
 
-    with pytest.raises(
-        ValueError,
-        match="evidence_assessment_market_type_mismatch",
-    ):
-        evaluate_priority_admission(
-            PriorityAdmissionContext(
-                market="over",
-                proposed_score=80,
-                evidence_assessment=assessment,
-                evidence_market_type=context_market_type,
-            )
+    with pytest.raises(ValueError, match="binding_candidate_index_mismatch"):
+        evidence_contract_module.evaluate_bound_priority_admission(
+            _admission_context("ml"),
+            candidate=candidate,
+            candidate_index=1,
+            binding=_binding("ml"),
+            market_input=_market(MarketType.ML, "away"),
+        )
+
+
+def test_bound_admission_rejects_unsupported_candidate_rating() -> None:
+    candidate = _candidate("ml", rating="review-only")
+
+    with pytest.raises(ValueError, match="candidate_decision_rating"):
+        evidence_contract_module.evaluate_bound_priority_admission(
+            _admission_context("ml"),
+            candidate=candidate,
+            candidate_index=0,
+            binding=_binding("ml"),
+            market_input=_market(MarketType.ML, "away"),
+        )
+
+
+def test_bound_admission_rejects_noncanonical_side_market_selection() -> None:
+    candidate = _candidate("ml")
+
+    with pytest.raises(ValueError, match="side_market_selected_side"):
+        evidence_contract_module.evaluate_bound_priority_admission(
+            _admission_context("ml"),
+            candidate=candidate,
+            candidate_index=0,
+            binding=_binding("ml"),
+            market_input=_market(MarketType.ML, "SEA"),
+        )
+
+
+def test_bound_admission_rejects_priority_market_mapping_mismatch() -> None:
+    candidate = _candidate("full_total")
+
+    with pytest.raises(ValueError, match="priority_market_mapping_mismatch"):
+        evidence_contract_module.evaluate_bound_priority_admission(
+            _admission_context("under"),
+            candidate=candidate,
+            candidate_index=0,
+            binding=_binding("full_total"),
+            market_input=_market(MarketType.FULL_TOTAL, "over", line=9.0),
         )
 
 
