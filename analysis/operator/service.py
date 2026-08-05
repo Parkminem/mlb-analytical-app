@@ -94,6 +94,7 @@ from .schemas import (
     HistoricalProjectedBundle,
     ProjectedBundle,
     ReviewBundle,
+    is_current_pregame_payload,
 )
 
 
@@ -889,6 +890,7 @@ def run_projected(
         type(bundle) is not ProjectedBundle
         or bundle.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
         or bundle.authority != CURRENT_PREGAME_AUTHORITY
+        or not is_current_pregame_payload(bundle.payload)
     ):
         raise TypeError(
             "normal pregame runner requires a strict current bundle: "
@@ -916,6 +918,7 @@ def run_confirmed(
         type(bundle) is not ConfirmedBundle
         or bundle.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
         or bundle.authority != CURRENT_PREGAME_AUTHORITY
+        or not is_current_pregame_payload(bundle.payload)
     ):
         raise TypeError(
             "normal pregame runner requires a strict current bundle: "

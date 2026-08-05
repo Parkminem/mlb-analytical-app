@@ -62,6 +62,7 @@ from analysis.operator.schemas import (
     HistoricalProjectedBundle,
     HistoricalStrictConfirmedBundleV1,
     HistoricalStrictProjectedBundleV1,
+    PregamePayload,
     ProjectedBundle,
     parse_confirmed_bundle_json,
     parse_historical_confirmed_bundle_json,
@@ -187,13 +188,15 @@ def test_historical_v1_cannot_launder_into_current_v2(
         ),
     ),
 )
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "empty"))
 def test_relaxed_v1_envelope_only_copy_cannot_launder_from_attributes(
     current_type,
     historical_parser,
     mapping_factory,
+    candidate_contract: str,
 ) -> None:
     historical = historical_parser(
-        _raw(historical_bundle_mapping(mapping_factory, "relaxed"))
+        _raw(historical_bundle_mapping(mapping_factory, candidate_contract))
     )
     envelope_only = historical.model_copy(
         update={"schema_version": 2, "authority": "current"}
@@ -1286,6 +1289,78 @@ def test_normal_runner_rejects_model_copy_invalid_current_envelope(
     ledger, bundles = _run_paths(tmp_path)
     bundle = _pregame_bundle(stage, game_factory())
     invalid = bundle.model_copy(update=invalid_envelope)
+
+    with pytest.raises(
+        TypeError,
+        match="normal pregame runner requires a strict current bundle",
+    ):
+        runner(invalid, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "runner",
+        "game_factory",
+        "historical_parser",
+    ),
+    (
+        (
+            "projected",
+            run_projected,
+            _projected_game,
+            parse_historical_projected_bundle_json,
+        ),
+        (
+            "confirmed",
+            run_confirmed,
+            _confirmed_game,
+            parse_historical_confirmed_bundle_json,
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "payload_contract",
+    ("relaxed", "strict", "empty", "generic"),
+)
+def test_normal_runner_rejects_model_copy_noncurrent_payload(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    historical_parser,
+    payload_contract: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    if payload_contract in ("relaxed", "strict"):
+        current = _bundle_with_legacy(
+            stage,
+            game_factory(),
+            _valid_recommended_legacy_mapping(),
+        )
+    else:
+        current = _pregame_bundle(stage, game_factory())
+    if payload_contract == "generic":
+        payload = PregamePayload(
+            game_input=current.payload.game_input,
+            legacy_decision=current.payload.legacy_decision,
+            forecast_config_version=current.payload.forecast_config_version,
+        )
+    else:
+        historical_mapping = json.loads(bundle_canonical_bytes(current))
+        historical_mapping["schema_version"] = 1
+        historical_mapping.pop("authority")
+        if payload_contract == "relaxed":
+            for candidate in historical_mapping["payload"]["legacy_decision"][
+                "candidates"
+            ]:
+                candidate.pop("same_game_pair_compatible")
+        historical = historical_parser(_raw(historical_mapping))
+        payload = historical.payload
+    invalid = current.model_copy(update={"payload": payload})
 
     with pytest.raises(
         TypeError,

@@ -9,14 +9,18 @@ from typing import Annotated, Literal, TypeVar
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
+    InstanceOf,
     StrictBool,
     TypeAdapter,
     ValidateAs,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from analysis.forecasting import NormalizedGameInput
 from analysis.ledger import MarketObservationCommand, OfficialResultCommand
@@ -234,6 +238,18 @@ class _CurrentPregamePayload(BaseModel):
         return value
 
 
+def is_current_pregame_payload(value: object) -> bool:
+    """Return whether value has the exact fresh-run payload runtime type."""
+
+    return type(value) is _CurrentPregamePayload
+
+
+_CurrentPregamePayloadSource = (
+    InstanceOf[_CurrentPregamePayload]
+    | SkipJsonSchema[Mapping[str, object]]
+)
+
+
 def _legacy_candidate_mappings(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, dict):
         return []
@@ -275,7 +291,27 @@ class _HistoricalStrictPregamePayload(BaseModel):
 class _CurrentPregameBundle(_PregameBundle):
     schema_version: Literal[2]
     authority: Literal["current"]
-    payload: _CurrentPregamePayload
+    payload: _CurrentPregamePayloadSource = Field(union_mode="left_to_right")
+
+    @field_validator("payload", mode="after")
+    @classmethod
+    def _materialize_current_payload(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> _CurrentPregamePayload:
+        if is_current_pregame_payload(value):
+            return value
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "current payload must be a mapping or exact current payload"
+            )
+        if info.mode == "json":
+            return _CurrentPregamePayload.model_validate_json(
+                json.dumps(value),
+                strict=True,
+            )
+        return _CurrentPregamePayload.model_validate(value)
 
 
 class _HistoricalPregameBundleV1(_PregameBundle):
