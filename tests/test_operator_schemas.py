@@ -154,10 +154,27 @@ def historical_bundle_mapping(
     if candidate_contract != "empty":
         legacy = _two_candidate_legacy_decision_mapping()
         mapping["payload"]["legacy_decision"] = legacy
+    legacy["model_version"] = "2026-08-03"
     if candidate_contract == "relaxed":
         for candidate in legacy["candidates"]:
             candidate.pop("same_game_pair_compatible")
     return mapping
+
+
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+@pytest.mark.parametrize(
+    "mapping_factory",
+    (projected_bundle_mapping, confirmed_bundle_mapping),
+)
+def test_historical_fixture_preserves_2026_08_03_model_version(
+    mapping_factory,
+    candidate_contract: str,
+) -> None:
+    mapping = historical_bundle_mapping(mapping_factory, candidate_contract)
+
+    assert mapping["payload"]["legacy_decision"]["model_version"] == (
+        "2026-08-03"
+    )
 
 
 def review_bundle_mapping() -> dict[str, object]:
