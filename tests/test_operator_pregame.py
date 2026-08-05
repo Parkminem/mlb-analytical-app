@@ -618,8 +618,24 @@ def _current_authority_registry_snapshot(
             schemas_module._DECISION_AUTHORITIES,
             schemas_module._PAYLOAD_AUTHORITIES,
             schemas_module._BUNDLE_AUTHORITIES,
+            schemas_module._VALIDATION_EVENTS,
         )
     )
+
+
+def _validate_current_bundle_source(
+    current_type,
+    mapping: dict[str, object],
+    validation_path: str,
+):
+    if validation_path == "base_python":
+        return current_type.model_validate(mapping)
+    if validation_path == "adapter_python":
+        return TypeAdapter(current_type).validate_python(mapping)
+    raw = _raw(mapping)
+    if validation_path == "base_json":
+        return current_type.model_validate_json(raw, strict=True)
+    return TypeAdapter(current_type).validate_json(raw, strict=True)
 
 
 def _copy_pydantic_private_state(source: object, target: object) -> None:
@@ -2422,6 +2438,134 @@ def test_normal_runner_accepts_explicit_raw_current_validation(
     assert result.stage == stage
     assert result.game_pk == seed.game_pk
     assert result.managed_bundle.path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "game_factory"),
+    (
+        ("projected", ProjectedBundle, _projected_game),
+        ("confirmed", ConfirmedBundle, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize(
+    "validation_path",
+    ("base_python", "adapter_python", "base_json", "adapter_json"),
+)
+@pytest.mark.parametrize(
+    ("created_at", "expected"),
+    (
+        (
+            "2026-08-05T12:34:56Z",
+            "2026-08-05T12:34:56+00:00",
+        ),
+        (
+            "2026-08-05T12:34:56+09:00",
+            "2026-08-05T12:34:56+09:00",
+        ),
+        (
+            "2026-08-05T12:34:56.123456-04:00",
+            "2026-08-05T12:34:56.123456-04:00",
+        ),
+    ),
+)
+def test_current_validation_preserves_supported_created_at_grammar(
+    stage: str,
+    current_type,
+    game_factory,
+    validation_path: str,
+    created_at: str,
+    expected: str,
+) -> None:
+    seed = _pregame_bundle(stage, game_factory())
+    mapping = json.loads(bundle_canonical_bytes(seed))
+    mapping["created_at"] = created_at
+
+    current = _validate_current_bundle_source(
+        current_type,
+        mapping,
+        validation_path,
+    )
+
+    assert current.created_at.isoformat() == expected
+    assert schemas_module.is_current_pregame_bundle(
+        current,
+        expected_type=current_type,
+        expected_stage=stage,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "current_type", "runner", "game_factory"),
+    (
+        (
+            "projected",
+            ProjectedBundle,
+            run_projected,
+            _projected_game,
+        ),
+        (
+            "confirmed",
+            ConfirmedBundle,
+            run_confirmed,
+            _confirmed_game,
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "validation_path",
+    ("base_python", "adapter_python", "base_json", "adapter_json"),
+)
+@pytest.mark.parametrize(
+    "created_at",
+    (
+        "20260805T123456+00:00",
+        "2026-W32-3T12:34:56+00:00",
+        "2026-08-05T12+00:00",
+        "2026-08-05T12:34:56",
+        "not-a-datetime",
+    ),
+)
+def test_current_validation_rejects_unsupported_created_at_before_writes(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    validation_path: str,
+    created_at: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    seed = _pregame_bundle(stage, game_factory())
+    mapping = json.loads(bundle_canonical_bytes(seed))
+    mapping["created_at"] = created_at
+    registry_before = _current_authority_registry_snapshot()
+
+    try:
+        forged = _validate_current_bundle_source(
+            current_type,
+            mapping,
+            validation_path,
+        )
+    except ValidationError:
+        pass
+    else:
+        assert schemas_module.is_current_pregame_bundle(
+            forged,
+            expected_type=current_type,
+            expected_stage=stage,
+        )
+        result = runner(
+            forged,
+            ledger_path=ledger,
+            bundle_root=bundles,
+        )
+        assert ledger.is_file()
+        assert result.managed_bundle.path.is_file()
+        pytest.fail("unsupported created_at received current authority")
+
+    assert _current_authority_registry_snapshot() == registry_before
+    assert not ledger.exists()
+    assert not bundles.exists()
 
 
 @pytest.mark.parametrize(

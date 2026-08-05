@@ -11,6 +11,7 @@ from typing import Annotated, Literal, TypeVar
 from weakref import ReferenceType, ref
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -43,6 +44,7 @@ from .errors import BundleValidationError
 
 CURRENT_PREGAME_SCHEMA_VERSION = 2
 CURRENT_PREGAME_AUTHORITY = "current"
+_CURRENT_CREATED_AT_ADAPTER = TypeAdapter(dict[str, AwareDatetime])
 
 
 @dataclass(frozen=True)
@@ -643,16 +645,20 @@ class _CurrentPregameBundle(_PregameBundle):
             raise ValueError(
                 "current bundle must be supplied as a raw mapping"
             )
-        created_at = value.get("created_at")
-        if info.mode == "json" and isinstance(created_at, str):
+        if "created_at" not in value:
+            return value
+
+        created_at = {"created_at": value["created_at"]}
+        if info.mode == "json":
+            parsed = _CURRENT_CREATED_AT_ADAPTER.validate_json(
+                json.dumps(created_at),
+                strict=True,
+            )
             normalized = dict(value)
-            try:
-                normalized["created_at"] = datetime.fromisoformat(
-                    created_at
-                )
-            except ValueError:
-                pass
+            normalized["created_at"] = parsed["created_at"]
             return normalized
+
+        _CURRENT_CREATED_AT_ADAPTER.validate_python(created_at)
         return value
 
     @field_validator("authority", mode="after")
