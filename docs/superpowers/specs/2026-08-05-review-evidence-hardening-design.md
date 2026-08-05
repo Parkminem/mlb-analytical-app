@@ -15,32 +15,30 @@ new baseball score.
 
 ### Starter-Dependent Full-Game ML
 
-- The admission input carries an explicit boolean
-  `starter_dependent_full_game_ml`. Set it only when the pregame ML thesis uses
-  starter stability, survival, or suppression as a principal reason. This
-  flag, rather than prose inspection, is the deterministic trigger.
-- A full-game ML candidate with that flag must set the matching immutable
-  candidate metadata and declare `starter_suppression` in both its evidence
-  set and principal-path binding.
+- Every non-pass full-game ML at or above the playable score of `72` must
+  declare at least one canonical starter path in both its evidence set and
+  principal-path binding. This is deterministic and cannot be disabled by a
+  caller-supplied thesis flag.
+- `starter_suppression` represents the selected side's own starter run
+  prevention. `starter_collapse` represents the opposing starter failure path.
+  Either satisfies the ML starter-path contract when its bound side matches
+  the selected ML direction.
 - `starter_suppression` binds exactly one component:
   `{away|home}_pitcher_chain_runs_allowed`. It does not bind workload.
   `starter_collapse` remains the separate runs-plus-workload shape.
 - A missing starter path caps the ML priority score at `71`, which keeps the
   incomplete candidate out of the final priority stack.
-- An ML whose full-game case is genuinely independent of starter stability is
-  not forced to invent a starter path. Existing full-game margin and bullpen
-  requirements remain in force.
+- Existing full-game margin and bullpen requirements remain in force. The new
+  rule makes the starter portion of every playable ML auditable because the
+  fixed ML engine always incorporates the first-five starter structure.
 
 ### Two-Sided Full-Game Over At 9.0 Or Higher
 
-- The admission input carries an explicit boolean `two_sided_over_thesis`,
-  populated from the existing two-sided volatility/scoring analysis. It is
-  active only for a full-game over whose verified market total is `9.0` or
-  higher. This flag, market, direction, and line form the deterministic
-  trigger.
-- A triggered candidate must set matching immutable candidate metadata and
-  declare two distinct canonical scoring paths, one for each team's scoring
-  direction, in both its evidence set and principal-path binding.
+- Every non-pass full-game over at or above the playable score of `72` whose
+  verified market total is `9.0` or higher must declare two distinct canonical
+  scoring paths, one for each team's scoring direction, in both its evidence
+  set and principal-path binding. The trigger is derived only from market type,
+  over direction, verified line, and score; no caller thesis flag exists.
 - A batting-team conversion route uses one of `top_order_matchup`,
   `recent_run_conversion`, or `underdog_run_creation` and binds exactly
   `{side}_full_runs`, `{side}_full_traffic`, and
@@ -69,9 +67,10 @@ new baseball score.
 
 1. Existing baseball layers produce their scores and canonical evidence once.
 2. The market engine produces the unchanged preliminary market decision.
-3. Final admission receives the explicit thesis flag, checks whether the
-   candidate's stated thesis requires the new evidence contract, and applies
-   only the relevant cap when incomplete.
+3. A deterministic evidence-completeness helper receives the candidate, its
+   matching frozen binding, and verified market line. It derives starter-path
+   and per-team scoring-direction coverage from canonical paths and component
+   IDs, then applies only the relevant cap when incomplete.
 4. Fresh-capture validation verifies that every required evidence path has a
    matching principal-path binding.
 5. Postgame review consumes the frozen bindings without reconstructing or
@@ -91,7 +90,8 @@ new baseball score.
 ## Failure Handling
 
 - Incomplete fresh bundles fail validation before a forecast or ledger record
-  is written.
+  is written. Candidate and binding contents are the source of truth; no
+  external completeness boolean is accepted.
 - A complete bundle whose admission cap lowers a candidate below the priority
   threshold remains a valid capture; it is simply omitted from priority.
 - Diagnostics never repair missing evidence and never promote a market.
@@ -119,6 +119,8 @@ new baseball score.
   directions keeps its original score.
 - Two routes using the same canonical path value, two routes covering the same
   scoring side, or a route with the wrong component horizon are rejected.
+- A caller cannot bypass either contract with a false or omitted thesis flag
+  because no such input exists.
 - One-sided totals and lower totals are not accidentally forced into the new
   two-sided contract when their existing engine does not claim that thesis.
 - Historical replay, Shadow authority, same-game assembly, and the full test
