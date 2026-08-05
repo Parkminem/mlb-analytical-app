@@ -1,5 +1,5 @@
 {
-  "version": "2026-08-03",
+  "version": "2026-08-05",
   "fixed_model": true,
   "forecasting": {
     "enabled": true,
@@ -181,6 +181,11 @@
     "late_bullpen_protection_cap": 71,
     "full_game_bullpen_requires_performance_support": true,
     "ml_requires_independent_full_game_margin_path": true,
-    "discontinuous_lineup_over_cap": 69
+    "discontinuous_lineup_over_cap": 69,
+    "ml_starter_evidence_cap": 71,
+    "high_total_two_sided_over_cap": 69,
+    "high_total_two_sided_over_threshold": 9.0,
+    "fresh_review_requires_ml_starter_evidence_binding": true,
+    "fresh_review_requires_high_total_two_sided_bindings": true
   }
 }
