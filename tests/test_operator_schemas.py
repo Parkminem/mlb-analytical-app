@@ -595,6 +595,33 @@ def test_current_bundle_public_dump_paths_are_warning_free(
 
 
 @pytest.mark.parametrize(
+    ("current_type", "mapping_factory"),
+    (
+        (ProjectedBundle, projected_bundle_mapping),
+        (ConfirmedBundle, confirmed_bundle_mapping),
+    ),
+)
+def test_current_runtime_authority_is_absent_from_public_schema_and_dump(
+    current_type,
+    mapping_factory,
+) -> None:
+    bundle = current_type.model_validate(mapping_factory())
+    schema = current_type.model_json_schema()
+    dumped = bundle.model_dump(warnings="error")
+
+    assert set(schema["properties"]) == {
+        "schema_version",
+        "authority",
+        "stage",
+        "game_pk",
+        "created_at",
+        "payload",
+    }
+    assert "runtime_authority" not in json.dumps(schema)
+    assert "runtime_authority" not in json.dumps(dumped, default=str)
+
+
+@pytest.mark.parametrize(
     (
         "historical_parser",
         "mapping_factory",

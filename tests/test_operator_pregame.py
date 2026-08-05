@@ -235,11 +235,31 @@ def _pregame_bundle(stage: str, game):
         if stage == "projected"
         else confirmed_bundle_mapping()
     )
+    mapping["game_pk"] = game.identity.game_pk
     mapping["payload"]["game_input"] = capture_payload(game)
     raw = _raw(mapping)
     if stage == "projected":
         return parse_projected_bundle_json(raw)
     return parse_confirmed_bundle_json(raw)
+
+
+def _validated_current_copy(
+    bundle,
+    *,
+    game_input=None,
+    legacy_decision=None,
+):
+    mapping = json.loads(bundle.model_dump_json(warnings="error"))
+    if game_input is not None:
+        mapping["game_pk"] = game_input.identity.game_pk
+        mapping["payload"]["game_input"] = capture_payload(game_input)
+    if legacy_decision is not None:
+        mapping["payload"]["legacy_decision"] = (
+            canonical_legacy_decision_payload(legacy_decision)
+        )
+    if bundle.stage == "projected":
+        return parse_projected_bundle_json(_raw(mapping))
+    return parse_confirmed_bundle_json(_raw(mapping))
 
 
 def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
@@ -669,13 +689,9 @@ def test_fresh_pregame_rejects_priority_stack_differing_from_assembler(
             ),
         )
 
-    base = _pregame_bundle("projected", game)
-    bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=legacy,
     )
 
     def fail_forecast(*args, **kwargs):
@@ -698,13 +714,9 @@ def test_fresh_pregame_accepts_compatible_ml_and_over_in_score_order(
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
     game, legacy = _compatible_ml_over_case()
-    base = _pregame_bundle("projected", game)
-    bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=legacy,
     )
 
     result = run_projected(
@@ -1134,13 +1146,9 @@ def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
     game, legacy = _compatible_ml_over_case()
-    base = _pregame_bundle("projected", game)
-    fresh_bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    fresh_bundle = _validated_current_copy(
+        _pregame_bundle("projected", game),
+        legacy_decision=legacy,
     )
     first = _record_pre_v2_execution(fresh_bundle, ledger)
 
@@ -1303,6 +1311,223 @@ def test_normal_runner_rejects_model_copy_invalid_current_envelope(
 
     assert not ledger.exists()
     assert not bundles.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "current_type",
+        "runner",
+        "game_factory",
+        "historical_parser",
+    ),
+    (
+        (
+            "projected",
+            ProjectedBundle,
+            run_projected,
+            _projected_game,
+            parse_historical_projected_bundle_json,
+        ),
+        (
+            "confirmed",
+            ConfirmedBundle,
+            run_confirmed,
+            _confirmed_game,
+            parse_historical_confirmed_bundle_json,
+        ),
+    ),
+)
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+@pytest.mark.parametrize("reentry", ("direct", "base_model", "type_adapter"))
+def test_normal_runner_rejects_nested_historical_decision_copy_before_writes(
+    tmp_path: Path,
+    stage: str,
+    current_type,
+    runner,
+    game_factory,
+    historical_parser,
+    candidate_contract: str,
+    reentry: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    if candidate_contract == "empty":
+        current = _pregame_bundle(stage, game_factory())
+    else:
+        current = _bundle_with_legacy(
+            stage,
+            game_factory(),
+            _valid_recommended_legacy_mapping(),
+        )
+    historical_mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(current)),
+        candidate_contract=candidate_contract,
+    )
+    historical = historical_parser(_raw(historical_mapping))
+    laundered = current.model_copy(
+        update={
+            "payload": current.payload.model_copy(
+                update={
+                    "legacy_decision": historical.payload.legacy_decision,
+                }
+            )
+        }
+    )
+    if reentry == "base_model":
+        normal_input = current_type.model_validate(laundered)
+    elif reentry == "type_adapter":
+        normal_input = TypeAdapter(current_type).validate_python(laundered)
+    else:
+        normal_input = laundered
+
+    error = None
+    try:
+        runner(normal_input, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert the public boundary below
+        error = caught
+
+    assert normal_input is laundered
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "cross_game_payload",
+        "cross_game_payload_and_envelope",
+        "envelope_game_pk",
+        "payload_game_input",
+        "current_legacy_decision",
+        "forecast_config_version",
+        "created_at",
+        "stage",
+    ),
+)
+def test_normal_runner_rejects_stale_current_authority_before_writes(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    mutation: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = game_factory()
+    bundle = _pregame_bundle(stage, game)
+    other_game = replace(
+        game_factory(),
+        identity=replace(
+            game_factory().identity,
+            game_pk=game.identity.game_pk + 1,
+        ),
+    )
+    other = _pregame_bundle(stage, other_game)
+
+    if mutation == "cross_game_payload":
+        invalid = bundle.model_copy(update={"payload": other.payload})
+    elif mutation == "cross_game_payload_and_envelope":
+        invalid = bundle.model_copy(
+            update={"game_pk": other.game_pk, "payload": other.payload}
+        )
+    elif mutation == "envelope_game_pk":
+        invalid = bundle.model_copy(update={"game_pk": other.game_pk})
+    elif mutation == "payload_game_input":
+        changed_game = replace(
+            bundle.payload.game_input,
+            captured_at=bundle.payload.game_input.captured_at
+            + timedelta(seconds=1),
+        )
+        invalid = bundle.model_copy(
+            update={
+                "payload": bundle.payload.model_copy(
+                    update={"game_input": changed_game}
+                )
+            }
+        )
+    elif mutation == "current_legacy_decision":
+        other_decision = _bundle_with_legacy(
+            stage,
+            game,
+            _valid_recommended_legacy_mapping(),
+        ).payload.legacy_decision
+        invalid = bundle.model_copy(
+            update={
+                "payload": bundle.payload.model_copy(
+                    update={"legacy_decision": other_decision}
+                )
+            }
+        )
+    elif mutation == "forecast_config_version":
+        invalid = bundle.model_copy(
+            update={
+                "payload": bundle.payload.model_copy(
+                    update={"forecast_config_version": "unvalidated-config"}
+                )
+            }
+        )
+    elif mutation == "created_at":
+        invalid = bundle.model_copy(
+            update={"created_at": bundle.created_at + timedelta(seconds=1)}
+        )
+    else:
+        opposite_stage = "confirmed" if stage == "projected" else "projected"
+        invalid = bundle.model_copy(update={"stage": opposite_stage})
+
+    error = None
+    try:
+        runner(invalid, ledger_path=ledger, bundle_root=bundles)
+    except Exception as caught:  # noqa: BLE001 - assert the public boundary below
+        error = caught
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+    assert type(error) is TypeError
+    assert "normal pregame runner requires a strict current bundle" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("stage", "runner", "game_factory"),
+    (
+        ("projected", run_projected, _projected_game),
+        ("confirmed", run_confirmed, _confirmed_game),
+    ),
+)
+@pytest.mark.parametrize("deep", (False, True))
+@pytest.mark.parametrize("candidate_contract", ("empty", "candidate"))
+def test_normal_runner_accepts_untampered_current_bundle_copy(
+    tmp_path: Path,
+    stage: str,
+    runner,
+    game_factory,
+    deep: bool,
+    candidate_contract: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    if candidate_contract == "candidate":
+        bundle = _bundle_with_legacy(
+            stage,
+            game_factory(),
+            _valid_recommended_legacy_mapping(),
+        )
+    else:
+        bundle = _pregame_bundle(stage, game_factory())
+    bundle = bundle.model_copy(deep=deep)
+
+    result = runner(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert result.stage == stage
+    assert result.game_pk == bundle.game_pk
+    assert ledger.is_file()
+    assert result.managed_bundle.path.is_file()
 
 
 @pytest.mark.parametrize(
@@ -1957,13 +2182,9 @@ def test_historical_replay_rejects_mixed_frozen_candidate_contract(
             for candidate in legacy.candidates
         ),
     )
-    base = _pregame_bundle(stage, game)
-    fresh_bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    fresh_bundle = _validated_current_copy(
+        _pregame_bundle(stage, game),
+        legacy_decision=legacy,
     )
     mapping = _historical_v1_mapping(
         json.loads(bundle_canonical_bytes(fresh_bundle)),
@@ -2135,13 +2356,9 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
             game,
             away_lineup=replace(game.away_lineup, state=LineupState.CONFIRMED),
         )
-    base = _pregame_bundle(stage, game)
-    fresh_bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    fresh_bundle = _validated_current_copy(
+        _pregame_bundle(stage, game),
+        legacy_decision=legacy,
     )
     first = _record_pre_v2_execution(fresh_bundle, ledger)
     assert len(
@@ -2756,14 +2973,10 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
     legacy_change: str,
 ) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
-    base = _pregame_bundle("confirmed", _confirmed_game())
     legacy = _ordered_legacy_decision()
-    bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    bundle = _validated_current_copy(
+        _pregame_bundle("confirmed", _confirmed_game()),
+        legacy_decision=legacy,
     )
     first = run_confirmed(
         bundle,
@@ -2804,12 +3017,9 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
                 *legacy.review_bindings[1:],
             ),
         )
-    corrected_bundle = bundle.model_copy(
-        update={
-            "payload": bundle.payload.model_copy(
-                update={"legacy_decision": corrected_legacy}
-            )
-        }
+    corrected_bundle = _validated_current_copy(
+        bundle,
+        legacy_decision=corrected_legacy,
     )
 
     corrected = run_confirmed(
@@ -3071,14 +3281,10 @@ def test_reordered_equivalent_legacy_replay_skips_forecast(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger_path, bundle_root = _run_paths(tmp_path)
-    base = _pregame_bundle("confirmed", _confirmed_game())
     legacy = _ordered_legacy_decision()
-    bundle = base.model_copy(
-        update={
-            "payload": base.payload.model_copy(
-                update={"legacy_decision": legacy}
-            )
-        }
+    bundle = _validated_current_copy(
+        _pregame_bundle("confirmed", _confirmed_game()),
+        legacy_decision=legacy,
     )
     first = run_confirmed(
         bundle,
@@ -3097,12 +3303,9 @@ def test_reordered_equivalent_legacy_replay_skips_forecast(
             for binding in reversed(legacy.review_bindings)
         ),
     )
-    reordered_bundle = bundle.model_copy(
-        update={
-            "payload": bundle.payload.model_copy(
-                update={"legacy_decision": reordered_legacy}
-            )
-        }
+    reordered_bundle = _validated_current_copy(
+        bundle,
+        legacy_decision=reordered_legacy,
     )
 
     def fail_forecast(*args, **kwargs):
@@ -3177,12 +3380,9 @@ def test_uncertain_or_changed_confirmed_replay_calls_forecast(
             bundle.payload.legacy_decision,
             notes=("operator correction",),
         )
-        replay_bundle = bundle.model_copy(
-            update={
-                "payload": bundle.payload.model_copy(
-                    update={"legacy_decision": changed_legacy}
-                )
-            }
+        replay_bundle = _validated_current_copy(
+            bundle,
+            legacy_decision=changed_legacy,
         )
     else:
         game = bundle.payload.game_input
@@ -3220,12 +3420,9 @@ def test_uncertain_or_changed_confirmed_replay_calls_forecast(
                 game,
                 markets=(changed_market, *game.markets[1:]),
             )
-        replay_bundle = bundle.model_copy(
-            update={
-                "payload": bundle.payload.model_copy(
-                    update={"game_input": changed_game}
-                )
-            }
+        replay_bundle = _validated_current_copy(
+            bundle,
+            game_input=changed_game,
         )
 
     class ForecastCalled(RuntimeError):

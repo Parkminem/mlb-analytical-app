@@ -1,8 +1,10 @@
 """Strict JSON bundle schemas for shadow operator stages."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import datetime
+import hashlib
+import hmac
 import json
 from typing import Annotated, Literal, TypeVar
 
@@ -11,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     InstanceOf,
+    PrivateAttr,
     StrictBool,
     TypeAdapter,
     ValidateAs,
@@ -24,12 +27,14 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from analysis.forecasting import NormalizedGameInput
+from analysis.forecasting.identity import canonical_json, capture_payload
 from analysis.ledger import MarketObservationCommand, OfficialResultCommand
 from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
 from analysis.review.classification import PrincipalPathBinding
 from analysis.shadow import (
     CandidateReviewBinding,
     LegacyDecisionSnapshot,
+    canonical_legacy_decision_payload,
 )
 
 from .errors import BundleValidationError
@@ -37,6 +42,65 @@ from .errors import BundleValidationError
 
 CURRENT_PREGAME_SCHEMA_VERSION = 2
 CURRENT_PREGAME_AUTHORITY = "current"
+_CURRENT_AUTHORITY_TOKEN_BYTES = 32
+
+
+@dataclass(frozen=True)
+class _CurrentPayloadAuthority:
+    token: bytes
+    digest: bytes
+
+
+@dataclass(frozen=True)
+class _CurrentBundleAuthority:
+    payload_token: bytes
+    digest: bytes
+
+
+class _CurrentLegacyDecisionSnapshot(LegacyDecisionSnapshot):
+    """Runtime-only proof that strict current decision validation completed."""
+
+
+def _authority_digest(value: object) -> bytes:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).digest()
+
+
+def _payload_authority_digest(
+    game_input: object,
+    legacy_decision: object,
+    forecast_config_version: object,
+) -> bytes:
+    return _authority_digest(
+        {
+            "game_input": capture_payload(game_input),
+            "legacy_decision": canonical_legacy_decision_payload(
+                legacy_decision
+            ),
+            "forecast_config_version": forecast_config_version,
+        }
+    )
+
+
+def _bundle_authority_digest(
+    *,
+    schema_version: object,
+    authority: object,
+    stage: object,
+    game_pk: object,
+    created_at: object,
+    payload_authority: _CurrentPayloadAuthority,
+) -> bytes:
+    return _authority_digest(
+        {
+            "schema_version": schema_version,
+            "authority": authority,
+            "stage": stage,
+            "game_pk": game_pk,
+            "created_at": created_at,
+            "payload_token": payload_authority.token.hex(),
+            "payload_digest": payload_authority.digest.hex(),
+        }
+    )
 
 
 class PregamePayload(BaseModel):
@@ -148,6 +212,36 @@ class _CurrentLegacyDecisionInput(BaseModel):
 def _current_legacy(
     value: _CurrentLegacyDecisionInput,
 ) -> LegacyDecisionSnapshot:
+    decision = _CurrentLegacyDecisionSnapshot(
+        model_version=value.model_version,
+        candidates=value.candidates,
+        final_priority=value.final_priority,
+        review_bindings=value.review_bindings,
+        notes=value.notes,
+    )
+    object.__setattr__(
+        decision,
+        "_current_authority_token",
+        _authority_digest(
+            {
+                "authority": CURRENT_PREGAME_AUTHORITY,
+                "schema_version": CURRENT_PREGAME_SCHEMA_VERSION,
+                "legacy_decision": canonical_legacy_decision_payload(decision),
+            }
+        ),
+    )
+    return decision
+
+
+_CurrentLegacyDecision = Annotated[
+    LegacyDecisionSnapshot,
+    ValidateAs(_CurrentLegacyDecisionInput, _current_legacy),
+]
+
+
+def _historical_strict_legacy(
+    value: _CurrentLegacyDecisionInput,
+) -> LegacyDecisionSnapshot:
     return LegacyDecisionSnapshot(
         model_version=value.model_version,
         candidates=value.candidates,
@@ -157,9 +251,9 @@ def _current_legacy(
     )
 
 
-_CurrentLegacyDecision = Annotated[
+_HistoricalStrictLegacyDecision = Annotated[
     LegacyDecisionSnapshot,
-    ValidateAs(_CurrentLegacyDecisionInput, _current_legacy),
+    ValidateAs(_CurrentLegacyDecisionInput, _historical_strict_legacy),
 ]
 
 
@@ -230,6 +324,7 @@ class _CurrentPregamePayload(BaseModel):
     game_input: NormalizedGameInput
     legacy_decision: _CurrentLegacyDecision
     forecast_config_version: str
+    _runtime_authority: _CurrentPayloadAuthority = PrivateAttr()
 
     @field_validator("forecast_config_version")
     @classmethod
@@ -238,11 +333,60 @@ class _CurrentPregamePayload(BaseModel):
             raise ValueError("forecast_config_version must be nonempty")
         return value
 
+    def model_post_init(self, context: object) -> None:
+        del context
+        token = getattr(
+            self.legacy_decision,
+            "_current_authority_token",
+            None,
+        )
+        if type(token) is not bytes:
+            raise ValueError("current decision authority is missing")
+        self._runtime_authority = _CurrentPayloadAuthority(
+            token=token,
+            digest=_payload_authority_digest(
+                self.game_input,
+                self.legacy_decision,
+                self.forecast_config_version,
+            ),
+        )
+
 
 def is_current_pregame_payload(value: object) -> bool:
-    """Return whether value has the exact fresh-run payload runtime type."""
+    """Return whether value retains its validated current-runtime authority."""
 
-    return type(value) is _CurrentPregamePayload
+    if type(value) is not _CurrentPregamePayload:
+        return False
+    runtime_authority = getattr(value, "_runtime_authority", None)
+    legacy_decision = value.legacy_decision
+    decision_token = getattr(
+        legacy_decision,
+        "_current_authority_token",
+        None,
+    )
+    if (
+        type(runtime_authority) is not _CurrentPayloadAuthority
+        or type(value.game_input) is not NormalizedGameInput
+        or type(legacy_decision) is not _CurrentLegacyDecisionSnapshot
+        or type(value.forecast_config_version) is not str
+        or not value.forecast_config_version.strip()
+        or type(decision_token) is not bytes
+        or len(decision_token) != _CURRENT_AUTHORITY_TOKEN_BYTES
+        or type(runtime_authority.token) is not bytes
+        or len(runtime_authority.token) != _CURRENT_AUTHORITY_TOKEN_BYTES
+        or type(runtime_authority.digest) is not bytes
+        or not hmac.compare_digest(runtime_authority.token, decision_token)
+    ):
+        return False
+    try:
+        digest = _payload_authority_digest(
+            value.game_input,
+            legacy_decision,
+            value.forecast_config_version,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(runtime_authority.digest, digest)
 
 
 _CurrentPregamePayloadSource = (
@@ -278,7 +422,7 @@ class _HistoricalStrictPregamePayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     game_input: NormalizedGameInput
-    legacy_decision: _CurrentLegacyDecision
+    legacy_decision: _HistoricalStrictLegacyDecision
     forecast_config_version: str
 
     @field_validator("forecast_config_version")
@@ -293,6 +437,7 @@ class _CurrentPregameBundle(_PregameBundle):
     schema_version: Literal[2]
     authority: Literal["current"]
     payload: _CurrentPregamePayloadSource = Field(union_mode="left_to_right")
+    _runtime_authority: _CurrentBundleAuthority = PrivateAttr()
 
     @field_validator("payload", mode="after")
     @classmethod
@@ -301,7 +446,9 @@ class _CurrentPregameBundle(_PregameBundle):
         value: object,
         info: ValidationInfo,
     ) -> _CurrentPregamePayload:
-        if is_current_pregame_payload(value):
+        if type(value) is _CurrentPregamePayload:
+            if not is_current_pregame_payload(value):
+                raise ValueError("current payload authority is invalid")
             return value
         if not isinstance(value, Mapping):
             raise ValueError(
@@ -313,6 +460,21 @@ class _CurrentPregameBundle(_PregameBundle):
                 strict=True,
             )
         return _CurrentPregamePayload.model_validate(value)
+
+    def model_post_init(self, context: object) -> None:
+        del context
+        payload_authority = self.payload._runtime_authority
+        self._runtime_authority = _CurrentBundleAuthority(
+            payload_token=payload_authority.token,
+            digest=_bundle_authority_digest(
+                schema_version=self.schema_version,
+                authority=self.authority,
+                stage=self.stage,
+                game_pk=self.game_pk,
+                created_at=self.created_at,
+                payload_authority=payload_authority,
+            ),
+        )
 
     @field_serializer("payload", return_type=_CurrentPregamePayload)
     def _serialize_current_payload(
@@ -336,6 +498,62 @@ class ConfirmedBundle(_CurrentPregameBundle):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stage: Literal["confirmed"]
+
+
+def is_current_pregame_bundle(
+    value: object,
+    *,
+    expected_type: type[ProjectedBundle] | type[ConfirmedBundle],
+    expected_stage: Literal["projected", "confirmed"],
+) -> bool:
+    """Verify the complete sealed runtime graph for a normal pregame run.
+
+    Untouched shallow and deep copies retain the value-based seal. Pydantic
+    update copies deliberately do not mint a new seal and must be revalidated
+    from an explicit current-v2 mapping before normal execution.
+    """
+
+    if (
+        type(value) is not expected_type
+        or type(value.schema_version) is not int
+        or value.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
+        or type(value.authority) is not str
+        or value.authority != CURRENT_PREGAME_AUTHORITY
+        or type(value.stage) is not str
+        or value.stage != expected_stage
+        or type(value.game_pk) is not int
+        or type(value.created_at) is not datetime
+        or value.created_at.tzinfo is None
+        or value.created_at.utcoffset() is None
+        or not is_current_pregame_payload(value.payload)
+        or value.game_pk != value.payload.game_input.identity.game_pk
+    ):
+        return False
+    runtime_authority = getattr(value, "_runtime_authority", None)
+    payload_authority = value.payload._runtime_authority
+    if (
+        type(runtime_authority) is not _CurrentBundleAuthority
+        or type(runtime_authority.payload_token) is not bytes
+        or type(runtime_authority.digest) is not bytes
+        or type(payload_authority.token) is not bytes
+        or not hmac.compare_digest(
+            runtime_authority.payload_token,
+            payload_authority.token,
+        )
+    ):
+        return False
+    try:
+        digest = _bundle_authority_digest(
+            schema_version=value.schema_version,
+            authority=value.authority,
+            stage=value.stage,
+            game_pk=value.game_pk,
+            created_at=value.created_at,
+            payload_authority=payload_authority,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(runtime_authority.digest, digest)
 
 
 class HistoricalRelaxedProjectedBundleV1(_HistoricalPregameBundleV1):

@@ -89,8 +89,6 @@ from .reporting import (
     write_calibration_reports,
 )
 from .schemas import (
-    CURRENT_PREGAME_AUTHORITY,
-    CURRENT_PREGAME_SCHEMA_VERSION,
     ConfirmedBundle,
     HistoricalRelaxedConfirmedBundleV1,
     HistoricalRelaxedProjectedBundleV1,
@@ -98,7 +96,7 @@ from .schemas import (
     HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     ReviewBundle,
-    is_current_pregame_payload,
+    is_current_pregame_bundle,
 )
 
 
@@ -933,11 +931,10 @@ def run_projected(
 ) -> PregameRunResult:
     """Append or replay one projected-lineup shadow forecast."""
 
-    if (
-        type(bundle) is not ProjectedBundle
-        or bundle.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
-        or bundle.authority != CURRENT_PREGAME_AUTHORITY
-        or not is_current_pregame_payload(bundle.payload)
+    if not is_current_pregame_bundle(
+        bundle,
+        expected_type=ProjectedBundle,
+        expected_stage="projected",
     ):
         raise TypeError(
             "normal pregame runner requires a strict current bundle: "
@@ -961,11 +958,10 @@ def run_confirmed(
 ) -> PregameRunResult:
     """Append or replay one confirmed-lineup shadow forecast."""
 
-    if (
-        type(bundle) is not ConfirmedBundle
-        or bundle.schema_version != CURRENT_PREGAME_SCHEMA_VERSION
-        or bundle.authority != CURRENT_PREGAME_AUTHORITY
-        or not is_current_pregame_payload(bundle.payload)
+    if not is_current_pregame_bundle(
+        bundle,
+        expected_type=ConfirmedBundle,
+        expected_stage="confirmed",
     ):
         raise TypeError(
             "normal pregame runner requires a strict current bundle: "
