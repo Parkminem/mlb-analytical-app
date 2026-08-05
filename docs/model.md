@@ -61,6 +61,8 @@ Every schema-v1 projected or confirmed artifact is historical and replay-only, w
 
 The fixed MLB model version is `2026-08-05`; model version and bundle schema version are independent. This bundle authority boundary does not change MLB scoring, F5 side or F5 total engines, full-game market engines, the same-game candidate assembler, legacy decision authority, or mandatory Shadow behavior.
 
+The `2026-08-05` contract inherits the prior ML bullpen review contract and the prior two-sided under review contract. The new starter-evidence and high-total-over requirements are additive fresh-capture checks; they do not remove or weaken those inherited bindings.
+
 The operator derives capture idempotency intrinsically from the bundle schema version, stage, and exact capture command content except the supersession target. It searches that key before resolving lineage, so an exact replay returns the original immutable capture, forecast, link, and supersession target. New state appends a new capture and explicit supersession relationship; no prior ledger record is edited. Lower-level `record_shadow_run` remains an append-only API whose direct callers supply the capture key.
 
 - every new projected or confirmed `play`/`lean` candidate must be review-eligible;

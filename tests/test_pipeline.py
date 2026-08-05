@@ -118,6 +118,41 @@ class ModelConfigTests(unittest.TestCase):
             ]
         )
 
+    def test_priority_admission_uses_exact_approved_schema(self):
+        config = load_model_config()
+
+        self.assertEqual(
+            set(config["priority_admission"]),
+            {
+                "allow_compatible_side_total_pair",
+                "apply_family_policy_to_f5",
+                "canonical_evidence_paths_only",
+                "caps_only_no_positive_rescoring",
+                "discontinuous_lineup_over_cap",
+                "exclude_market_engine_pass_from_priority",
+                "f5_market_engine_unchanged",
+                "fresh_review_requires_high_total_two_sided_bindings",
+                "fresh_review_requires_ml_starter_evidence_binding",
+                "full_game_bullpen_requires_performance_support",
+                "high_total_two_sided_over_cap",
+                "high_total_two_sided_over_threshold",
+                "incomplete_pitching_chain_cap",
+                "late_bullpen_protection_cap",
+                "matchup_only_side_requires_recent_run_conversion",
+                "missing_evidence_blocks_multi_market_retention",
+                "ml_requires_independent_full_game_margin_path",
+                "ml_starter_evidence_cap",
+                "multi_market_min_score",
+                "one_candidate_per_full_game_family",
+                "require_directional_coherence",
+                "require_distinct_canonical_evidence_paths_for_multi_market_retention",
+                "require_ml_bullpen_review_path",
+                "require_two_sided_under_review_path",
+                "same_game_candidate_assembler",
+                "traffic_only_side_cap",
+            },
+        )
+
     def test_forecasting_addition_preserves_every_legacy_config_value(self):
         config = load_model_config()
         legacy_config = {
@@ -571,6 +606,12 @@ class AnalysisManifestTests(unittest.TestCase):
         self.assertTrue(policy["apply_family_policy_to_f5"])
         self.assertTrue(policy["f5_market_engine_unchanged"])
 
+        self.assertEqual(policy["ml_starter_evidence_cap"], 71)
+        self.assertEqual(policy["high_total_two_sided_over_cap"], 69)
+        self.assertEqual(policy["high_total_two_sided_over_threshold"], 9.0)
+        self.assertTrue(policy["fresh_review_requires_ml_starter_evidence_binding"])
+        self.assertTrue(policy["fresh_review_requires_high_total_two_sided_bindings"])
+
     def test_weather_is_excluded_unless_requested(self):
         manifest = build_analysis_manifest(
             lineup_confirmed=True,
@@ -580,6 +621,37 @@ class AnalysisManifestTests(unittest.TestCase):
 
         self.assertFalse(manifest["include_weather"])
         self.assertNotIn("weather_and_park", manifest["required_inputs"])
+
+
+class CurrentRuntimeDocumentationTests(unittest.TestCase):
+    def test_current_runtime_docs_publish_the_current_legacy_version(self):
+        project_root = Path(__file__).resolve().parents[1]
+        expected_current_runtime_text = {
+            "README.md": "고정 MLB model version은 `2026-08-05`",
+            "docs/analysis-output-template.md": (
+                "Use legacy model version `2026-08-05` for every fresh"
+            ),
+            "docs/shadow-operator.md": (
+                "the current legacy model version is `2026-08-05`"
+            ),
+        }
+        for relative_path, expected_text in expected_current_runtime_text.items():
+            with self.subTest(path=relative_path):
+                text = (project_root / relative_path).read_text(encoding="utf-8")
+                self.assertIn(expected_text, text)
+
+    def test_model_docs_state_inherited_review_contracts(self):
+        project_root = Path(__file__).resolve().parents[1]
+        text = (project_root / "docs/model.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "The `2026-08-05` contract inherits the prior ML bullpen review contract",
+            text,
+        )
+        self.assertIn(
+            "the prior two-sided under review contract",
+            text,
+        )
 
 
 if __name__ == "__main__":

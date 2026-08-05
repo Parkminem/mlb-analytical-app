@@ -19,6 +19,7 @@ from analysis.review.classification import (
     PrincipalPathBinding,
 )
 from analysis.review.evidence_contract import assess_priority_evidence_contract
+from analysis.pipeline import load_model_config
 from analysis.shadow import CandidateReviewBinding
 
 
@@ -174,6 +175,31 @@ def test_playable_ml_without_a_bound_starter_path_is_capped() -> None:
     assert assessment.score_cap == 71
     assert assessment.reason_codes == ("missing_ml_starter_evidence",)
     assert _admission_score(assessment) == 71
+
+
+def test_code_derived_caps_match_approved_model_config() -> None:
+    priority_config = load_model_config()["priority_admission"]
+
+    ml_assessment = assess_priority_evidence_contract(
+        _candidate("ml"),
+        _binding("ml"),
+        _market(MarketType.ML, "away"),
+    )
+    total_assessment = assess_priority_evidence_contract(
+        _candidate("full_total"),
+        _binding("full_total"),
+        _market(
+            MarketType.FULL_TOTAL,
+            "over",
+            line=priority_config["high_total_two_sided_over_threshold"],
+        ),
+    )
+
+    assert ml_assessment.score_cap == priority_config["ml_starter_evidence_cap"]
+    assert (
+        total_assessment.score_cap
+        == priority_config["high_total_two_sided_over_cap"]
+    )
 
 
 def test_assessment_cannot_cap_a_different_priority_market() -> None:

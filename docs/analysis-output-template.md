@@ -37,7 +37,7 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 Postgame review cannot invent or change these paths, IDs, rules, or intervals. A missing/invalid binding, candidate/market mismatch, unknown market, invalid path count or shape, or missing component distribution makes that market review-ineligible; state the reason and do not infer a substitute. See [Pregame Principal-Path Binding](model.md#pregame-principal-path-binding) for the authoritative contract.
 
-Use legacy model version `2026-08-03` for every fresh projected or confirmed capture. A stale model version is accepted only when the Operator finds and returns its exact immutable historical replay before fresh-capture validation.
+Use legacy model version `2026-08-05` for every fresh projected or confirmed capture. A stale model version is accepted only when the Operator finds and returns its exact immutable historical replay before fresh-capture validation.
 
 ## Operator Bundle Handoff
 
@@ -53,7 +53,7 @@ Fresh projected and confirmed commands require schema v2 with explicit current a
 
 Review remains schema v1 and receives the exact frozen IDs from the successful confirmed command. Every pregame schema-v1 shape, relaxed or strict, is historical exact replay only: it must come from the authenticated managed root and match an existing ledger capture, forecast, and link. Regenerate any pending unexecuted pregame v1 file as schema v2/current; rejection must not change ledger or managed bytes.
 
-Bundle schema and model version are independent. The v2 handoff leaves model `2026-08-03`, MLB scoring, F5 side and F5 total logic, full-game market engines, the same-game assembler, legacy authority, and Shadow recommendation restrictions unchanged.
+Bundle schema and model version are independent. The v2 handoff leaves model `2026-08-05`, MLB scoring, F5 side and F5 total logic, full-game market engines, the same-game assembler, legacy authority, and Shadow recommendation restrictions unchanged.
 
 ## Game Review
 
