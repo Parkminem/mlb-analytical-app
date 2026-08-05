@@ -64,6 +64,7 @@ from analysis.operator.schemas import (
     HistoricalStrictProjectedBundleV1,
     PregamePayload,
     ProjectedBundle,
+    ReviewBundle,
     parse_confirmed_bundle_json,
     parse_historical_confirmed_bundle_json,
     parse_historical_projected_bundle_json,
@@ -436,12 +437,16 @@ def _write_hash_named_managed_bundle(
 
 def _historical_v1_mapping(
     mapping: dict[str, object],
+    *,
+    candidate_contract: str = "relaxed",
 ) -> dict[str, object]:
     historical = deepcopy(mapping)
     historical["schema_version"] = 1
     historical.pop("authority")
-    for candidate in historical["payload"]["legacy_decision"]["candidates"]:
-        candidate.pop("same_game_pair_compatible", None)
+    if candidate_contract == "relaxed":
+        candidates = historical["payload"]["legacy_decision"]["candidates"]
+        for candidate in candidates:
+            candidate.pop("same_game_pair_compatible", None)
     return historical
 
 
@@ -1609,29 +1614,117 @@ def test_historical_nested_payload_dump_cannot_create_current_pregame_run(
 
 
 @pytest.mark.parametrize(
-    ("stage", "runner", "historical_replay", "game_factory"),
+    (
+        "mapping_factory",
+        "relaxed_type",
+        "strict_type",
+    ),
+    (
+        (
+            projected_bundle_mapping,
+            HistoricalRelaxedProjectedBundleV1,
+            HistoricalStrictProjectedBundleV1,
+        ),
+        (
+            confirmed_bundle_mapping,
+            HistoricalRelaxedConfirmedBundleV1,
+            HistoricalStrictConfirmedBundleV1,
+        ),
+    ),
+)
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict", "empty"))
+def test_authenticated_v1_managed_bundle_preserves_historical_shape(
+    tmp_path: Path,
+    mapping_factory,
+    relaxed_type,
+    strict_type,
+    candidate_contract: str,
+) -> None:
+    mapping = historical_bundle_mapping(mapping_factory, candidate_contract)
+    source = _write_hash_named_managed_bundle(mapping, tmp_path)
+    original_bytes = source.read_bytes()
+
+    artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=tmp_path,
+    )
+
+    assert isinstance(artifact, ReplayOnlyPregameBundle)
+    expected_type = (
+        strict_type if candidate_contract == "strict" else relaxed_type
+    )
+    assert type(artifact.bundle) is expected_type
+    assert artifact.managed_bundle.path == source.resolve()
+    assert artifact.managed_bundle.bundle_hash == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+    assert artifact.managed_bundle.replayed is True
+    assert source.read_bytes() == original_bytes
+
+    dumped = artifact.bundle.model_dump()
+    dumped_json = json.loads(artifact.bundle.model_dump_json())
+    nested_payload = artifact.bundle.payload.model_dump()
+    expected_presence = candidate_contract == "strict"
+    for payload in (dumped["payload"], dumped_json["payload"], nested_payload):
+        candidates = payload["legacy_decision"]["candidates"]
+        assert all(
+            ("same_game_pair_compatible" in candidate) is expected_presence
+            for candidate in candidates
+        )
+
+
+def test_historical_loader_keeps_review_v1_on_current_review_parser(
+    tmp_path: Path,
+) -> None:
+    source = _write_hash_named_managed_bundle(review_bundle_mapping(), tmp_path)
+
+    artifact = bundles_module.load_historical_managed_bundle(
+        source,
+        root=tmp_path,
+    )
+
+    assert type(artifact) is ReviewBundle
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "historical_parser",
+        "historical_replay",
+        "relaxed_type",
+        "strict_type",
+        "game_factory",
+    ),
     (
         (
             "projected",
-            run_projected,
+            parse_historical_projected_bundle_json,
             replay_historical_projected,
+            HistoricalRelaxedProjectedBundleV1,
+            HistoricalStrictProjectedBundleV1,
             _projected_game,
         ),
         (
             "confirmed",
-            run_confirmed,
+            parse_historical_confirmed_bundle_json,
             replay_historical_confirmed,
+            HistoricalRelaxedConfirmedBundleV1,
+            HistoricalStrictConfirmedBundleV1,
             _confirmed_game,
         ),
     ),
 )
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
 def test_historical_dedicated_replay_preserves_managed_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
-    runner,
+    historical_parser,
     historical_replay,
+    relaxed_type,
+    strict_type,
     game_factory,
+    candidate_contract: str,
 ) -> None:
     ledger, bundles = _run_paths(tmp_path)
     empty_ledger = tmp_path / "empty-ledger" / "shadow.jsonl"
@@ -1640,28 +1733,36 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
         game_factory(),
         _valid_recommended_legacy_mapping(),
     )
-    first = _record_pre_v2_execution(fresh_bundle, ledger)
+    mapping = _historical_v1_mapping(
+        json.loads(bundle_canonical_bytes(fresh_bundle)),
+        candidate_contract=candidate_contract,
+    )
+    source = _write_hash_named_managed_bundle(mapping, bundles)
+    original_bytes = source.read_bytes()
+    historical_bundle = historical_parser(original_bytes)
+    expected_type = (
+        strict_type if candidate_contract == "strict" else relaxed_type
+    )
+    assert type(historical_bundle) is expected_type
+    first = _record_pre_v2_execution(historical_bundle, ledger)
 
-    historical_outputs = json.loads(canonical_json(first.forecast.outputs))
-    del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
-        "same_game_pair_compatible"
-    ]
-    _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+    if candidate_contract == "relaxed":
+        historical_outputs = json.loads(canonical_json(first.forecast.outputs))
+        del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
+            "same_game_pair_compatible"
+        ]
+        _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
     historical_forecast = next(
         record
         for record in LedgerStore(ledger).iter_records("forecast")
         if isinstance(record, ForecastRecord)
     )
-
-    mapping = _historical_v1_mapping(
-        json.loads(bundle_canonical_bytes(fresh_bundle))
-    )
-    source = _write_hash_named_managed_bundle(mapping, bundles)
     files_before_replay = {
         path.relative_to(bundles): path.read_bytes()
         for path in bundles.rglob("*")
         if path.is_file()
     }
+    ledger_before_replay = ledger.read_bytes()
 
     def fail_historical_side_effect(*args, **kwargs):
         raise AssertionError("historical replay reached a forbidden write path")
@@ -1698,9 +1799,11 @@ def test_historical_dedicated_replay_preserves_managed_artifact(
     assert replay.link == first.link
     assert replay.managed_bundle.path == source.resolve()
     assert replay.managed_bundle.bundle_hash == hashlib.sha256(
-        source.read_bytes()
+        original_bytes
     ).hexdigest()
     assert replay.managed_bundle.replayed is True
+    assert source.read_bytes() == original_bytes
+    assert ledger.read_bytes() == ledger_before_replay
     assert not empty_ledger.exists()
     assert {
         path.relative_to(bundles): path.read_bytes()
@@ -1829,7 +1932,7 @@ def test_two_market_historical_replay_cannot_substitute_runner_or_provenance(
         )
     with pytest.raises(
         OperatorPreconditionError,
-        match="historical replay requires a pre-change managed bundle",
+        match="historical replay requires a schema-v1 managed bundle",
     ):
         historical_replay(
             current_managed.path,

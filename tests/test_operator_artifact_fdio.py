@@ -62,21 +62,29 @@ def _substitute_after_exclusive_lock(
     monkeypatch.setattr(module.fcntl, "flock", adversarial_flock)
 
 
-def _historical_bundle_mapping(note: str) -> dict[str, object]:
+def _historical_bundle_mapping(
+    note: str,
+    candidate_contract: str,
+) -> dict[str, object]:
     mapping = projected_bundle_mapping()
+    mapping["schema_version"] = 1
+    mapping.pop("authority")
     legacy = _complete_legacy_decision_mapping()
     legacy["notes"] = [note]
-    del legacy["candidates"][0]["same_game_pair_compatible"]
+    if candidate_contract == "relaxed":
+        del legacy["candidates"][0]["same_game_pair_compatible"]
     mapping["payload"]["legacy_decision"] = legacy
     return mapping
 
 
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
 def test_historical_loader_rejects_symlinked_game_directory_alias(
     tmp_path: Path,
+    candidate_contract: str,
 ) -> None:
     root = tmp_path / "bundles"
     source = _write_hash_named_managed_bundle(
-        _historical_bundle_mapping("original"),
+        _historical_bundle_mapping("original", candidate_contract),
         root,
     )
     alias = root / "game-alias"
@@ -86,16 +94,18 @@ def test_historical_loader_rejects_symlinked_game_directory_alias(
         load_historical_managed_bundle(alias / source.name, root=root)
 
 
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
 def test_historical_loader_rejects_file_swap_between_validation_and_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    candidate_contract: str,
 ) -> None:
     root = tmp_path / "bundles"
     inside_raw = canonical_json(
-        _historical_bundle_mapping("inside")
+        _historical_bundle_mapping("inside", candidate_contract)
     ).encode("utf-8")
     outside_raw = canonical_json(
-        _historical_bundle_mapping("outside")
+        _historical_bundle_mapping("outside", candidate_contract)
     ).encode("utf-8")
     outside_hash = hashlib.sha256(outside_raw).hexdigest()
     game_dir = root / "900001"
@@ -131,15 +141,38 @@ def test_historical_loader_rejects_file_swap_between_validation_and_read(
     assert outside.read_bytes() == outside_raw
 
 
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
+def test_historical_loader_rejects_nonregular_bundle_file(
+    tmp_path: Path,
+    candidate_contract: str,
+) -> None:
+    root = tmp_path / "bundles"
+    raw = canonical_json(
+        _historical_bundle_mapping("nonregular", candidate_contract)
+    ).encode("utf-8")
+    bundle_hash = hashlib.sha256(raw).hexdigest()
+    source = (
+        root
+        / "900001"
+        / f"projected-v1-{bundle_hash[:16]}.json"
+    )
+    source.mkdir(parents=True)
+
+    with pytest.raises(OperatorIOError, match="regular file"):
+        load_historical_managed_bundle(source, root=root)
+
+
 @pytest.mark.parametrize("substitution", ("root", "game", "file"))
+@pytest.mark.parametrize("candidate_contract", ("relaxed", "strict"))
 def test_historical_loader_rejects_authenticated_path_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     substitution: str,
+    candidate_contract: str,
 ) -> None:
     root = tmp_path / "bundles"
     source = _write_hash_named_managed_bundle(
-        _historical_bundle_mapping("authenticated"),
+        _historical_bundle_mapping("authenticated", candidate_contract),
         root,
     )
     raw = source.read_bytes()

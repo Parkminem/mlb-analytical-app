@@ -14,7 +14,7 @@ from pydantic import TypeAdapter
 from analysis.forecasting.identity import canonical_json
 from analysis.ledger import CaptureCommand
 
-from .errors import BundleValidationError, OperatorIOError
+from .errors import OperatorIOError
 from .fdio import (
     create_exclusive_file,
     open_directory,
@@ -28,8 +28,10 @@ from .fdio import (
 )
 from .schemas import (
     ConfirmedBundle,
-    HistoricalConfirmedBundle,
-    HistoricalProjectedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     ReviewBundle,
     bundle_stage_from_json,
@@ -42,6 +44,12 @@ from .schemas import (
 
 
 _Bundle = ProjectedBundle | ConfirmedBundle | ReviewBundle
+HistoricalPregameBundleV1 = (
+    HistoricalRelaxedProjectedBundleV1
+    | HistoricalStrictProjectedBundleV1
+    | HistoricalRelaxedConfirmedBundleV1
+    | HistoricalStrictConfirmedBundleV1
+)
 _BUNDLE_ADAPTERS = {
     ProjectedBundle: TypeAdapter(ProjectedBundle),
     ConfirmedBundle: TypeAdapter(ConfirmedBundle),
@@ -79,9 +87,9 @@ class ManagedBundleCopy:
 
 @dataclass(frozen=True)
 class ReplayOnlyPregameBundle:
-    """Authenticated pre-change data for the path-based replay service only."""
+    """Authenticated schema-v1 data for the path-based replay service only."""
 
-    bundle: HistoricalProjectedBundle | HistoricalConfirmedBundle
+    bundle: HistoricalPregameBundleV1
     managed_bundle: ManagedBundleCopy
 
 
@@ -167,16 +175,16 @@ def load_historical_managed_bundle(
         if actual_hash[:16] != filename_match.group("hash_prefix"):
             raise OperatorIOError("historical managed bundle hash is invalid")
         stage = bundle_stage_from_json(raw)
-        replay_only = False
-        try:
-            bundle = _BUNDLE_PARSERS[stage](raw)
-        except BundleValidationError:
+        filename_version = int(filename_match.group("schema_version"))
+        if stage in ("projected", "confirmed") and filename_version == 1:
             bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
-            replay_only = stage in ("projected", "confirmed")
+            replay_only = True
+        else:
+            bundle = _BUNDLE_PARSERS[stage](raw)
+            replay_only = False
         if (
             stage != filename_match.group("stage")
-            or bundle.schema_version
-            != int(filename_match.group("schema_version"))
+            or bundle.schema_version != filename_version
             or game_name != str(bundle.game_pk)
         ):
             raise OperatorIOError(
@@ -527,6 +535,7 @@ def persist_managed_bundle(
 
 __all__ = (
     "DEFAULT_BUNDLE_ROOT",
+    "HistoricalPregameBundleV1",
     "ManagedBundleCopy",
     "ReplayOnlyPregameBundle",
     "bundle_canonical_bytes",

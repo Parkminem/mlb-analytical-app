@@ -7,6 +7,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TypeVar
 
+from pydantic import BaseModel
+
 from analysis.forecasting import LineupState, run_forecast
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.engine import (
@@ -90,8 +92,10 @@ from .schemas import (
     CURRENT_PREGAME_AUTHORITY,
     CURRENT_PREGAME_SCHEMA_VERSION,
     ConfirmedBundle,
-    HistoricalConfirmedBundle,
-    HistoricalProjectedBundle,
+    HistoricalRelaxedConfirmedBundleV1,
+    HistoricalRelaxedProjectedBundleV1,
+    HistoricalStrictConfirmedBundleV1,
+    HistoricalStrictProjectedBundleV1,
     ProjectedBundle,
     ReviewBundle,
     is_current_pregame_payload,
@@ -106,8 +110,10 @@ _Bundle = ProjectedBundle | ConfirmedBundle
 _ReplayBundle = (
     ProjectedBundle
     | ConfirmedBundle
-    | HistoricalProjectedBundle
-    | HistoricalConfirmedBundle
+    | HistoricalRelaxedProjectedBundleV1
+    | HistoricalStrictProjectedBundleV1
+    | HistoricalRelaxedConfirmedBundleV1
+    | HistoricalStrictConfirmedBundleV1
 )
 _T = TypeVar("_T")
 _HEAD_CAS_MAX_ATTEMPTS = 3
@@ -937,9 +943,7 @@ def _replay_historical_pregame(
     path: str | Path,
     *,
     expected_stage: str,
-    expected_type: (
-        type[HistoricalProjectedBundle] | type[HistoricalConfirmedBundle]
-    ),
+    expected_types: tuple[type[BaseModel], ...],
     ledger_path: str | Path,
     bundle_root: str | Path,
     registry_root: str | Path | None,
@@ -947,10 +951,10 @@ def _replay_historical_pregame(
     artifact = load_historical_managed_bundle(path, root=bundle_root)
     if not isinstance(artifact, ReplayOnlyPregameBundle):
         raise OperatorPreconditionError(
-            "historical replay requires a pre-change managed bundle"
+            "historical replay requires a schema-v1 managed bundle"
         )
     bundle = artifact.bundle
-    if type(bundle) is not expected_type or bundle.stage != expected_stage:
+    if type(bundle) not in expected_types or bundle.stage != expected_stage:
         raise OperatorPreconditionError("historical replay stage/type mismatch")
 
     _validate_game(bundle, expected_stage)
@@ -1010,7 +1014,10 @@ def replay_historical_projected(
     return _replay_historical_pregame(
         path,
         expected_stage="projected",
-        expected_type=HistoricalProjectedBundle,
+        expected_types=(
+            HistoricalRelaxedProjectedBundleV1,
+            HistoricalStrictProjectedBundleV1,
+        ),
         ledger_path=ledger_path,
         bundle_root=bundle_root,
         registry_root=registry_root,
@@ -1029,7 +1036,10 @@ def replay_historical_confirmed(
     return _replay_historical_pregame(
         path,
         expected_stage="confirmed",
-        expected_type=HistoricalConfirmedBundle,
+        expected_types=(
+            HistoricalRelaxedConfirmedBundleV1,
+            HistoricalStrictConfirmedBundleV1,
+        ),
         ledger_path=ledger_path,
         bundle_root=bundle_root,
         registry_root=registry_root,
