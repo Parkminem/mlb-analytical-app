@@ -7,6 +7,7 @@ import warnings
 
 import pytest
 
+import analysis.operator.bundles as bundles_module
 import analysis.operator.service as service_module
 import analysis.shadow as shadow_module
 from analysis.operator.bundles import (
@@ -33,6 +34,7 @@ from analysis.ledger import (
     LedgerHeadChangedError,
     LedgerReferenceError,
     LedgerStore,
+    linked_shadow_comparison,
 )
 from analysis.ledger.forecast_codec import (
     compact_forecast_outputs,
@@ -114,7 +116,6 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
         contradiction_rule=ContradictionRule.STARTER_SUPPRESSION,
     )
     ml_paths = (
-        starter_path,
         PrincipalPathBinding(
             evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
             component_ids=(
@@ -155,6 +156,7 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
             evidence_paths=frozenset(
                 path.evidence_path for path in ml_paths
             ),
+            same_game_pair_compatible=True,
         ),
         PriorityMarketCandidate(
             market="full_total",
@@ -163,6 +165,7 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
             evidence_paths=frozenset(
                 path.evidence_path for path in under_paths
             ),
+            same_game_pair_compatible=True,
         ),
     )
     return LegacyDecisionSnapshot(
@@ -185,6 +188,98 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
         ),
         notes=("canonical replay order",),
     )
+
+
+def _compatible_ml_over_case() -> tuple[object, LegacyDecisionSnapshot]:
+    game = _projected_game()
+    full_over = replace(
+        next(market for market in game.markets if market.market_key == "full_under"),
+        market_key="full_over",
+        selected_side="over",
+    )
+    game = replace(
+        game,
+        markets=tuple(
+            full_over if market.market_key == "full_under" else market
+            for market in game.markets
+        ),
+    )
+    top_order_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.TOP_ORDER_MATCHUP,
+        component_ids=(
+            "away_full_runs",
+            "away_full_traffic",
+            "away_full_extra_base_hits",
+        ),
+        contradiction_rule=ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+    )
+    bullpen_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.BULLPEN_PROTECTION,
+        component_ids=(
+            "home_bullpen_runs_allowed",
+            "home_protected_bullpen_close_entry",
+        ),
+        contradiction_rule=ContradictionRule.BULLPEN_PROTECTION,
+    )
+    starter_collapse_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.STARTER_COLLAPSE,
+        component_ids=(
+            "home_pitcher_chain_runs_allowed",
+            "home_pitcher_chain_workload_outs",
+        ),
+        contradiction_rule=ContradictionRule.STARTER_COLLAPSE,
+    )
+    recent_conversion_path = PrincipalPathBinding(
+        evidence_path=PriorityEvidencePath.RECENT_RUN_CONVERSION,
+        component_ids=(
+            "home_full_runs",
+            "home_full_traffic",
+            "home_full_extra_base_hits",
+        ),
+        contradiction_rule=ContradictionRule.TOP_ORDER_OR_RECENT_CONVERSION,
+    )
+    ml_paths = (top_order_path, bullpen_path)
+    total_paths = (starter_collapse_path, recent_conversion_path)
+    legacy = LegacyDecisionSnapshot(
+        model_version="2026-08-03",
+        candidates=(
+            PriorityMarketCandidate(
+                market="ml",
+                score=77,
+                decision_rating="play",
+                evidence_paths=frozenset(
+                    path.evidence_path for path in ml_paths
+                ),
+                same_game_pair_compatible=True,
+            ),
+            PriorityMarketCandidate(
+                market="full_total",
+                score=83,
+                decision_rating="play",
+                evidence_paths=frozenset(
+                    path.evidence_path for path in total_paths
+                ),
+                same_game_pair_compatible=True,
+            ),
+        ),
+        final_priority=("full_total", "ml"),
+        review_bindings=(
+            CandidateReviewBinding(
+                market_key="sea_ml",
+                legacy_candidate_index=0,
+                legacy_market="ml",
+                principal_paths=ml_paths,
+            ),
+            CandidateReviewBinding(
+                market_key="full_over",
+                legacy_candidate_index=1,
+                legacy_market="full_total",
+                principal_paths=total_paths,
+            ),
+        ),
+        notes=("compatible score-sorted priority",),
+    )
+    return game, legacy
 
 
 def _run_paths(tmp_path: Path) -> tuple[Path, Path]:
@@ -307,6 +402,138 @@ def test_invalid_recommended_contract_before_forecast(
 
     assert not ledger.exists()
     assert not bundles.exists()
+
+
+@pytest.mark.parametrize(
+    "violation",
+    ("below_threshold", "duplicate_side_family", "correlated", "incompatible"),
+)
+def test_fresh_pregame_rejects_priority_stack_differing_from_assembler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    violation: str,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game, legacy = _compatible_ml_over_case()
+
+    if violation == "below_threshold":
+        legacy = replace(
+            legacy,
+            candidates=(replace(legacy.candidates[0], score=71),),
+            final_priority=("ml",),
+            review_bindings=(legacy.review_bindings[0],),
+        )
+    elif violation == "duplicate_side_family":
+        handicap_paths = legacy.review_bindings[1].principal_paths
+        legacy = replace(
+            legacy,
+            candidates=(
+                legacy.candidates[0],
+                replace(
+                    legacy.candidates[1],
+                    market="plus_1_5",
+                    score=76,
+                    same_game_pair_compatible=False,
+                ),
+            ),
+            final_priority=("ml", "plus_1_5"),
+            review_bindings=(
+                legacy.review_bindings[0],
+                CandidateReviewBinding(
+                    market_key="sea_plus_1_5",
+                    legacy_candidate_index=1,
+                    legacy_market="plus_1_5",
+                    principal_paths=handicap_paths,
+                ),
+            ),
+        )
+    elif violation == "correlated":
+        shared_path = legacy.review_bindings[0].principal_paths[0]
+        total_binding = legacy.review_bindings[1]
+        correlated_paths = (
+            total_binding.principal_paths[0],
+            shared_path,
+        )
+        legacy = replace(
+            legacy,
+            candidates=(
+                legacy.candidates[0],
+                replace(
+                    legacy.candidates[1],
+                    evidence_paths=frozenset(
+                        path.evidence_path for path in correlated_paths
+                    ),
+                ),
+            ),
+            review_bindings=(
+                legacy.review_bindings[0],
+                replace(total_binding, principal_paths=correlated_paths),
+            ),
+        )
+    else:
+        legacy = replace(
+            legacy,
+            candidates=tuple(
+                replace(candidate, same_game_pair_compatible=False)
+                for candidate in legacy.candidates
+            ),
+        )
+
+    base = _pregame_bundle("projected", game)
+    bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("forecast must not run")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    with pytest.raises(
+        OperatorPreconditionError,
+        match="final_priority must exactly match assembled priority",
+    ):
+        run_projected(bundle, ledger_path=ledger, bundle_root=bundles)
+
+    assert not ledger.exists()
+    assert not bundles.exists()
+
+
+def test_fresh_pregame_accepts_compatible_ml_and_over_in_score_order(
+    tmp_path: Path,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game, legacy = _compatible_ml_over_case()
+    base = _pregame_bundle("projected", game)
+    bundle = base.model_copy(
+        update={
+            "payload": base.payload.model_copy(
+                update={"legacy_decision": legacy}
+            )
+        }
+    )
+
+    result = run_projected(
+        bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    frozen = shadow_module.deserialize_shadow_comparison(
+        linked_shadow_comparison(result.link, result.forecast)
+    ).legacy
+    assert frozen.final_priority == ("full_total", "ml")
+    scores_by_market = {
+        candidate.market: candidate.score for candidate in frozen.candidates
+    }
+    assert tuple(
+        (market, scores_by_market[market])
+        for market in frozen.final_priority
+    ) == (("full_total", 83), ("ml", 77))
 
 
 def test_invalid_static_path_count_rejects_before_forecast_without_artifacts(
@@ -711,6 +938,66 @@ def test_historical_invalid_recommended_command_replays(
     assert len(tuple(LedgerStore(ledger).iter_records())) == 3
 
 
+def test_pre_change_schema_v1_bundle_and_shadow_payload_exact_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, bundles = _run_paths(tmp_path)
+    game = _projected_game()
+    legacy = _valid_recommended_legacy_mapping()
+    fresh_bundle = _bundle_with_legacy("projected", game, legacy)
+    first = run_projected(
+        fresh_bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    historical_outputs = json.loads(canonical_json(first.forecast.outputs))
+    del historical_outputs["shadow_comparison"]["legacy"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    _rewrite_forecast_outputs(ledger, first.forecast, historical_outputs)
+    historical_forecast = next(
+        record
+        for record in LedgerStore(ledger).iter_records("forecast")
+        if isinstance(record, ForecastRecord)
+    )
+
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["game_input"] = capture_payload(game)
+    mapping["payload"]["legacy_decision"] = legacy
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    raw = canonical_json(mapping).encode("utf-8")
+    bundle_hash = hashlib.sha256(raw).hexdigest()
+    game_dir = bundles / str(mapping["game_pk"])
+    source = game_dir / f"projected-v1-{bundle_hash[:16]}.json"
+    source.write_bytes(raw)
+    historical_bundle = bundles_module.load_historical_managed_bundle(
+        source,
+        root=bundles,
+    )
+
+    def fail_forecast(*args, **kwargs):
+        raise AssertionError("exact historical replay must not run forecast")
+
+    monkeypatch.setattr(service_module, "run_forecast", fail_forecast)
+
+    replay = run_projected(
+        historical_bundle,
+        ledger_path=ledger,
+        bundle_root=bundles,
+    )
+
+    assert replay.capture == first.capture
+    assert replay.forecast == historical_forecast
+    assert replay.link == first.link
+    assert replay.capture_replayed is True
+    assert replay.forecast_replayed is True
+    assert replay.link_replayed is True
+
+
 def _rewrite_forecast_outputs(
     ledger_path: Path,
     forecast: ForecastRecord,
@@ -862,6 +1149,33 @@ def test_load_bundle_delegates_strict_stage_schema_parsing(tmp_path: Path) -> No
 
     assert isinstance(loaded, ProjectedBundle)
     assert loaded == _projected_bundle()
+
+
+def test_historical_schema_v1_managed_bundle_defaults_missing_compatibility(
+    tmp_path: Path,
+) -> None:
+    mapping = projected_bundle_mapping()
+    mapping["payload"]["legacy_decision"] = (
+        _complete_legacy_decision_mapping()
+    )
+    del mapping["payload"]["legacy_decision"]["candidates"][0][
+        "same_game_pair_compatible"
+    ]
+    raw = canonical_json(mapping).encode("utf-8")
+    bundle_hash = hashlib.sha256(raw).hexdigest()
+    game_dir = tmp_path / str(mapping["game_pk"])
+    game_dir.mkdir()
+    source = game_dir / f"projected-v1-{bundle_hash[:16]}.json"
+    source.write_bytes(raw)
+
+    loaded = bundles_module.load_historical_managed_bundle(
+        source,
+        root=tmp_path,
+    )
+
+    assert loaded.payload.legacy_decision.candidates[
+        0
+    ].same_game_pair_compatible is False
 
 
 @pytest.mark.parametrize(
@@ -1172,7 +1486,7 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
         )
     else:
         first_binding = legacy.review_bindings[0]
-        starter_path = first_binding.principal_paths[0]
+        conversion_path = first_binding.principal_paths[0]
         corrected_legacy = replace(
             legacy,
             review_bindings=(
@@ -1180,9 +1494,11 @@ def test_changed_legacy_appends_durable_link_correction_without_new_forecast(
                     first_binding,
                     principal_paths=(
                         replace(
-                            starter_path,
+                            conversion_path,
                             component_ids=(
-                                "away_pitcher_chain_runs_allowed",
+                                "home_full_runs",
+                                "home_full_traffic",
+                                "home_full_extra_base_hits",
                             ),
                         ),
                         *first_binding.principal_paths[1:],

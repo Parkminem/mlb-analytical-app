@@ -124,6 +124,48 @@ class SameGamePriorityTests(unittest.TestCase):
         self.assertEqual([candidate.market for candidate in result.included], ["full_total"])
         self.assertEqual([candidate.market for candidate in result.excluded], ["ml"])
 
+    def test_f5_side_and_full_total_require_explicit_compatibility(self):
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "f5_side",
+                    77,
+                    "play",
+                    frozenset({model.PriorityEvidencePath.TOP_ORDER_MATCHUP}),
+                ),
+                model.PriorityMarketCandidate(
+                    "full_total",
+                    83,
+                    "over",
+                    frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE}),
+                ),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["full_total"])
+        self.assertEqual([candidate.market for candidate in result.excluded], ["f5_side"])
+
+    def test_full_side_and_f5_total_require_explicit_compatibility(self):
+        result = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "ml",
+                    77,
+                    "play",
+                    frozenset({model.PriorityEvidencePath.BULLPEN_PROTECTION}),
+                ),
+                model.PriorityMarketCandidate(
+                    "f5_total",
+                    83,
+                    "over",
+                    frozenset({model.PriorityEvidencePath.STARTER_COLLAPSE}),
+                ),
+            ]
+        )
+
+        self.assertEqual([candidate.market for candidate in result.included], ["f5_total"])
+        self.assertEqual([candidate.market for candidate in result.excluded], ["ml"])
+
     def test_ml_and_handicap_keep_only_higher_scoring_side_family_candidate(self):
         result = model.assemble_same_game_priority(
             [
@@ -318,9 +360,21 @@ class SameGamePriorityTests(unittest.TestCase):
 
         result = model.assemble_same_game_priority(
             [
-                model.PriorityMarketCandidate("f5_side", 77, "play", starter_path),
+                model.PriorityMarketCandidate(
+                    "f5_side",
+                    77,
+                    "play",
+                    starter_path,
+                    same_game_pair_compatible=True,
+                ),
                 model.PriorityMarketCandidate("f5_total", 75, "under", starter_path),
-                model.PriorityMarketCandidate("full_total", 76, "over", late_path),
+                model.PriorityMarketCandidate(
+                    "full_total",
+                    76,
+                    "over",
+                    late_path,
+                    same_game_pair_compatible=True,
+                ),
             ]
         )
 

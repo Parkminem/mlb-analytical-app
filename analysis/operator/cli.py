@@ -8,7 +8,11 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from .bundles import DEFAULT_BUNDLE_ROOT, load_bundle
+from .bundles import (
+    DEFAULT_BUNDLE_ROOT,
+    load_bundle,
+    load_historical_managed_bundle,
+)
 from .errors import (
     OperatorError,
     OperatorPartialProgress,
@@ -140,8 +144,14 @@ def _load_stage_bundle(
     *,
     expected_type: type[_BundleT],
     expected_stage: str,
+    bundle_root: Path,
 ) -> _BundleT:
-    bundle = load_bundle(path)
+    resolved_path = path.expanduser().resolve(strict=False)
+    resolved_root = bundle_root.expanduser().resolve(strict=False)
+    if resolved_path.parent.parent == resolved_root:
+        bundle = load_historical_managed_bundle(path, root=bundle_root)
+    else:
+        bundle = load_bundle(path)
     if type(bundle) is not expected_type or bundle.stage != expected_stage:
         raise OperatorPreconditionError(
             "bundle stage/type mismatch: "
@@ -269,6 +279,7 @@ def projected(
             bundle,
             expected_type=ProjectedBundle,
             expected_stage="projected",
+            bundle_root=bundle_root,
         )
         result = run_projected(
             loaded,
@@ -301,6 +312,7 @@ def confirmed(
             bundle,
             expected_type=ConfirmedBundle,
             expected_stage="confirmed",
+            bundle_root=bundle_root,
         )
         result = run_confirmed(
             loaded,
@@ -338,6 +350,7 @@ def review(
             bundle,
             expected_type=ReviewBundle,
             expected_stage="review",
+            bundle_root=bundle_root,
         )
         result = run_review(
             loaded,

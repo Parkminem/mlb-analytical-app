@@ -644,10 +644,13 @@ def assemble_same_game_priority(
 
         incompatible_side_total = any(
             (
-                {candidate_family, _priority_market_family(selected)}
-                in (
-                    {"f5_side", "f5_total"},
-                    {"full_side", "full_total"},
+                (
+                    candidate_family in {"f5_side", "full_side"}
+                    and _priority_market_family(selected)
+                    in {"f5_total", "full_total"}
+                    or candidate_family in {"f5_total", "full_total"}
+                    and _priority_market_family(selected)
+                    in {"f5_side", "full_side"}
                 )
                 and not (
                     candidate.same_game_pair_compatible

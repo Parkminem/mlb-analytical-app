@@ -164,6 +164,11 @@ _LEGACY_SNAPSHOT_FIELDS = tuple(
 _LEGACY_CANDIDATE_FIELDS = tuple(
     field.name for field in fields(PriorityMarketCandidate)
 )
+_HISTORICAL_LEGACY_CANDIDATE_FIELDS = tuple(
+    field_name
+    for field_name in _LEGACY_CANDIDATE_FIELDS
+    if field_name != "same_game_pair_compatible"
+)
 _LEGACY_BINDING_FIELDS = tuple(
     field.name for field in fields(CandidateReviewBinding)
 )
@@ -314,6 +319,23 @@ def _bundle_payload(value: object) -> dict[str, object] | None:
 
 
 def _require_pregame_audit_fields(value: object) -> None:
+    _require_pregame_audit_fields_with_candidates(
+        value,
+        _LEGACY_CANDIDATE_FIELDS,
+    )
+
+
+def _require_historical_pregame_audit_fields(value: object) -> None:
+    _require_pregame_audit_fields_with_candidates(
+        value,
+        _HISTORICAL_LEGACY_CANDIDATE_FIELDS,
+    )
+
+
+def _require_pregame_audit_fields_with_candidates(
+    value: object,
+    candidate_fields: tuple[str, ...],
+) -> None:
     payload = _bundle_payload(value)
     if payload is None:
         return
@@ -332,7 +354,7 @@ def _require_pregame_audit_fields(value: object) -> None:
         for index, candidate in enumerate(candidates):
             _require_explicit_fields(
                 candidate,
-                _LEGACY_CANDIDATE_FIELDS,
+                candidate_fields,
                 f"{legacy_path}.candidates[{index}]",
             )
 
@@ -547,4 +569,32 @@ def parse_review_bundle_json(
         _require_review_audit_fields,
         _REVIEW_TRUSTED_FIELDS,
         _REVIEW_DYNAMIC_MAPPING_FIELDS,
+    )
+
+
+def parse_historical_projected_bundle_json(
+    raw: str | bytes | bytearray,
+) -> ProjectedBundle:
+    """Parse a persisted pre-field schema-v1 projected bundle."""
+
+    return _parse_bundle_json(
+        raw,
+        _PROJECTED_ADAPTER,
+        _require_historical_pregame_audit_fields,
+        _PROJECTED_TRUSTED_FIELDS,
+        _PROJECTED_DYNAMIC_MAPPING_FIELDS,
+    )
+
+
+def parse_historical_confirmed_bundle_json(
+    raw: str | bytes | bytearray,
+) -> ConfirmedBundle:
+    """Parse a persisted pre-field schema-v1 confirmed bundle."""
+
+    return _parse_bundle_json(
+        raw,
+        _CONFIRMED_ADAPTER,
+        _require_historical_pregame_audit_fields,
+        _CONFIRMED_TRUSTED_FIELDS,
+        _CONFIRMED_DYNAMIC_MAPPING_FIELDS,
     )

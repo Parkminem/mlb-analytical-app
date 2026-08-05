@@ -113,6 +113,42 @@ def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:
     return parse_review_bundle_json(_raw(review_bundle_mapping()))
 
 
+def test_stage_loader_uses_historical_reader_only_for_managed_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "managed"
+    managed_path = bundle_root / "900001" / "projected-v1-deadbeefdeadbeef.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text("historical", encoding="utf-8")
+    expected = _bundle("projected")
+    calls: list[tuple[Path, Path]] = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bundle",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("managed artifact must not use fresh parser")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_historical_managed_bundle",
+        lambda path, *, root: calls.append((path, root)) or expected,
+        raising=False,
+    )
+
+    loaded = cli_module._load_stage_bundle(
+        managed_path,
+        expected_type=ProjectedBundle,
+        expected_stage="projected",
+        bundle_root=bundle_root,
+    )
+
+    assert loaded is expected
+    assert calls == [(managed_path, bundle_root)]
+
+
 def _pregame_result(command: str, *, replayed: bool) -> _PregameResult:
     return _PregameResult(
         stage=command,

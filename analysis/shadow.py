@@ -62,7 +62,11 @@ from analysis.ledger.records import (
     ForecastCommand,
     ForecastRecord,
 )
-from analysis.model import PriorityEvidencePath, PriorityMarketCandidate
+from analysis.model import (
+    PriorityEvidencePath,
+    PriorityMarketCandidate,
+    assemble_same_game_priority,
+)
 from analysis.review.classification import (
     ContradictionRule,
     PrincipalPathBinding,
@@ -119,6 +123,9 @@ _CANDIDATE_FIELDS = frozenset(
         "evidence_paths",
         "same_game_pair_compatible",
     )
+)
+_HISTORICAL_CANDIDATE_FIELDS = _CANDIDATE_FIELDS.difference(
+    ("same_game_pair_compatible",)
 )
 _REVIEW_BINDING_FIELDS = frozenset(
     (
@@ -344,6 +351,10 @@ class LegacyDecisionSnapshot:
                     "candidate evidence_paths must use canonical "
                     "PriorityEvidencePath values"
                 )
+            if not isinstance(candidate.same_game_pair_compatible, bool):
+                raise ValueError(
+                    "candidate same_game_pair_compatible must be bool"
+                )
 
         _require_string_tuple(self.final_priority, "final_priority")
         if not isinstance(self.review_bindings, tuple):
@@ -520,6 +531,18 @@ def validate_recommended_review_contract(
             errors.append(
                 f"final_priority {market}: requires one play or lean candidate"
             )
+
+    assembled_priority = tuple(
+        candidate.market
+        for candidate in assemble_same_game_priority(
+            list(legacy.candidates)
+        ).included
+    )
+    if legacy.final_priority != assembled_priority:
+        errors.append(
+            "final_priority must exactly match assembled priority: "
+            f"expected {assembled_priority}"
+        )
 
     if errors:
         raise ValueError(
@@ -863,8 +886,19 @@ def _principal_paths_from_payload(
     )
 
 
-def _candidate_from_payload(value: object) -> PriorityMarketCandidate:
-    payload = _payload_mapping(value, "legacy candidate", _CANDIDATE_FIELDS)
+def _candidate_from_payload(
+    value: object,
+    *,
+    historical: bool = False,
+) -> PriorityMarketCandidate:
+    expected_fields = (
+        _HISTORICAL_CANDIDATE_FIELDS
+        if historical
+        and isinstance(value, Mapping)
+        and "same_game_pair_compatible" not in value
+        else _CANDIDATE_FIELDS
+    )
+    payload = _payload_mapping(value, "legacy candidate", expected_fields)
     evidence_values = _payload_string_sequence(
         payload["evidence_paths"],
         "legacy candidate evidence_paths",
@@ -886,7 +920,10 @@ def _candidate_from_payload(value: object) -> PriorityMarketCandidate:
         raise ValueError(
             "legacy candidate evidence_paths must use canonical unique order"
         )
-    same_game_pair_compatible = payload["same_game_pair_compatible"]
+    same_game_pair_compatible = payload.get(
+        "same_game_pair_compatible",
+        False,
+    )
     if not isinstance(same_game_pair_compatible, bool):
         raise ValueError(
             "legacy candidate same_game_pair_compatible must be bool"
@@ -916,12 +953,16 @@ def _binding_from_payload(value: object) -> CandidateReviewBinding:
     )
 
 
-def _legacy_from_payload(value: object) -> LegacyDecisionSnapshot:
+def _legacy_from_payload(
+    value: object,
+    *,
+    historical: bool = False,
+) -> LegacyDecisionSnapshot:
     payload = _payload_mapping(value, "shadow legacy", _LEGACY_FIELDS)
     return LegacyDecisionSnapshot(
         model_version=payload["model_version"],
         candidates=tuple(
-            _candidate_from_payload(candidate)
+            _candidate_from_payload(candidate, historical=historical)
             for candidate in _payload_sequence(
                 payload["candidates"],
                 "shadow legacy candidates",
@@ -982,7 +1023,7 @@ def deserialize_shadow_comparison(value: object) -> ShadowComparison:
     )
     return ShadowComparison(
         authority=payload["authority"],
-        legacy=_legacy_from_payload(payload["legacy"]),
+        legacy=_legacy_from_payload(payload["legacy"], historical=True),
         forecast_run_id=payload["forecast_run_id"],
         market_comparisons=tuple(
             _market_comparison_from_payload(comparison)

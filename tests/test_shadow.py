@@ -1082,6 +1082,15 @@ class ShadowComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "canonical"):
             legacy_snapshot(candidates=(noncanonical_evidence,), review_bindings=())
 
+    def test_snapshot_rejects_non_boolean_pair_compatibility(self) -> None:
+        invalid = replace(candidate(), same_game_pair_compatible=1)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "same_game_pair_compatible must be bool",
+        ):
+            legacy_snapshot(candidates=(invalid,))
+
     def test_adapter_preserves_legacy_authority_candidate_identity_and_order(self) -> None:
         first = candidate(market="full_total", score=72)
         second = candidate(market="ml", score=85)
@@ -1119,6 +1128,21 @@ class ShadowComparisonTests(unittest.TestCase):
 
         self.assertTrue(payload["candidates"][0]["same_game_pair_compatible"])
         self.assertEqual(shadow_module._legacy_from_payload(payload), legacy)
+
+    def test_historical_shadow_payload_defaults_missing_pair_compatibility(
+        self,
+    ) -> None:
+        comparison = compare_shadow_forecast(legacy_snapshot(), self.forecast)
+        payload = shadow_module._shadow_comparison_payload(comparison)
+        del payload["legacy"]["candidates"][0][
+            "same_game_pair_compatible"
+        ]
+
+        restored = shadow_module.deserialize_shadow_comparison(payload)
+
+        self.assertFalse(
+            restored.legacy.candidates[0].same_game_pair_compatible
+        )
 
     def test_forecast_probability_does_not_change_legacy_priority(self) -> None:
         legacy_candidate = candidate()

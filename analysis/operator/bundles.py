@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 
 from pydantic import TypeAdapter
@@ -27,6 +28,8 @@ from .schemas import (
     ProjectedBundle,
     ReviewBundle,
     bundle_stage_from_json,
+    parse_historical_confirmed_bundle_json,
+    parse_historical_projected_bundle_json,
     parse_confirmed_bundle_json,
     parse_projected_bundle_json,
     parse_review_bundle_json,
@@ -44,6 +47,15 @@ _BUNDLE_PARSERS = {
     "confirmed": parse_confirmed_bundle_json,
     "review": parse_review_bundle_json,
 }
+_HISTORICAL_BUNDLE_PARSERS = {
+    "projected": parse_historical_projected_bundle_json,
+    "confirmed": parse_historical_confirmed_bundle_json,
+    "review": parse_review_bundle_json,
+}
+_MANAGED_BUNDLE_FILENAME = re.compile(
+    r"(?P<stage>projected|confirmed|review)-v(?P<schema_version>[0-9]+)-"
+    r"(?P<hash_prefix>[0-9a-f]{16})\.json\Z"
+)
 DEFAULT_BUNDLE_ROOT = (
     Path(__file__).resolve().parents[2] / "data" / "shadow" / "bundles"
 )
@@ -72,6 +84,56 @@ def load_bundle(path: str | os.PathLike[str]) -> _Bundle:
         ) from error
     stage = bundle_stage_from_json(raw)
     return _BUNDLE_PARSERS[stage](raw)
+
+
+def load_historical_managed_bundle(
+    path: str | os.PathLike[str],
+    *,
+    root: str | os.PathLike[str],
+) -> _Bundle:
+    """Read an authenticated managed artifact through historical schemas."""
+
+    bundle_path = Path(path).expanduser()
+    root_path = Path(root).expanduser()
+    try:
+        if bundle_path.is_symlink() or root_path.is_symlink():
+            raise OperatorIOError("historical managed bundle path is symbolic")
+        resolved_path = bundle_path.resolve(strict=True)
+        resolved_root = root_path.resolve(strict=True)
+        if resolved_path.parent.parent != resolved_root:
+            raise OperatorIOError(
+                "historical managed bundle must be inside its managed root"
+            )
+        filename_match = _MANAGED_BUNDLE_FILENAME.fullmatch(
+            resolved_path.name
+        )
+        if filename_match is None:
+            raise OperatorIOError(
+                "historical managed bundle filename is invalid"
+            )
+        raw = resolved_path.read_bytes()
+    except OperatorIOError:
+        raise
+    except OSError as error:
+        raise OperatorIOError(
+            f"unable to read historical managed bundle {bundle_path}: {error}"
+        ) from error
+
+    actual_hash = hashlib.sha256(raw).hexdigest()
+    if actual_hash[:16] != filename_match.group("hash_prefix"):
+        raise OperatorIOError("historical managed bundle hash is invalid")
+    stage = bundle_stage_from_json(raw)
+    bundle = _HISTORICAL_BUNDLE_PARSERS[stage](raw)
+    if (
+        stage != filename_match.group("stage")
+        or bundle.schema_version
+        != int(filename_match.group("schema_version"))
+        or resolved_path.parent.name != str(bundle.game_pk)
+    ):
+        raise OperatorIOError(
+            "historical managed bundle identity is inconsistent"
+        )
+    return bundle
 
 
 def _serialized_bundle(bundle: _Bundle) -> dict[str, object]:
@@ -364,5 +426,6 @@ __all__ = (
     "bundle_sha256",
     "intrinsic_capture_key",
     "load_bundle",
+    "load_historical_managed_bundle",
     "persist_managed_bundle",
 )
