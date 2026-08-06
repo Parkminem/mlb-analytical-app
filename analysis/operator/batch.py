@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Literal
 
 from pydantic import (
@@ -18,13 +20,17 @@ from pydantic import (
 )
 
 from .bundles import bundle_canonical_bytes
-from .errors import BundleValidationError
+from analysis.forecasting.identity import canonical_json
+from analysis.ledger import LedgerStore
+
+from .errors import BundleValidationError, OperatorError, OperatorIOError
 from .schemas import (
     ConfirmedBundle,
     ProjectedBundle,
     parse_confirmed_bundle_json,
     parse_projected_bundle_json,
 )
+from .service import run_confirmed, run_projected
 
 
 _LOWERCASE_HEX = frozenset("0123456789abcdef")
@@ -428,6 +434,327 @@ def prepare_pregame_batch(
     return tuple(prepared)
 
 
+def _worker_failure(
+    entry: PreparedBatchEntry,
+    error: OperatorError,
+) -> PregameBatchFailure:
+    progress = error.partial_progress
+    return PregameBatchFailure(
+        game_pk=entry.game_pk,
+        bundle_path=entry.bundle_path,
+        error_type=error.__class__.__name__,
+        message=" ".join(str(error).split()) or error.__class__.__name__,
+        exit_code=error.exit_code,
+        capture_id=None if progress is None else progress.capture_id,
+        forecast_run_id=(
+            None if progress is None else progress.forecast_run_id
+        ),
+        capture_forecast_link_record_id=(
+            None
+            if progress is None
+            else progress.capture_forecast_link_record_id
+        ),
+        rerun_safe=False if progress is None else progress.rerun_safe,
+    )
+
+
+def _execute_batch_entry(
+    stage: str,
+    entry: PreparedBatchEntry,
+    ledger_path: str,
+    bundle_root: str,
+    registry_root: str | None,
+) -> BatchResultEntry:
+    """Run one immutable current bundle inside a process worker."""
+
+    try:
+        if stage == "projected":
+            bundle = parse_projected_bundle_json(entry.canonical_bundle)
+            result = run_projected(
+                bundle,
+                ledger_path=ledger_path,
+                bundle_root=bundle_root,
+                registry_root=registry_root,
+            )
+        elif stage == "confirmed":
+            bundle = parse_confirmed_bundle_json(entry.canonical_bundle)
+            result = run_confirmed(
+                bundle,
+                ledger_path=ledger_path,
+                bundle_root=bundle_root,
+                registry_root=registry_root,
+            )
+        else:
+            raise ValueError("batch worker stage must be projected or confirmed")
+        return PregameBatchSuccess(
+            game_pk=result.game_pk,
+            bundle_path=entry.bundle_path,
+            capture_id=result.capture.capture_id,
+            forecast_run_id=result.forecast.forecast_run_id,
+            capture_forecast_link_record_id=result.link.envelope.record_id,
+            managed_bundle_path=result.managed_bundle.path,
+            managed_bundle_hash=result.managed_bundle.bundle_hash,
+            managed_bundle_replayed=result.managed_bundle.replayed,
+            capture_replayed=result.capture_replayed,
+            forecast_replayed=result.forecast_replayed,
+            link_replayed=result.link_replayed,
+        )
+    except OperatorError as error:
+        return _worker_failure(entry, error)
+    except Exception as error:
+        return PregameBatchFailure(
+            game_pk=entry.game_pk,
+            bundle_path=entry.bundle_path,
+            error_type="internal_worker_error",
+            message=f"{error.__class__.__name__}: {' '.join(str(error).split())}",
+            exit_code=1,
+        )
+
+
+def _crashed_worker_failure(
+    entry: PreparedBatchEntry,
+    error: BaseException,
+) -> PregameBatchFailure:
+    return PregameBatchFailure(
+        game_pk=entry.game_pk,
+        bundle_path=entry.bundle_path,
+        error_type="worker_process_error",
+        message=f"{error.__class__.__name__}: {' '.join(str(error).split())}",
+        exit_code=1,
+    )
+
+
+def _execute_prepared_batch(
+    stage: str,
+    entries: tuple[PreparedBatchEntry, ...],
+    *,
+    ledger_path: Path,
+    bundle_root: Path,
+    registry_root: Path | None,
+    max_workers: int,
+) -> tuple[BatchResultEntry, ...]:
+    runtime = (
+        str(ledger_path),
+        str(bundle_root),
+        None if registry_root is None else str(registry_root),
+    )
+    if max_workers == 1:
+        return tuple(
+            _execute_batch_entry(stage, entry, *runtime) for entry in entries
+        )
+
+    by_game: dict[int, BatchResultEntry] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _execute_batch_entry,
+                stage,
+                entry,
+                *runtime,
+            ): entry
+            for entry in entries
+        }
+        for future in as_completed(futures):
+            entry = futures[future]
+            try:
+                by_game[entry.game_pk] = future.result()
+            except BaseException as error:
+                by_game[entry.game_pk] = _crashed_worker_failure(entry, error)
+    return tuple(by_game[entry.game_pk] for entry in entries)
+
+
+def _coverage_failure(
+    success: PregameBatchSuccess,
+    message: str,
+) -> PregameBatchFailure:
+    return PregameBatchFailure(
+        game_pk=success.game_pk,
+        bundle_path=success.bundle_path,
+        error_type="coverage_audit",
+        message=message,
+        exit_code=5,
+        capture_id=success.capture_id,
+        forecast_run_id=success.forecast_run_id,
+        capture_forecast_link_record_id=(
+            success.capture_forecast_link_record_id
+        ),
+        rerun_safe=True,
+    )
+
+
+def audit_pregame_batch(
+    result: PregameBatchResult,
+    *,
+    ledger_path: str | Path,
+) -> PregameBatchResult:
+    """Verify every reported success triplet in one fresh ledger checkpoint."""
+
+    if not isinstance(result, PregameBatchResult):
+        raise TypeError("result must be a PregameBatchResult")
+    if not result.successes:
+        return result
+    try:
+        checkpoint = LedgerStore(Path(ledger_path)).pregame_checkpoint()
+    except Exception as error:
+        message = (
+            "ledger checkpoint unavailable during coverage audit: "
+            f"{error.__class__.__name__}"
+        )
+        return PregameBatchResult(
+            stage=result.stage,
+            max_workers=result.max_workers,
+            target_game_pks=result.target_game_pks,
+            entries=tuple(
+                _coverage_failure(entry, message)
+                if isinstance(entry, PregameBatchSuccess)
+                else entry
+                for entry in result.entries
+            ),
+        )
+
+    superseded_capture_ids = {
+        record.supersedes_capture_id
+        for record in checkpoint.records
+        if record.record_kind == "capture"
+        and record.supersedes_capture_id is not None
+    }
+    audited: list[BatchResultEntry] = []
+    for entry in result.entries:
+        if isinstance(entry, PregameBatchFailure):
+            audited.append(entry)
+            continue
+        capture = checkpoint.record("capture", entry.capture_id)
+        forecast = checkpoint.record("forecast", entry.forecast_run_id)
+        link = checkpoint.record(
+            "capture_forecast_link",
+            entry.capture_forecast_link_record_id,
+        )
+        mismatch: str | None = None
+        if capture is None:
+            mismatch = "reported capture is missing from the ledger"
+        elif capture.game_pk != entry.game_pk:
+            mismatch = "reported capture belongs to a different game"
+        elif entry.capture_id in superseded_capture_ids:
+            mismatch = "reported capture is no longer the active pregame state"
+        elif forecast is None:
+            mismatch = "reported forecast is missing from the ledger"
+        elif link is None:
+            mismatch = "reported capture-forecast link is missing from the ledger"
+        elif link.capture_id != entry.capture_id:
+            mismatch = "reported link references a different capture"
+        elif link.forecast_run_id != entry.forecast_run_id:
+            mismatch = "reported link references a different forecast"
+        audited.append(
+            entry if mismatch is None else _coverage_failure(entry, mismatch)
+        )
+    return PregameBatchResult(
+        stage=result.stage,
+        max_workers=result.max_workers,
+        target_game_pks=result.target_game_pks,
+        entries=tuple(audited),
+    )
+
+
+def _publish_batch_receipt(
+    path: Path,
+    result: PregameBatchResult,
+) -> None:
+    content = (canonical_json(result.to_mapping()) + "\n").encode("utf-8")
+    temporary_path: Path | None = None
+    descriptor = -1
+    try:
+        supplied = path.expanduser()
+        if supplied.is_symlink():
+            raise OperatorIOError("batch receipt path cannot be symbolic")
+        resolved = supplied.resolve(strict=False)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{resolved.name}.",
+            dir=resolved.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, resolved)
+        temporary_path = None
+        directory_descriptor = os.open(resolved.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OperatorIOError:
+        raise
+    except OSError as error:
+        raise OperatorIOError(
+            f"unable to publish pregame batch receipt {path}: {error}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def run_pregame_batch(
+    manifest_path: str | Path,
+    *,
+    expected_stage: str,
+    ledger_path: str | Path,
+    bundle_root: str | Path,
+    receipt_path: str | Path,
+    max_workers: int = 3,
+    registry_root: str | Path | None = None,
+) -> PregameBatchResult:
+    """Execute, audit, and publish one projected or confirmed target batch."""
+
+    if (
+        isinstance(max_workers, bool)
+        or not isinstance(max_workers, int)
+        or not 1 <= max_workers <= 4
+    ):
+        raise ValueError("max_workers must be an integer from 1 through 4")
+    manifest = load_pregame_batch_manifest(
+        manifest_path,
+        expected_stage=expected_stage,
+    )
+    prepared = prepare_pregame_batch(
+        manifest,
+        manifest_path=manifest_path,
+    )
+    resolved_ledger = Path(ledger_path).expanduser().resolve(strict=False)
+    resolved_bundle_root = Path(bundle_root).expanduser().resolve(strict=False)
+    resolved_registry = (
+        None
+        if registry_root is None
+        else Path(registry_root).expanduser().resolve(strict=False)
+    )
+    # Initialize the shared lock and checkpoint before workers race to open it.
+    LedgerStore(resolved_ledger).pregame_checkpoint()
+    entries = _execute_prepared_batch(
+        manifest.stage,
+        prepared,
+        ledger_path=resolved_ledger,
+        bundle_root=resolved_bundle_root,
+        registry_root=resolved_registry,
+        max_workers=max_workers,
+    )
+    result = PregameBatchResult(
+        stage=manifest.stage,
+        max_workers=max_workers,
+        target_game_pks=tuple(entry.game_pk for entry in prepared),
+        entries=entries,
+    )
+    audited = audit_pregame_batch(result, ledger_path=resolved_ledger)
+    _publish_batch_receipt(Path(receipt_path), audited)
+    return audited
+
+
 __all__ = (
     "BatchResultEntry",
     "PregameBatchEntry",
@@ -436,6 +763,8 @@ __all__ = (
     "PregameBatchResult",
     "PregameBatchSuccess",
     "PreparedBatchEntry",
+    "audit_pregame_batch",
     "load_pregame_batch_manifest",
     "prepare_pregame_batch",
+    "run_pregame_batch",
 )
