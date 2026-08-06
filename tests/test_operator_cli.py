@@ -26,6 +26,7 @@ from analysis.operator.bundles import (
 )
 from analysis.operator.batch import (
     PregameBatchFailure,
+    PregameBatchReceiptError,
     PregameBatchResult,
     PregameBatchSuccess,
 )
@@ -241,6 +242,46 @@ def test_pregame_batch_cli_reports_partial_receipt_with_exit_seven(
     assert "OperatorPreconditionError" in result.stdout
     assert "candidate is not review-eligible" in result.stdout
     assert "internal error" not in result.stderr
+
+
+def test_pregame_batch_cli_preserves_triplets_when_receipt_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = _complete_batch_result(tmp_path, "confirmed")
+
+    def receipt_failure(*args, **kwargs):
+        raise PregameBatchReceiptError(
+            "ledger records are durable; rerun the exact manifest",
+            result=durable,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_pregame_batch",
+        receipt_failure,
+        raising=False,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "batch-confirmed",
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+        ],
+    )
+
+    success = durable.successes[0]
+    assert result.exit_code == 6
+    assert "success_count: 1" in result.stdout
+    assert success.capture_id in result.stdout
+    assert success.forecast_run_id in result.stdout
+    assert success.capture_forecast_link_record_id in result.stdout
+    assert "ledger records are durable" in result.stderr
+    assert "rerun the exact manifest" in result.stderr
 
 
 @pytest.mark.parametrize("workers", ("0", "5"))

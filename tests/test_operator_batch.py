@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
 import json
 from pathlib import Path
 
 import pytest
 
+import analysis.operator.batch as batch_module
 from analysis.forecasting.config import SimulationConfig
 from analysis.forecasting.identity import canonical_json, capture_payload
+from analysis.operator.bundles import bundle_sha256
 from analysis.operator.batch import (
     PregameBatchFailure,
     PregameBatchResult,
@@ -16,7 +20,8 @@ from analysis.operator.batch import (
     prepare_pregame_batch,
     run_pregame_batch,
 )
-from analysis.operator.errors import BundleValidationError
+from analysis.operator.errors import BundleValidationError, OperatorIOError
+from analysis.operator.schemas import parse_confirmed_bundle_json
 from analysis.shadow import canonical_legacy_decision_payload
 from tests.test_operator_pregame import _confirmed_game, _ordered_legacy_decision
 from tests.test_operator_schemas import confirmed_bundle_mapping
@@ -26,11 +31,22 @@ def _write_confirmed_bundle(
     directory: Path,
     game_pk: int,
     *,
+    captured_at_offset_minutes: int = 0,
     forecast_config_version: str | None = None,
     legacy_model_version: str | None = None,
+    name: str | None = None,
 ) -> Path:
     mapping = confirmed_bundle_mapping()
-    mapping["payload"]["game_input"] = capture_payload(_confirmed_game())
+    game = _confirmed_game()
+    if captured_at_offset_minutes:
+        game = replace(
+            game,
+            captured_at=(
+                game.captured_at
+                + timedelta(minutes=captured_at_offset_minutes)
+            ),
+        )
+    mapping["payload"]["game_input"] = capture_payload(game)
     mapping["payload"]["legacy_decision"] = (
         canonical_legacy_decision_payload(_ordered_legacy_decision())
     )
@@ -43,7 +59,7 @@ def _write_confirmed_bundle(
             legacy_model_version
         )
     raw = canonical_json(mapping).replace("900001", str(game_pk))
-    path = directory / f"{game_pk}-confirmed.json"
+    path = directory / (name or f"{game_pk}-confirmed.json")
     path.write_text(raw, encoding="utf-8")
     return path
 
@@ -63,6 +79,7 @@ def _write_manifest(
     directory: Path,
     *,
     entries: tuple[tuple[int, str], ...],
+    name: str = "manifest.json",
     stage: str = "confirmed",
     **extra: object,
 ) -> Path:
@@ -75,7 +92,7 @@ def _write_manifest(
         ],
     }
     mapping.update(extra)
-    path = directory / "manifest.json"
+    path = directory / name
     path.write_text(canonical_json(mapping), encoding="utf-8")
     return path
 
@@ -350,6 +367,71 @@ def test_exact_batch_replay_preserves_ids_and_reports_replay_flags(
     assert second_success.link_replayed is True
 
 
+def test_exact_historical_batch_replay_survives_newer_superseding_capture(
+    tmp_path: Path,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    old_bundle = _write_confirmed_bundle(
+        tmp_path,
+        900001,
+        name="old-confirmed.json",
+    )
+    old_manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, old_bundle.name),),
+        name="old-manifest.json",
+    )
+    newer_bundle = _write_confirmed_bundle(
+        tmp_path,
+        900001,
+        captured_at_offset_minutes=5,
+        name="newer-confirmed.json",
+    )
+    newer_manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, newer_bundle.name),),
+        name="newer-manifest.json",
+    )
+    runtime = {
+        "ledger_path": tmp_path / "ledger" / "shadow.jsonl",
+        "bundle_root": tmp_path / "managed",
+        "receipt_path": tmp_path / "receipt.json",
+        "registry_root": registry,
+        "max_workers": 1,
+    }
+
+    first = run_pregame_batch(
+        old_manifest,
+        expected_stage="confirmed",
+        **runtime,
+    )
+    newer = run_pregame_batch(
+        newer_manifest,
+        expected_stage="confirmed",
+        **runtime,
+    )
+    replay = run_pregame_batch(
+        old_manifest,
+        expected_stage="confirmed",
+        **runtime,
+    )
+
+    first_success = first.successes[0]
+    newer_success = newer.successes[0]
+    replay_success = replay.successes[0]
+    assert newer_success.capture_id != first_success.capture_id
+    assert replay.complete is True
+    assert replay_success.capture_id == first_success.capture_id
+    assert replay_success.forecast_run_id == first_success.forecast_run_id
+    assert (
+        replay_success.capture_forecast_link_record_id
+        == first_success.capture_forecast_link_record_id
+    )
+    assert replay_success.capture_replayed is True
+    assert replay_success.forecast_replayed is True
+    assert replay_success.link_replayed is True
+
+
 def test_one_service_failure_keeps_success_and_writes_partial_receipt(
     tmp_path: Path,
 ) -> None:
@@ -407,6 +489,140 @@ def test_coverage_audit_converts_missing_triplet_to_failure(
     assert "capture" in audited.failures[0].message
 
 
+def test_coverage_audit_rejects_mixed_capture_forecast_relationship(
+    tmp_path: Path,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    first_bundle = _write_confirmed_bundle(tmp_path, 900001)
+    second_bundle = _write_confirmed_bundle(tmp_path, 900002)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=(
+            (900001, first_bundle.name),
+            (900002, second_bundle.name),
+        ),
+    )
+    ledger = tmp_path / "ledger" / "shadow.jsonl"
+    recorded = run_pregame_batch(
+        manifest,
+        expected_stage="confirmed",
+        ledger_path=ledger,
+        bundle_root=tmp_path / "managed",
+        receipt_path=tmp_path / "receipt.json",
+        registry_root=registry,
+        max_workers=2,
+    )
+    first, second = recorded.successes
+    mixed = replace(first, forecast_run_id=second.forecast_run_id)
+    claimed = PregameBatchResult(
+        stage="confirmed",
+        max_workers=2,
+        target_game_pks=(900001,),
+        entries=(mixed,),
+    )
+
+    audited = audit_pregame_batch(claimed, ledger_path=ledger)
+
+    assert audited.complete is False
+    assert audited.failures[0].error_type == "coverage_audit"
+    assert "different forecast" in audited.failures[0].message
+
+
+def test_receipt_publish_failure_preserves_durable_batch_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+
+    original_publish = batch_module._publish_batch_receipt
+    publish_calls = 0
+
+    def fail_publish(
+        path: Path,
+        result: PregameBatchResult,
+        **kwargs,
+    ) -> None:
+        nonlocal publish_calls
+        publish_calls += 1
+        if publish_calls == 1:
+            raise OperatorIOError("disk full")
+        original_publish(path, result, **kwargs)
+
+    monkeypatch.setattr(batch_module, "_publish_batch_receipt", fail_publish)
+
+    with pytest.raises(
+        batch_module.PregameBatchReceiptError,
+        match="ledger.*durable.*rerun",
+    ) as raised:
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=tmp_path / "ledger" / "shadow.jsonl",
+            bundle_root=tmp_path / "managed",
+            receipt_path=tmp_path / "receipt.json",
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert raised.value.result.complete is True
+    assert raised.value.result.success_count == 1
+    assert raised.value.result.successes[0].capture_id
+    assert raised.value.result.successes[0].forecast_run_id
+    assert raised.value.result.successes[0].capture_forecast_link_record_id
+
+    replay = run_pregame_batch(
+        manifest,
+        expected_stage="confirmed",
+        ledger_path=tmp_path / "ledger" / "shadow.jsonl",
+        bundle_root=tmp_path / "managed",
+        receipt_path=tmp_path / "receipt.json",
+        registry_root=registry,
+        max_workers=1,
+    )
+
+    durable_success = raised.value.result.successes[0]
+    replay_success = replay.successes[0]
+    assert replay_success.capture_id == durable_success.capture_id
+    assert replay_success.forecast_run_id == durable_success.forecast_run_id
+    assert (
+        replay_success.capture_forecast_link_record_id
+        == durable_success.capture_forecast_link_record_id
+    )
+    assert replay_success.capture_replayed is True
+    assert replay_success.forecast_replayed is True
+    assert replay_success.link_replayed is True
+    assert (tmp_path / "receipt.json").exists()
+
+
+def test_atomic_receipt_replace_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    result = PregameBatchResult(
+        stage="confirmed",
+        max_workers=1,
+        target_game_pks=(900001,),
+        entries=(_success(900001, tmp_path / "bundle.json"),),
+    )
+
+    def fail_replace(*args, **kwargs) -> None:
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(batch_module.os, "replace", fail_replace)
+
+    with pytest.raises(OperatorIOError, match="unable to publish"):
+        batch_module._publish_batch_receipt(receipt, result)
+
+    assert not receipt.exists()
+    assert list(tmp_path.glob(".receipt.json.*")) == []
+
+
 @pytest.mark.parametrize("max_workers", (0, 5, True))
 def test_invalid_worker_count_fails_before_receipt(
     tmp_path: Path,
@@ -430,3 +646,183 @@ def test_invalid_worker_count_fails_before_receipt(
         )
 
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize(
+    "collision",
+    ("manifest", "bundle", "ledger", "checkpoint", "lock"),
+)
+def test_receipt_path_cannot_replace_authoritative_or_input_files(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+    ledger = tmp_path / "ledger" / "shadow.jsonl"
+    receipt_paths = {
+        "manifest": manifest,
+        "bundle": bundle,
+        "ledger": ledger,
+        "checkpoint": Path(f"{ledger}.checkpoint-v1.json"),
+        "lock": Path(f"{ledger}.lock"),
+    }
+    manifest_before = manifest.read_bytes()
+    bundle_before = bundle.read_bytes()
+
+    with pytest.raises(OperatorIOError, match="receipt.*collides"):
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=ledger,
+            bundle_root=tmp_path / "managed",
+            receipt_path=receipt_paths[collision],
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert manifest.read_bytes() == manifest_before
+    assert bundle.read_bytes() == bundle_before
+    assert not ledger.exists()
+
+
+def test_receipt_path_cannot_replace_managed_bundle_artifact(
+    tmp_path: Path,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+    parsed = parse_confirmed_bundle_json(bundle.read_bytes())
+    digest = bundle_sha256(parsed)
+    managed_target = (
+        tmp_path
+        / "managed"
+        / "900001"
+        / f"confirmed-v2-{digest[:16]}.json"
+    )
+
+    with pytest.raises(OperatorIOError, match="receipt.*collides"):
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=tmp_path / "ledger" / "shadow.jsonl",
+            bundle_root=tmp_path / "managed",
+            receipt_path=managed_target,
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert not managed_target.exists()
+
+
+def test_receipt_path_cannot_replace_forecast_registry_file(
+    tmp_path: Path,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    config_path = registry / f"{SimulationConfig(simulations=12).version}.json"
+    config_before = config_path.read_bytes()
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+
+    with pytest.raises(OperatorIOError, match="receipt.*collides"):
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=tmp_path / "ledger" / "shadow.jsonl",
+            bundle_root=tmp_path / "managed",
+            receipt_path=config_path,
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert config_path.read_bytes() == config_before
+
+
+@pytest.mark.parametrize("artifact_store", ("managed", "registry"))
+def test_receipt_path_rejects_every_immutable_artifact_store_file(
+    tmp_path: Path,
+    artifact_store: str,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    bundle_root = tmp_path / "managed"
+    if artifact_store == "managed":
+        unrelated = bundle_root / "999999" / "confirmed-v2-unrelated.json"
+    else:
+        unrelated = registry / "unrelated-version.json"
+    unrelated.parent.mkdir(parents=True, exist_ok=True)
+    unrelated.write_bytes(b"immutable-artifact")
+    before = unrelated.read_bytes()
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+
+    with pytest.raises(OperatorIOError, match="receipt.*collides"):
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=tmp_path / "ledger" / "shadow.jsonl",
+            bundle_root=bundle_root,
+            receipt_path=unrelated,
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert unrelated.read_bytes() == before
+
+
+def test_receipt_parent_swap_cannot_redirect_publication_to_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _write_test_registry(tmp_path)
+    bundle = _write_confirmed_bundle(tmp_path, 900001)
+    manifest = _write_manifest(
+        tmp_path,
+        entries=((900001, bundle.name),),
+    )
+    ledger = tmp_path / "ledger" / "shadow.jsonl"
+    receipt_parent = tmp_path / "receipts"
+    receipt_parent.mkdir()
+    receipt = receipt_parent / ledger.name
+    ledger_before_swap: list[bytes] = []
+    original_execute = batch_module._execute_prepared_batch
+
+    def execute_then_swap(*args, **kwargs):
+        entries = original_execute(*args, **kwargs)
+        ledger_before_swap.append(ledger.read_bytes())
+        receipt_parent.rename(tmp_path / "receipts-original")
+        receipt_parent.symlink_to(ledger.parent, target_is_directory=True)
+        return entries
+
+    monkeypatch.setattr(
+        batch_module,
+        "_execute_prepared_batch",
+        execute_then_swap,
+    )
+
+    with pytest.raises(
+        batch_module.PregameBatchReceiptError,
+        match="receipt.*changed|publication failed",
+    ):
+        run_pregame_batch(
+            manifest,
+            expected_stage="confirmed",
+            ledger_path=ledger,
+            bundle_root=tmp_path / "managed",
+            receipt_path=receipt,
+            registry_root=registry,
+            max_workers=1,
+        )
+
+    assert ledger.read_bytes() == ledger_before_swap[0]

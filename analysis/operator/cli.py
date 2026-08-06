@@ -17,6 +17,7 @@ from .bundles import (
 )
 from .batch import (
     PregameBatchFailure,
+    PregameBatchReceiptError,
     PregameBatchResult,
     PregameBatchSuccess,
     run_pregame_batch,
@@ -342,14 +343,18 @@ def _run_pregame_batch_command(
     completed: list[PregameBatchResult] = []
 
     def execute() -> None:
-        result = run_pregame_batch(
-            manifest,
-            expected_stage=stage,
-            ledger_path=ledger,
-            bundle_root=bundle_root,
-            receipt_path=receipt,
-            max_workers=max_workers,
-        )
+        try:
+            result = run_pregame_batch(
+                manifest,
+                expected_stage=stage,
+                ledger_path=ledger,
+                bundle_root=bundle_root,
+                receipt_path=receipt,
+                max_workers=max_workers,
+            )
+        except PregameBatchReceiptError as error:
+            _print_batch(error.result, receipt)
+            raise
         completed.append(result)
         _print_batch(result, receipt)
 

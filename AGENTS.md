@@ -32,6 +32,14 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - If the over case is driven by volatility on both sides, prefer O/U and downgrade ML.
 - Evaluate F5 O/U independently from full-game O/U. Exclude full-game bullpen effects unless a verified opener/bulk arm is scheduled inside the first five innings.
 - Require a verified F5 total and decimal price. Never infer the F5 line from the full-game total.
+
+## Required Pregame Recording Behavior
+
+- For a multi-game projected-lineup recording request, prepare every schema-v2/current bundle first and run `python -m analysis.operator batch-projected --manifest <path> --receipt <path>` instead of stopping after in-memory analysis or ad hoc Shadow output.
+- For a multi-game confirmed-lineup analysis or freeze request, prepare every schema-v2/current bundle first and run `python -m analysis.operator batch-confirmed --manifest <path> --receipt <path>`.
+- Do not say a slate is recorded, frozen, or complete unless the batch receipt has `complete: true` and `success_count == target_count`. Report `부분 기록` or `부분 동결` with the failed games and reasons otherwise.
+- Include the receipt `N/N` status and each successful game's `capture_id`, `forecast_run_id`, and `capture_forecast_link_record_id` in the operational handoff. In-memory tables, reviews, and Shadow simulations without these audited IDs are not frozen records.
+- Exact reruns are safe. If a batch is partial, rerun the same manifest and path overrides rather than fabricating or retroactively inserting missing pregame records.
 - Admit F5 under only after explicitly verifying both scoring directions. Unresolved long-horizon starter WHIP/BB/HR/collapse risk blocks F5 under even when recent starts improved.
 - Cap matchup-only or traffic-only side strength when recent run conversion is absent; bullpen quality cannot substitute for offensive conversion.
 - For ML, require an independent full-game margin path beyond the F5 edge. For ML and `+1.5`, rested bullpen availability must also have current role-specific performance support.

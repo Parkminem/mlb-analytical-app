@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
+import stat
 from typing import Literal
 
 from pydantic import (
@@ -23,7 +24,14 @@ from .bundles import bundle_canonical_bytes
 from analysis.forecasting.identity import canonical_json
 from analysis.ledger import LedgerStore
 
+from .config import DEFAULT_REGISTRY_ROOT
 from .errors import BundleValidationError, OperatorError, OperatorIOError
+from .fdio import (
+    create_exclusive_file,
+    open_directory,
+    stat_at,
+    verify_public_directory,
+)
 from .schemas import (
     ConfirmedBundle,
     ProjectedBundle,
@@ -327,6 +335,16 @@ class PregameBatchResult:
         }
 
 
+class PregameBatchReceiptError(OperatorIOError):
+    """Receipt publication failed after audited ledger work completed."""
+
+    def __init__(self, message: str, *, result: PregameBatchResult) -> None:
+        if not isinstance(result, PregameBatchResult):
+            raise TypeError("result must be a PregameBatchResult")
+        super().__init__(message)
+        self.result = result
+
+
 def _reject_duplicate_keys(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -612,12 +630,6 @@ def audit_pregame_batch(
             ),
         )
 
-    superseded_capture_ids = {
-        record.supersedes_capture_id
-        for record in checkpoint.records
-        if record.record_kind == "capture"
-        and record.supersedes_capture_id is not None
-    }
     audited: list[BatchResultEntry] = []
     for entry in result.entries:
         if isinstance(entry, PregameBatchFailure):
@@ -634,8 +646,6 @@ def audit_pregame_batch(
             mismatch = "reported capture is missing from the ledger"
         elif capture.game_pk != entry.game_pk:
             mismatch = "reported capture belongs to a different game"
-        elif entry.capture_id in superseded_capture_ids:
-            mismatch = "reported capture is no longer the active pregame state"
         elif forecast is None:
             mismatch = "reported forecast is missing from the ledger"
         elif link is None:
@@ -658,33 +668,57 @@ def audit_pregame_batch(
 def _publish_batch_receipt(
     path: Path,
     result: PregameBatchResult,
+    *,
+    directory_descriptor: int | None = None,
 ) -> None:
     content = (canonical_json(result.to_mapping()) + "\n").encode("utf-8")
-    temporary_path: Path | None = None
-    descriptor = -1
+    resolved = path.expanduser().resolve(strict=False)
+    owned_directory_descriptor = -1
+    temporary_name: str | None = None
+    file_descriptor = -1
     try:
-        supplied = path.expanduser()
-        if supplied.is_symlink():
-            raise OperatorIOError("batch receipt path cannot be symbolic")
-        resolved = supplied.resolve(strict=False)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{resolved.name}.",
-            dir=resolved.parent,
+        if directory_descriptor is None:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            owned_directory_descriptor = open_directory(resolved.parent)
+            directory_descriptor = owned_directory_descriptor
+        verify_public_directory(
+            resolved.parent,
+            directory_descriptor,
+            label="batch receipt directory",
         )
-        temporary_path = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as output:
-            descriptor = -1
+        existing = stat_at(directory_descriptor, resolved.name)
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise OperatorIOError("batch receipt path cannot be symbolic")
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise OperatorIOError("batch receipt path must be a regular file")
+        file_descriptor, temporary_name = create_exclusive_file(
+            directory_descriptor,
+            prefix=f".{resolved.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(file_descriptor, "wb") as output:
+            file_descriptor = -1
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary_path, resolved)
-        temporary_path = None
-        directory_descriptor = os.open(resolved.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        verify_public_directory(
+            resolved.parent,
+            directory_descriptor,
+            label="batch receipt directory",
+        )
+        os.replace(
+            temporary_name,
+            resolved.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_name = None
+        os.fsync(directory_descriptor)
+        verify_public_directory(
+            resolved.parent,
+            directory_descriptor,
+            label="batch receipt directory",
+        )
     except OperatorIOError:
         raise
     except OSError as error:
@@ -692,13 +726,110 @@ def _publish_batch_receipt(
             f"unable to publish pregame batch receipt {path}: {error}"
         ) from error
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temporary_path is not None:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if temporary_name is not None and directory_descriptor is not None:
             try:
-                temporary_path.unlink()
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
             except FileNotFoundError:
                 pass
+        if owned_directory_descriptor >= 0:
+            os.close(owned_directory_descriptor)
+
+
+def _receipt_protected_paths(
+    *,
+    manifest_path: str | Path,
+    entries: tuple[PreparedBatchEntry, ...],
+    stage: str,
+    ledger_path: Path,
+    bundle_root: Path,
+    registry_root: Path,
+) -> set[Path]:
+    protected = {
+        Path(manifest_path).expanduser().resolve(strict=False),
+        ledger_path,
+        Path(f"{ledger_path}.checkpoint-v1.json"),
+        Path(f"{ledger_path}.lock"),
+        *(entry.bundle_path for entry in entries),
+    }
+    for entry in entries:
+        digest = hashlib.sha256(entry.canonical_bundle).hexdigest()
+        mapping = json.loads(entry.canonical_bundle)
+        schema_version = mapping["schema_version"]
+        config_version = mapping["payload"]["forecast_config_version"]
+        protected.add(
+            bundle_root
+            / str(entry.game_pk)
+            / f"{stage}-v{schema_version}-{digest[:16]}.json"
+        )
+        protected.add(registry_root / f"{config_version}.json")
+    return protected
+
+
+def _resolve_safe_receipt_path(
+    receipt_path: str | Path,
+    *,
+    manifest_path: str | Path,
+    entries: tuple[PreparedBatchEntry, ...],
+    stage: str,
+    ledger_path: Path,
+    bundle_root: Path,
+    registry_root: Path,
+) -> Path:
+    supplied = Path(receipt_path).expanduser()
+    if supplied.is_symlink():
+        raise OperatorIOError("batch receipt path cannot be symbolic")
+    resolved = supplied.resolve(strict=False)
+    protected = _receipt_protected_paths(
+        manifest_path=manifest_path,
+        entries=entries,
+        stage=stage,
+        ledger_path=ledger_path,
+        bundle_root=bundle_root,
+        registry_root=registry_root,
+    )
+    immutable_roots = (bundle_root, registry_root)
+    inside_immutable_store = any(
+        resolved == root or root in resolved.parents
+        for root in immutable_roots
+    )
+    if resolved in protected or inside_immutable_store:
+        raise OperatorIOError(
+            "batch receipt path collides with an authoritative or input file"
+        )
+    if resolved.exists() and not resolved.is_file():
+        raise OperatorIOError("batch receipt path must be a regular file")
+    return resolved
+
+
+def _open_receipt_directory(path: Path) -> int:
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = open_directory(path.parent)
+        verify_public_directory(
+            path.parent,
+            descriptor,
+            label="batch receipt directory",
+        )
+        existing = stat_at(descriptor, path.name)
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise OperatorIOError("batch receipt path cannot be symbolic")
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise OperatorIOError("batch receipt path must be a regular file")
+        return descriptor
+    except OperatorIOError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise OperatorIOError(
+            f"unable to authenticate batch receipt directory: {error}"
+        ) from error
 
 
 def run_pregame_batch(
@@ -730,29 +861,55 @@ def run_pregame_batch(
     resolved_ledger = Path(ledger_path).expanduser().resolve(strict=False)
     resolved_bundle_root = Path(bundle_root).expanduser().resolve(strict=False)
     resolved_registry = (
-        None
+        DEFAULT_REGISTRY_ROOT
         if registry_root is None
-        else Path(registry_root).expanduser().resolve(strict=False)
+        else Path(registry_root).expanduser()
     )
-    # Initialize the shared lock and checkpoint before workers race to open it.
-    LedgerStore(resolved_ledger).pregame_checkpoint()
-    entries = _execute_prepared_batch(
-        manifest.stage,
-        prepared,
+    resolved_registry = resolved_registry.resolve(strict=False)
+    resolved_receipt = _resolve_safe_receipt_path(
+        receipt_path,
+        manifest_path=manifest_path,
+        entries=prepared,
+        stage=manifest.stage,
         ledger_path=resolved_ledger,
         bundle_root=resolved_bundle_root,
         registry_root=resolved_registry,
-        max_workers=max_workers,
     )
-    result = PregameBatchResult(
-        stage=manifest.stage,
-        max_workers=max_workers,
-        target_game_pks=tuple(entry.game_pk for entry in prepared),
-        entries=entries,
-    )
-    audited = audit_pregame_batch(result, ledger_path=resolved_ledger)
-    _publish_batch_receipt(Path(receipt_path), audited)
-    return audited
+    receipt_directory_descriptor = _open_receipt_directory(resolved_receipt)
+    try:
+        # Initialize the shared lock before workers race to open the ledger.
+        LedgerStore(resolved_ledger).pregame_checkpoint()
+        entries = _execute_prepared_batch(
+            manifest.stage,
+            prepared,
+            ledger_path=resolved_ledger,
+            bundle_root=resolved_bundle_root,
+            registry_root=resolved_registry,
+            max_workers=max_workers,
+        )
+        result = PregameBatchResult(
+            stage=manifest.stage,
+            max_workers=max_workers,
+            target_game_pks=tuple(entry.game_pk for entry in prepared),
+            entries=entries,
+        )
+        audited = audit_pregame_batch(result, ledger_path=resolved_ledger)
+        try:
+            _publish_batch_receipt(
+                resolved_receipt,
+                audited,
+                directory_descriptor=receipt_directory_descriptor,
+            )
+        except OperatorIOError as error:
+            raise PregameBatchReceiptError(
+                "batch ledger records are durable but receipt publication "
+                "failed; rerun the exact manifest to rebuild the receipt "
+                f"safely: {error}",
+                result=audited,
+            ) from error
+        return audited
+    finally:
+        os.close(receipt_directory_descriptor)
 
 
 __all__ = (
@@ -761,6 +918,7 @@ __all__ = (
     "PregameBatchFailure",
     "PregameBatchManifest",
     "PregameBatchResult",
+    "PregameBatchReceiptError",
     "PregameBatchSuccess",
     "PreparedBatchEntry",
     "audit_pregame_batch",
