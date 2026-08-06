@@ -15,6 +15,12 @@ from .bundles import (
     load_bundle,
     load_historical_managed_bundle,
 )
+from .batch import (
+    PregameBatchFailure,
+    PregameBatchResult,
+    PregameBatchSuccess,
+    run_pregame_batch,
+)
 from .errors import (
     BundleValidationError,
     OperatorError,
@@ -257,6 +263,101 @@ def _print_pregame(result: PregameRunResult) -> None:
     )
 
 
+def _batch_rows(
+    result: PregameBatchResult,
+    receipt_path: Path,
+) -> tuple[tuple[str, object], ...]:
+    rows: list[tuple[str, object]] = [
+        ("stage", result.stage),
+        ("complete", result.complete),
+        ("target_count", result.target_count),
+        ("success_count", result.success_count),
+        ("failure_count", result.failure_count),
+        ("max_workers", result.max_workers),
+        ("receipt_path", receipt_path),
+    ]
+    for index, entry in enumerate(result.entries, start=1):
+        prefix = f"game.{index}"
+        rows.extend(
+            (
+                (f"{prefix}.game_pk", entry.game_pk),
+                (
+                    f"{prefix}.status",
+                    (
+                        "success"
+                        if isinstance(entry, PregameBatchSuccess)
+                        else "failure"
+                    ),
+                ),
+                (f"{prefix}.bundle_path", entry.bundle_path),
+            )
+        )
+        if isinstance(entry, PregameBatchSuccess):
+            rows.extend(
+                (
+                    (f"{prefix}.capture_id", entry.capture_id),
+                    (f"{prefix}.forecast_run_id", entry.forecast_run_id),
+                    (
+                        f"{prefix}.capture_forecast_link_record_id",
+                        entry.capture_forecast_link_record_id,
+                    ),
+                    (
+                        f"{prefix}.managed_bundle_path",
+                        entry.managed_bundle_path,
+                    ),
+                    (f"{prefix}.capture_replayed", entry.capture_replayed),
+                    (f"{prefix}.forecast_replayed", entry.forecast_replayed),
+                    (f"{prefix}.link_replayed", entry.link_replayed),
+                )
+            )
+        else:
+            assert isinstance(entry, PregameBatchFailure)
+            rows.extend(
+                (
+                    (f"{prefix}.error_type", entry.error_type),
+                    (f"{prefix}.message", entry.message),
+                    (f"{prefix}.exit_code", entry.exit_code),
+                    (f"{prefix}.rerun_safe", entry.rerun_safe),
+                )
+            )
+    return tuple(rows)
+
+
+def _print_batch(result: PregameBatchResult, receipt_path: Path) -> None:
+    _print_summary(
+        "Shadow pregame batch",
+        _batch_rows(result, receipt_path),
+    )
+
+
+def _run_pregame_batch_command(
+    *,
+    stage: str,
+    manifest: Path,
+    ledger: Path,
+    bundle_root: Path,
+    receipt: Path,
+    max_workers: int,
+) -> None:
+    completed: list[PregameBatchResult] = []
+
+    def execute() -> None:
+        result = run_pregame_batch(
+            manifest,
+            expected_stage=stage,
+            ledger_path=ledger,
+            bundle_root=bundle_root,
+            receipt_path=receipt,
+            max_workers=max_workers,
+        )
+        completed.append(result)
+        _print_batch(result, receipt)
+
+    _run_at_cli_boundary(execute)
+    if not completed[0].complete:
+        raise typer.Exit(code=7)
+
+
 def _review_rows(result: ReviewRunResult) -> tuple[tuple[str, object], ...]:
     rows: list[tuple[str, object]] = [
         ("stage", result.stage),
@@ -329,6 +430,90 @@ def _review_rows(result: ReviewRunResult) -> tuple[tuple[str, object], ...]:
 
 def _print_review(result: ReviewRunResult) -> None:
     _print_summary("Shadow review stage", _review_rows(result))
+
+
+@app.command("batch-projected")
+def batch_projected(
+    manifest: Path = typer.Option(
+        ...,
+        "--manifest",
+        help="Projected batch manifest JSON.",
+    ),
+    ledger: Path = typer.Option(
+        DEFAULT_LEDGER_PATH,
+        "--ledger",
+        help="Append-only shadow ledger path.",
+    ),
+    bundle_root: Path = typer.Option(
+        DEFAULT_BUNDLE_ROOT,
+        "--bundle-root",
+        help="Managed bundle directory.",
+    ),
+    receipt: Path = typer.Option(
+        ...,
+        "--receipt",
+        help="Atomic projected batch receipt JSON.",
+    ),
+    max_workers: int = typer.Option(
+        3,
+        "--max-workers",
+        min=1,
+        max=4,
+        help="Bounded forecast worker process count.",
+    ),
+) -> None:
+    """Record or replay a complete projected-lineup batch."""
+
+    _run_pregame_batch_command(
+        stage="projected",
+        manifest=manifest,
+        ledger=ledger,
+        bundle_root=bundle_root,
+        receipt=receipt,
+        max_workers=max_workers,
+    )
+
+
+@app.command("batch-confirmed")
+def batch_confirmed(
+    manifest: Path = typer.Option(
+        ...,
+        "--manifest",
+        help="Confirmed batch manifest JSON.",
+    ),
+    ledger: Path = typer.Option(
+        DEFAULT_LEDGER_PATH,
+        "--ledger",
+        help="Append-only shadow ledger path.",
+    ),
+    bundle_root: Path = typer.Option(
+        DEFAULT_BUNDLE_ROOT,
+        "--bundle-root",
+        help="Managed bundle directory.",
+    ),
+    receipt: Path = typer.Option(
+        ...,
+        "--receipt",
+        help="Atomic confirmed batch receipt JSON.",
+    ),
+    max_workers: int = typer.Option(
+        3,
+        "--max-workers",
+        min=1,
+        max=4,
+        help="Bounded forecast worker process count.",
+    ),
+) -> None:
+    """Record or replay a complete confirmed-lineup batch."""
+
+    _run_pregame_batch_command(
+        stage="confirmed",
+        manifest=manifest,
+        ledger=ledger,
+        bundle_root=bundle_root,
+        receipt=receipt,
+        max_workers=max_workers,
+    )
 
 
 @app.command()

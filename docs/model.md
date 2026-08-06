@@ -47,6 +47,8 @@ Keep these output concepts separate:
 2. Refresh with the RotoWire confirmed lineup and current starter and market state, prepare a schema-v2 confirmed bundle with explicit `authority: "current"`, and run `.venv/bin/python -m analysis.operator confirmed --bundle <path>`. A genuine source-state event receives a new capture; a behavior-changing normalized input or semantic market change receives a new forecast run. An unchanged semantic state may link a later capture to the same deterministic forecast.
 3. Put the exact frozen `capture_id`, `forecast_run_id`, and `capture_forecast_link_record_id` from the confirmed command into the schema-v1 review bundle with the official MLB result, then run `.venv/bin/python -m analysis.operator review --bundle <path>`. Review binds only to those records, performs the objective flow review, and builds the calibration report without forecasting again.
 
+For a multi-game projected or confirmed request, prepare every current bundle before execution and use the matching `batch-projected` or `batch-confirmed` command. The batch receipt must cover every requested `game_pk` with an audited capture, forecast, and link triplet before the response may describe the slate as completely recorded or frozen. A partial receipt is an operational failure, not a model downgrade; successful immutable rows remain valid and exact rerun completes missing work. Bounded process parallelism, one final coverage audit, and receipt publication do not change baseball scoring, simulation count, legacy admission, priority order, or Shadow authority.
+
 Fresh projected and confirmed envelopes use this contract, with `stage` set to the matching command:
 
 ```json

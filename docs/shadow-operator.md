@@ -8,6 +8,8 @@ Shadow Operator는 외부에서 준비한 버전 고정 JSON 번들을 받아 �
 |---|---|---|
 | "예상 라인업으로 경기 전 분석을 기록해줘" | `projected` | `.venv/bin/python -m analysis.operator projected --bundle <path>` |
 | "확정 라인업으로 다시 기록하고 동결해줘" | `confirmed` | `.venv/bin/python -m analysis.operator confirmed --bundle <path>` |
+| "예상 라인업 전 경기를 기록해줘" | `projected` | `.venv/bin/python -m analysis.operator batch-projected --manifest <path> --receipt <path>` |
+| "확정 라인업 전 경기를 동결해줘" | `confirmed` | `.venv/bin/python -m analysis.operator batch-confirmed --manifest <path> --receipt <path>` |
 | "공식 결과로 복기하고 보고서를 갱신해줘" | `review` | `.venv/bin/python -m analysis.operator review --bundle <path>` |
 
 세 명령 모두 strict JSON bundle만 받으며 알 수 없는 필드, 잘못된 stage, 타입 강제 변환, 시간대 없는 timestamp를 거부합니다. 새 `projected`와 `confirmed` 실행은 JSON integer `schema_version: 2`와 명시적인 `authority: "current"`를 모두 요구합니다. `review` 계약은 `schema_version: 1`로 유지됩니다.
@@ -36,6 +38,35 @@ Fresh pregame 실행 객체는 raw mapping 또는 JSON을 public `ProjectedBundl
 
 고정 MLB 모델 버전 `2026-08-05`은 번들 schema version과 독립적입니다. Schema v2 전환은 MLB 점수화, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority, Shadow의 비권위 비교 모드를 변경하지 않습니다.
 
+## Pregame 배치와 완결성 receipt
+
+여러 경기는 strict manifest로 목표를 먼저 고정합니다. 상대 경로는 manifest 디렉터리를 기준으로 해석합니다.
+
+```json
+{
+  "schema_version": 1,
+  "stage": "confirmed",
+  "entries": [
+    {
+      "game_pk": 824806,
+      "bundle": "bundles/824806-confirmed.json"
+    }
+  ]
+}
+```
+
+Manifest는 비어 있을 수 없고 `game_pk`와 해석된 bundle 경로가 각각 고유해야 합니다. Parent process가 모든 파일을 한 번 읽고 schema-v2/current, stage, `game_pk`를 확인해 canonical bytes로 고정한 뒤에만 worker를 시작합니다. 따라서 한 파일이라도 정적 검증에 실패하면 ledger record와 receipt를 만들지 않습니다.
+
+기본 worker 수는 `3`, 허용 범위는 `1..4`입니다. CPU-bound 20,000회 forecast는 제한 병렬로 실행하지만 각 worker는 기존 `run_projected`/`run_confirmed`를 그대로 사용합니다. 원장 append는 기존 lock이 직렬화하며 성공한 경기의 immutable record는 다른 경기 실패 때문에 rollback하지 않습니다. Exact replay는 원래 ID를 재사용하고 시뮬레이션을 생략합니다.
+
+모든 worker가 끝나면 한 번의 fresh checkpoint로 각 성공 행의 `capture_id`, `forecast_run_id`, `capture_forecast_link_record_id`, game 관계를 검사합니다. Receipt는 manifest 순서를 보존하며 target/success/failure count, `complete`, worker 수, 경기별 triplet 또는 실패 원인과 partial progress를 담아 atomic replace로 저장합니다.
+
+- `complete: true`이고 `success_count == target_count`일 때만 `동결 완료`로 보고합니다.
+- 하나라도 실패하면 `부분 동결`이며 exit `7`입니다.
+- 성공 기록은 그대로 유지되므로 같은 manifest와 override로 재실행합니다.
+- Receipt는 파생 운영 산출물이고 JSONL ledger가 계속 유일한 authoritative state입니다.
+- 배치 명령은 라이브 출처를 수집하거나 분석표와 리뷰 문장을 생성하지 않습니다.
+
 Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.json`의 완전한 불변 설정을 선택합니다. CLI에서 임의 설정 override나 precomputed forecast를 주입할 수 없습니다.
 
 ## Recommended Review Eligibility Gate
@@ -61,6 +92,7 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 | 입력 번들 | 없음, 필수 | `--bundle <path>` |
 | append-only ledger | `data/ledger/shadow.jsonl` | 모든 명령의 `--ledger <path>` |
 | 관리 번들 루트 | `data/shadow/bundles` | 모든 명령의 `--bundle-root <dir>` |
+| Pregame 배치 receipt | 없음, 배치에서 필수 | `--receipt <path>` |
 | calibration 보고서 디렉터리 | `reports/private/shadow` | `review`의 `--report-dir <dir>` |
 
 전체 override 형태는 다음과 같습니다.
@@ -68,6 +100,8 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 ```bash
 .venv/bin/python -m analysis.operator projected --bundle <path> --ledger <path> --bundle-root <dir>
 .venv/bin/python -m analysis.operator confirmed --bundle <path> --ledger <path> --bundle-root <dir>
+.venv/bin/python -m analysis.operator batch-projected --manifest <path> --receipt <path> --max-workers 3 --ledger <path> --bundle-root <dir>
+.venv/bin/python -m analysis.operator batch-confirmed --manifest <path> --receipt <path> --max-workers 3 --ledger <path> --bundle-root <dir>
 .venv/bin/python -m analysis.operator review --bundle <path> --ledger <path> --bundle-root <dir> --report-dir <dir>
 ```
 
@@ -151,6 +185,7 @@ Checkpoint를 수동으로 지우는 것은 안전하지만 다음 pregame 명�
 | `4` | stage, lineup, timestamp, source, frozen-record precondition 실패 |
 | `5` | ledger reference, idempotency conflict, corruption 실패 |
 | `6` | bundle, ledger, report I/O 실패 |
+| `7` | Pregame 배치 일부 경기 실패 또는 coverage audit 불완전 |
 
 Expected operator 오류는 traceback 없이 간결한 원인과 가능한 partial progress를 출력합니다.
 

@@ -24,6 +24,11 @@ from analysis.operator.bundles import (
     ReplayOnlyPregameBundle,
     load_historical_managed_bundle,
 )
+from analysis.operator.batch import (
+    PregameBatchFailure,
+    PregameBatchResult,
+    PregameBatchSuccess,
+)
 from analysis.operator.errors import (
     BundleValidationError,
     OperatorIOError,
@@ -116,6 +121,163 @@ class _ReviewResult:
 
 runner = CliRunner()
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _batch_success(tmp_path: Path, game_pk: int) -> PregameBatchSuccess:
+    suffix = f"{game_pk:032x}"[-32:]
+    return PregameBatchSuccess(
+        game_pk=game_pk,
+        bundle_path=tmp_path / f"{game_pk}.json",
+        capture_id=suffix,
+        forecast_run_id=(suffix * 2)[:64],
+        capture_forecast_link_record_id=("f" * 31) + suffix[-1],
+        managed_bundle_path=tmp_path / "managed" / f"{game_pk}.json",
+        managed_bundle_hash="a" * 64,
+        managed_bundle_replayed=False,
+        capture_replayed=False,
+        forecast_replayed=False,
+        link_replayed=False,
+    )
+
+
+def _complete_batch_result(
+    tmp_path: Path,
+    stage: str,
+) -> PregameBatchResult:
+    return PregameBatchResult(
+        stage=stage,
+        max_workers=3,
+        target_game_pks=(900001,),
+        entries=(_batch_success(tmp_path, 900001),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "stage"),
+    (("batch-projected", "projected"), ("batch-confirmed", "confirmed")),
+)
+def test_pregame_batch_cli_prints_complete_receipt_and_triplet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    stage: str,
+) -> None:
+    expected = _complete_batch_result(tmp_path, stage)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "run_pregame_batch",
+        lambda *args, **kwargs: calls.append(
+            {"args": args, "kwargs": kwargs}
+        )
+        or expected,
+        raising=False,
+    )
+    receipt = tmp_path / "receipt.json"
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            command,
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--receipt",
+            str(receipt),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "complete: true" in result.stdout
+    assert "target_count: 1" in result.stdout
+    assert "success_count: 1" in result.stdout
+    assert expected.successes[0].capture_id in result.stdout
+    assert expected.successes[0].forecast_run_id in result.stdout
+    assert (
+        expected.successes[0].capture_forecast_link_record_id
+        in result.stdout
+    )
+    assert str(receipt) in result.stdout
+    assert calls[0]["kwargs"]["expected_stage"] == stage
+
+
+def test_pregame_batch_cli_reports_partial_receipt_with_exit_seven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = PregameBatchFailure(
+        game_pk=900002,
+        bundle_path=tmp_path / "900002.json",
+        error_type="OperatorPreconditionError",
+        message="candidate is not review-eligible",
+        exit_code=4,
+    )
+    partial = PregameBatchResult(
+        stage="confirmed",
+        max_workers=3,
+        target_game_pks=(900001, 900002),
+        entries=(_batch_success(tmp_path, 900001), failure),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_pregame_batch",
+        lambda *args, **kwargs: partial,
+        raising=False,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "batch-confirmed",
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+        ],
+    )
+
+    assert result.exit_code == 7
+    assert "complete: false" in result.stdout
+    assert "failure_count: 1" in result.stdout
+    assert "OperatorPreconditionError" in result.stdout
+    assert "candidate is not review-eligible" in result.stdout
+    assert "internal error" not in result.stderr
+
+
+@pytest.mark.parametrize("workers", ("0", "5"))
+def test_pregame_batch_cli_rejects_invalid_worker_count_before_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workers: str,
+) -> None:
+    calls = 0
+
+    def unexpected(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("batch service must not run")
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_pregame_batch",
+        unexpected,
+        raising=False,
+    )
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "batch-confirmed",
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--max-workers",
+            workers,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert calls == 0
 
 
 def _bundle(command: str) -> ProjectedBundle | ConfirmedBundle | ReviewBundle:

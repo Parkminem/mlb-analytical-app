@@ -23,6 +23,8 @@ python3 -m analysis.pipeline --lineup projected --starter confirmed
 python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 .venv/bin/python -m analysis.operator projected --bundle <path>
 .venv/bin/python -m analysis.operator confirmed --bundle <path>
+.venv/bin/python -m analysis.operator batch-projected --manifest <path> --receipt <path>
+.venv/bin/python -m analysis.operator batch-confirmed --manifest <path> --receipt <path>
 .venv/bin/python -m analysis.operator review --bundle <path>
 ```
 
@@ -46,6 +48,8 @@ Fresh `projected`/`confirmed` 번들은 JSON integer `schema_version: 2`와 명�
 1. **예상 라인업:** 공식 MLB 선발과 오프너/벌크 구조, RotoWire 예상 라인업, Savant/Statcast 매치업, 최근 흐름, 불펜, 심판, 현재 소수 배당을 사용해 기존 고정 모델 분석을 수행합니다. F5, F5 O/U, ML, `+1.5`, O/U의 `play`/`lean`/`pass`와 최종 우선순위를 정한 뒤 schema-v2/current `projected` 번들을 만들어 `.venv/bin/python -m analysis.operator projected --bundle <path>`로 같은 상태를 기록합니다. 예상 라인업은 팀 강도가 아니라 신뢰도만 낮춥니다.
 2. **확정 라인업:** RotoWire 확정 라인업과 최신 선발 및 시장 상태로 schema-v2/current `confirmed` 번들을 새로 만들고 `.venv/bin/python -m analysis.operator confirmed --bundle <path>`를 실행합니다. CLI는 번들의 intrinsic capture 내용에서 idempotency를 도출하고 최신 active pregame capture를 immutable supersession lineage로 연결합니다. 의미가 같은 forecast는 재사용될 수 있으며 정확한 재실행은 원래 capture, forecast, link를 반환합니다.
 3. **경기 후:** `confirmed` 성공 출력의 정확한 `capture_id`, `forecast_run_id`, `capture_forecast_link_record_id`와 공식 MLB 결과로 schema-v1 `review` 번들을 만들고 `.venv/bin/python -m analysis.operator review --bundle <path>`를 실행합니다. CLI는 동결된 pregame 상태만 복기하고 calibration report를 갱신하며 새 forecast를 만들지 않습니다.
+
+여러 경기를 처리할 때는 각 단계의 schema-v2/current 번들을 먼저 모두 준비한 뒤 `batch-projected` 또는 `batch-confirmed`를 사용합니다. 배치 명령은 기본 세 worker process로 기존 단일 경기 Operator를 제한 병렬 실행하고, 마지막에 원장의 capture/forecast/link 세 ID를 한 번 감사해 atomic JSON receipt를 만듭니다. 응답에서 `동결 완료`라고 표시하려면 receipt의 `complete`가 `true`이고 `success_count == target_count`여야 합니다. 일부 경기만 성공하면 immutable 성공 기록은 유지되지만 명령은 exit `7`로 끝나며 같은 manifest를 재실행해 안전하게 이어갑니다.
 
 모든 pregame schema-v1 shape은 relaxed/strict candidate 형식과 관계없이 역사적 exact replay 전용입니다. 설정된 관리 번들 루트의 인증된 파일과 ledger의 정확한 capture, forecast, link가 모두 있을 때만 replay할 수 있습니다. 아직 실행하지 않은 pending v1 파일은 fresh 상태를 만들 수 없으므로 schema v2/current로 다시 생성해야 합니다. V1 거부는 ledger나 관리 번들 bytes를 변경하지 않습니다.
 
