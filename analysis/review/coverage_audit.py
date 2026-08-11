@@ -41,6 +41,7 @@ from analysis.review.calibration import (
     CalibrationMetrics,
     CalibrationReport,
 )
+from analysis.review.watchlist import WatchlistResult
 from analysis.shadow import deserialize_shadow_comparison
 
 
@@ -96,6 +97,25 @@ _CALIBRATION_V1_KEYS: Final = frozenset(
     )
 )
 _CALIBRATION_V2_KEYS: Final = _CALIBRATION_V1_KEYS | frozenset(("watchlist",))
+_WATCHLIST_RESULT_KEYS: Final = frozenset(
+    (
+        "target_id",
+        "label",
+        "status",
+        "eligible_count",
+        "excluded_count",
+        "win_count",
+        "loss_count",
+        "push_count",
+        "classification_counts",
+        "b_loss_count",
+        "contradiction_count",
+        "contradiction_rate",
+        "non_push_hit_rate",
+        "minimum_sample",
+        "trigger_reasons",
+    )
+)
 _LEDGER_REVISION_KEYS: Final = frozenset(("record_count", "state_hash"))
 _GROUP_KEYS: Final = frozenset(("dimensions", "metrics"))
 _MIGRATION_KEYS: Final = frozenset(("confirmed_games", "market_types"))
@@ -357,6 +377,26 @@ def _validate_migration(value: object) -> None:
         )
 
 
+def _validate_watchlist(value: object) -> None:
+    if not isinstance(value, list):
+        raise ValueError("watchlist must be a JSON array")
+    for index, result_value in enumerate(value):
+        name = f"watchlist[{index}]"
+        result = _require_mapping(result_value, name)
+        _require_exact_keys(result, _WATCHLIST_RESULT_KEYS, name)
+        trigger_reasons = result["trigger_reasons"]
+        if not isinstance(trigger_reasons, list):
+            raise ValueError(f"{name}.trigger_reasons must be a JSON array")
+        constructor_values = dict(result)
+        constructor_values["trigger_reasons"] = tuple(trigger_reasons)
+        try:
+            validated = WatchlistResult(**constructor_values)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} is invalid: {error}") from error
+        if validated.to_mapping() != dict(result):
+            raise ValueError(f"{name} does not match WatchlistResult mapping")
+
+
 def _load_calibration(path: Path) -> Mapping[str, object]:
     calibration = _load_json(path, "calibration")
     schema_version = _require_positive_integer(
@@ -371,8 +411,8 @@ def _load_calibration(path: Path) -> Mapping[str, object]:
         else _CALIBRATION_V2_KEYS
     )
     _require_exact_keys(calibration, expected_keys, "calibration")
-    if schema_version == 2 and not isinstance(calibration["watchlist"], list):
-        raise ValueError("watchlist must be a JSON array")
+    if schema_version == 2:
+        _validate_watchlist(calibration["watchlist"])
     ledger_as_of = calibration["ledger_as_of"]
     if ledger_as_of is not None:
         _parse_datetime(ledger_as_of, "ledger_as_of")

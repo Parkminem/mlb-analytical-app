@@ -43,6 +43,7 @@ from analysis.review.coverage_audit import (
     build_coverage_audit,
     render_coverage_audit_markdown,
 )
+from analysis.review.watchlist import WatchlistResult
 
 
 UTC = timezone.utc
@@ -75,6 +76,26 @@ def _official_metrics() -> dict[str, object]:
         "mean_probability_clv": None,
         "mean_price_clv": None,
     }
+
+
+def _valid_watchlist_result() -> dict[str, object]:
+    return WatchlistResult(
+        target_id="f5_over_early_conversion",
+        label="F5 오버 초기 득점 전환",
+        status="관찰",
+        eligible_count=3,
+        excluded_count=1,
+        win_count=2,
+        loss_count=1,
+        push_count=0,
+        classification_counts={"A": 2, "B": 1, "C": 0, "D": 0},
+        b_loss_count=1,
+        contradiction_count=None,
+        contradiction_rate=None,
+        non_push_hit_rate=2 / 3,
+        minimum_sample=20,
+        trigger_reasons=(),
+    ).to_mapping()
 
 
 def _write_calibration(path: Path, ledger_path: Path) -> None:
@@ -464,13 +485,100 @@ def test_coverage_audit_accepts_calibration_schema_v2_watchlist(
     ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     calibration["schema_version"] = 2
-    calibration["watchlist"] = []
+    calibration["watchlist"] = [_valid_watchlist_result()]
     calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
 
     audit = build_coverage_audit(ledger_path, calibration_path, manifest_path)
 
     assert audit["official_metrics"] == _official_metrics()
     assert audit["official_calibration_unchanged"] is True
+
+
+def test_coverage_audit_rejects_non_object_v2_watchlist_entry(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["schema_version"] = 2
+    calibration["watchlist"] = [None]
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"watchlist\[0\] must be a JSON object"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (lambda row: row.pop("label"), "watchlist\\[0\\] has invalid fields"),
+        (
+            lambda row: row.update({"unexpected": True}),
+            "watchlist\\[0\\] has invalid fields",
+        ),
+        (lambda row: row.update({"target_id": 7}), "target_id"),
+        (lambda row: row.update({"label": ""}), "label"),
+        (lambda row: row.update({"status": "pending"}), "status"),
+        (lambda row: row.update({"eligible_count": True}), "eligible_count"),
+        (lambda row: row.update({"win_count": -1}), "win_count"),
+        (
+            lambda row: row.update({"eligible_count": 4}),
+            "eligible_count must equal outcome counts",
+        ),
+        (lambda row: row.update({"minimum_sample": 0}), "minimum_sample"),
+        (lambda row: row.update({"b_loss_count": "1"}), "b_loss_count"),
+        (
+            lambda row: row.update({"contradiction_count": 4}),
+            "contradiction_count",
+        ),
+        (
+            lambda row: row.update({"contradiction_rate": 1.1}),
+            "contradiction_rate",
+        ),
+        (
+            lambda row: row.update({"non_push_hit_rate": -0.1}),
+            "non_push_hit_rate",
+        ),
+        (
+            lambda row: row.update({"classification_counts": []}),
+            "classification_counts",
+        ),
+        (
+            lambda row: row["classification_counts"].pop("D"),
+            "classification_counts",
+        ),
+        (
+            lambda row: row["classification_counts"].update({"A": True}),
+            "classification_counts",
+        ),
+        (
+            lambda row: row.update({"trigger_reasons": "reason"}),
+            "trigger_reasons must be a JSON array",
+        ),
+        (
+            lambda row: row.update({"trigger_reasons": ["z", "a"]}),
+            "trigger_reasons",
+        ),
+        (
+            lambda row: row.update({"trigger_reasons": [""]}),
+            "trigger_reasons",
+        ),
+    ),
+)
+def test_coverage_audit_rejects_malformed_v2_watchlist_result(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    row = _valid_watchlist_result()
+    mutation(row)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["schema_version"] = 2
+    calibration["watchlist"] = [row]
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
 
 
 def test_coverage_audit_preserves_historical_calibration_schema_v1(
