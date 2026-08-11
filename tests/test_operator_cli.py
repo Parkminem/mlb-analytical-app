@@ -1393,6 +1393,47 @@ def test_operator_errors_have_stable_exit_codes_without_tracebacks(
     assert "Traceback" not in result.output
 
 
+@pytest.mark.parametrize(
+    ("config_error", "exit_code"),
+    (
+        (ValueError("invalid watchlist config"), 3),
+        (PermissionError("watchlist permission denied"), 6),
+    ),
+)
+def test_review_watchlist_config_errors_use_validation_and_io_exit_taxonomy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_error: Exception,
+    exit_code: int,
+) -> None:
+    class EmptyStore:
+        def iter_records(self):
+            return iter(())
+
+    def load_config():
+        raise config_error
+
+    def run_with_config_failure(bundle, **kwargs):
+        del bundle, kwargs
+        return service_module._calibration_report_state(
+            EmptyStore(),
+            tmp_path / "ledger.jsonl",
+        )
+
+    monkeypatch.setattr(cli_module, "load_bundle", lambda path: _bundle("review"))
+    monkeypatch.setattr(service_module, "load_review_watchlist_config", load_config)
+    monkeypatch.setattr(cli_module, "run_review", run_with_config_failure)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["review", "--bundle", "input.json"],
+    )
+
+    assert result.exit_code == exit_code
+    assert str(config_error) in result.output
+    assert "Traceback" not in result.output
+
+
 def test_unexpected_exception_exits_one_without_traceback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

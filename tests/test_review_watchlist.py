@@ -88,6 +88,21 @@ def test_default_watchlist_configuration_is_the_approved_version() -> None:
     ]
 
 
+def test_config_read_oserror_remains_filesystem_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "review-watchlist.json"
+
+    def unreadable(*args, **kwargs):
+        raise PermissionError("watchlist permission denied")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    with pytest.raises(PermissionError, match="permission denied"):
+        load_review_watchlist_config(path)
+
+
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     raw = json.dumps(APPROVED_CONFIG, ensure_ascii=False)
     raw = raw.replace('"schema_version": 1,', '"schema_version": 1, "schema_version": 1,', 1)

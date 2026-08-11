@@ -292,6 +292,12 @@ def load_review_watchlist_config(
     config_path = Path(path)
     try:
         decoded = config_path.read_text(encoding="utf-8")
+    except UnicodeError as error:
+        raise ValueError(
+            "watchlist configuration is not valid UTF-8"
+        ) from error
+
+    try:
         raw = json.loads(
             decoded,
             object_pairs_hook=_reject_duplicate_keys,
@@ -299,8 +305,6 @@ def load_review_watchlist_config(
         )
     except json.JSONDecodeError as error:
         raise ValueError("watchlist configuration is not valid JSON") from error
-    except (OSError, UnicodeError) as error:
-        raise ValueError("watchlist configuration is unreadable") from error
 
     if not isinstance(raw, dict):
         raise ValueError("watchlist configuration root must be a JSON object")

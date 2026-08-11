@@ -21,7 +21,11 @@ from analysis.ledger import (
     RecordEnvelope,
     ReviewCommand,
 )
-from analysis.operator.errors import OperatorIOError, OperatorLedgerError
+from analysis.operator.errors import (
+    BundleValidationError,
+    OperatorIOError,
+    OperatorLedgerError,
+)
 from analysis.operator.reporting import (
     CALIBRATION_JSON_FILENAME,
     CALIBRATION_MARKDOWN_FILENAME,
@@ -1810,9 +1814,18 @@ def test_service_builds_calibration_and_watchlist_from_same_selected_rows(
     assert sample_size == 1
 
 
-def test_invalid_watchlist_config_prevents_service_report_publication(
+@pytest.mark.parametrize(
+    ("config_error", "expected_error"),
+    (
+        (ValueError("invalid watchlist config"), BundleValidationError),
+        (PermissionError("watchlist permission denied"), OperatorIOError),
+    ),
+)
+def test_watchlist_config_error_prevents_service_report_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    config_error: Exception,
+    expected_error: type[Exception],
 ) -> None:
     published = False
 
@@ -1821,7 +1834,7 @@ def test_invalid_watchlist_config_prevents_service_report_publication(
             return iter(())
 
     def invalid_config():
-        raise ValueError("invalid watchlist config")
+        raise config_error
 
     def publish(mapping, *, report_dir):
         nonlocal published
@@ -1835,7 +1848,7 @@ def test_invalid_watchlist_config_prevents_service_report_publication(
     )
     monkeypatch.setattr(service_module, "write_calibration_reports", publish)
 
-    with pytest.raises(OperatorLedgerError, match="invalid watchlist config"):
+    with pytest.raises(expected_error, match=str(config_error)):
         service_module._publish_calibration_report(
             EmptyStore(),
             tmp_path / "ledger.jsonl",

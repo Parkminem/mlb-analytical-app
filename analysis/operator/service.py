@@ -1840,7 +1840,16 @@ def _calibration_report_state(
         ledger_records = tuple(store.iter_records())
         rows = select_primary_rows(_LedgerSnapshot(ledger_records))
         report = build_calibration_report(rows)
-        watchlist_config = load_review_watchlist_config()
+        try:
+            watchlist_config = load_review_watchlist_config()
+        except OSError as error:
+            raise OperatorIOError(
+                f"unable to read review watchlist configuration: {error}"
+            ) from error
+        except ValueError as error:
+            raise BundleValidationError(
+                f"invalid review watchlist configuration: {error}"
+            ) from error
         watchlist = build_review_watchlist(rows, watchlist_config)
         mapping = build_report_mapping(
             ledger_path=ledger_path,
