@@ -507,6 +507,20 @@ def test_coverage_audit_rejects_non_object_v2_watchlist_entry(
         build_coverage_audit(ledger_path, calibration_path, manifest_path)
 
 
+def test_coverage_audit_rejects_duplicate_v2_watchlist_target_ids(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    result = _valid_watchlist_result()
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["schema_version"] = 2
+    calibration["watchlist"] = [result, dict(result)]
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate.*target_id"):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (

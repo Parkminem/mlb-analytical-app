@@ -28,6 +28,10 @@ _PATH_TARGET_KEYS = _COMMON_TARGET_KEYS | frozenset(
 )
 _CLASSIFICATIONS = ("A", "B", "C", "D")
 _STATUSES = frozenset(("관찰", "정상 범위", "정밀 검토"))
+_F5_TRIGGER_REASONS = frozenset(
+    ("b_loss_count_and_rate", "non_push_hit_rate_below")
+)
+_PATH_TRIGGER_REASONS = frozenset(("contradiction_count_and_rate",))
 
 
 def _require_nonempty_string(value: object, name: str) -> str:
@@ -230,6 +234,66 @@ class WatchlistResult:
         ):
             raise ValueError(
                 "trigger_reasons must be a sorted tuple of unique nonempty strings"
+            )
+
+        is_f5_family = self.b_loss_count is not None
+        is_path_family = self.contradiction_count is not None
+        if is_f5_family == is_path_family:
+            raise ValueError(
+                "exactly one watchlist metric family must be present"
+            )
+
+        if is_f5_family:
+            if self.contradiction_rate is not None:
+                raise ValueError(
+                    "exactly one watchlist metric family must be present"
+                )
+            if self.b_loss_count > self.loss_count:
+                raise ValueError("b_loss_count must not exceed loss_count")
+            non_push_count = self.win_count + self.loss_count
+            expected_rate = (
+                self.win_count / non_push_count if non_push_count else None
+            )
+            if self.non_push_hit_rate != expected_rate:
+                raise ValueError(
+                    "non_push_hit_rate must equal win_count divided by "
+                    "non-push outcomes"
+                )
+            allowed_reasons = _F5_TRIGGER_REASONS
+        else:
+            if self.non_push_hit_rate is not None:
+                raise ValueError(
+                    "exactly one watchlist metric family must be present"
+                )
+            expected_rate = (
+                self.contradiction_count / self.eligible_count
+                if self.eligible_count
+                else None
+            )
+            if self.contradiction_rate != expected_rate:
+                raise ValueError(
+                    "contradiction_rate must equal contradiction_count "
+                    "divided by eligible_count"
+                )
+            allowed_reasons = _PATH_TRIGGER_REASONS
+
+        if not set(self.trigger_reasons).issubset(allowed_reasons):
+            raise ValueError(
+                "trigger_reasons contain values unsupported by the metric family"
+            )
+        if self.eligible_count < self.minimum_sample:
+            if self.trigger_reasons:
+                raise ValueError(
+                    "trigger_reasons must be empty below minimum_sample"
+                )
+            expected_status = "관찰"
+        else:
+            expected_status = (
+                "정밀 검토" if self.trigger_reasons else "정상 범위"
+            )
+        if self.status != expected_status:
+            raise ValueError(
+                "status must match minimum_sample and trigger_reasons"
             )
 
     def to_mapping(self) -> dict[str, object]:

@@ -287,6 +287,115 @@ def test_rejects_empty_required_strings(
 WATCHLIST_CONFIG = load_review_watchlist_config()
 
 
+def watchlist_result(**overrides: object) -> WatchlistResult:
+    values: dict[str, object] = {
+        "target_id": "f5_over_early_conversion",
+        "label": "F5 오버 초기 득점 전환",
+        "status": "관찰",
+        "eligible_count": 3,
+        "excluded_count": 0,
+        "win_count": 2,
+        "loss_count": 1,
+        "push_count": 0,
+        "classification_counts": {"A": 2, "B": 1, "C": 0, "D": 0},
+        "b_loss_count": 1,
+        "contradiction_count": None,
+        "contradiction_rate": None,
+        "non_push_hit_rate": 2 / 3,
+        "minimum_sample": 20,
+        "trigger_reasons": (),
+    }
+    values.update(overrides)
+    return WatchlistResult(**values)
+
+
+def path_watchlist_result(**overrides: object) -> WatchlistResult:
+    values: dict[str, object] = {
+        "target_id": "bullpen_protection_contradiction",
+        "label": "불펜 보호 경로 모순",
+        "status": "관찰",
+        "eligible_count": 4,
+        "excluded_count": 0,
+        "win_count": 0,
+        "loss_count": 4,
+        "push_count": 0,
+        "classification_counts": {"A": 0, "B": 0, "C": 4, "D": 0},
+        "b_loss_count": None,
+        "contradiction_count": 1,
+        "contradiction_rate": 0.25,
+        "non_push_hit_rate": None,
+        "minimum_sample": 20,
+        "trigger_reasons": (),
+    }
+    values.update(overrides)
+    return WatchlistResult(**values)
+
+
+def test_watchlist_result_requires_derived_rates() -> None:
+    with pytest.raises(ValueError, match="non_push_hit_rate"):
+        watchlist_result(non_push_hit_rate=0.5)
+    with pytest.raises(ValueError, match="contradiction_rate"):
+        path_watchlist_result(contradiction_rate=0.5)
+
+
+def test_watchlist_result_requires_b_losses_to_be_losses() -> None:
+    with pytest.raises(ValueError, match="b_loss_count.*loss_count"):
+        watchlist_result(b_loss_count=2)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"contradiction_count": 0, "contradiction_rate": 0.0},
+        {"b_loss_count": None, "non_push_hit_rate": None},
+        {"contradiction_rate": 0.0},
+    ),
+)
+def test_watchlist_result_requires_exactly_one_metric_family(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="metric family"):
+        watchlist_result(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"status": "정상 범위"},
+        {
+            "status": "관찰",
+            "trigger_reasons": ("non_push_hit_rate_below",),
+        },
+        {"minimum_sample": 3, "status": "관찰"},
+        {
+            "minimum_sample": 3,
+            "status": "정상 범위",
+            "trigger_reasons": ("non_push_hit_rate_below",),
+        },
+    ),
+)
+def test_watchlist_result_status_matches_minimum_and_triggers(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="status|trigger_reasons|minimum_sample"):
+        watchlist_result(**overrides)
+
+
+def test_watchlist_result_recognizes_triggers_for_each_metric_family() -> None:
+    with pytest.raises(ValueError, match="trigger_reasons"):
+        watchlist_result(
+            minimum_sample=3,
+            status="정밀 검토",
+            trigger_reasons=("contradiction_count_and_rate",),
+        )
+    with pytest.raises(ValueError, match="trigger_reasons"):
+        path_watchlist_result(
+            minimum_sample=4,
+            status="정밀 검토",
+            trigger_reasons=("b_loss_count_and_rate",),
+        )
+
+
 def watchlist_row(
     *,
     lineup_state: str = "confirmed",

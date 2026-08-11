@@ -380,6 +380,7 @@ def _validate_migration(value: object) -> None:
 def _validate_watchlist(value: object) -> None:
     if not isinstance(value, list):
         raise ValueError("watchlist must be a JSON array")
+    target_ids: set[str] = set()
     for index, result_value in enumerate(value):
         name = f"watchlist[{index}]"
         result = _require_mapping(result_value, name)
@@ -395,6 +396,11 @@ def _validate_watchlist(value: object) -> None:
             raise ValueError(f"{name} is invalid: {error}") from error
         if validated.to_mapping() != dict(result):
             raise ValueError(f"{name} does not match WatchlistResult mapping")
+        if validated.target_id in target_ids:
+            raise ValueError(
+                f"duplicate watchlist target_id: {validated.target_id}"
+            )
+        target_ids.add(validated.target_id)
 
 
 def _load_calibration(path: Path) -> Mapping[str, object]:
