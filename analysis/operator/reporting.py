@@ -23,6 +23,7 @@ from analysis.review.calibration import (
     CalibrationRow,
     GROUPING_DIMENSIONS,
 )
+from analysis.review.watchlist import WatchlistResult
 from analysis.shadow import deserialize_shadow_comparison
 
 from .errors import OperatorIOError, OperatorLedgerError
@@ -37,7 +38,7 @@ from .fdio import (
 )
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 CONFIRMED_GAME_THRESHOLD = 100
 DECISIONS_PER_MARKET_TYPE_THRESHOLD = 300
 CALIBRATION_JSON_FILENAME = "calibration-latest.json"
@@ -383,6 +384,7 @@ def build_report_mapping(
     ledger_records: tuple[object, ...],
     rows: tuple[CalibrationRow, ...],
     report: CalibrationReport,
+    watchlist: tuple[WatchlistResult, ...],
 ) -> dict[str, object]:
     """Build the complete deterministic report mapping from ledger state."""
 
@@ -394,6 +396,10 @@ def build_report_mapping(
         raise TypeError("rows must be a tuple of CalibrationRow values")
     if not isinstance(report, CalibrationReport):
         raise TypeError("report must be a CalibrationReport")
+    if not isinstance(watchlist, tuple) or any(
+        not isinstance(result, WatchlistResult) for result in watchlist
+    ):
+        raise TypeError("watchlist must be a tuple of WatchlistResult values")
     if report.group_by != GROUPING_DIMENSIONS:
         raise ValueError("report must use the fixed calibration group dimensions")
 
@@ -420,6 +426,7 @@ def build_report_mapping(
             }
             for group in report.groups
         ],
+        "watchlist": [result.to_mapping() for result in watchlist],
         "migration": _migration_mapping(
             _migration_eligible_rows(rows, ledger_records)
         ),
@@ -449,12 +456,15 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
 
     overall = mapping["overall"]
     groups = mapping["groups"]
+    watchlist = mapping["watchlist"]
     migration = mapping["migration"]
     ledger_revision = mapping["ledger_revision"]
     if not isinstance(overall, Mapping):
         raise TypeError("overall must be a mapping")
     if not isinstance(groups, list):
         raise TypeError("groups must be a list")
+    if not isinstance(watchlist, list):
+        raise TypeError("watchlist must be a list")
     if not isinstance(migration, Mapping):
         raise TypeError("migration must be a mapping")
     if not isinstance(ledger_revision, Mapping):
@@ -494,6 +504,71 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
         )
         lines.extend(("", f"### {dimension_text}", ""))
         _append_metrics(lines, metrics)
+
+    lines.extend(
+        (
+            "",
+            "## 반복 검증 Watchlist",
+            "",
+            "> 관찰 전용이며 모델 결정 권한 없음",
+            "",
+            "| 대상 | 상태 | 표본 | 제외 | 핵심 지표 | 트리거 |",
+            "|---|---|---:|---:|---|---|",
+        )
+    )
+    for result in watchlist:
+        if not isinstance(result, Mapping):
+            raise TypeError("watchlist entries must be mappings")
+        hit_rate = result["non_push_hit_rate"]
+        b_loss_count = result["b_loss_count"]
+        contradiction_count = result["contradiction_count"]
+        contradiction_rate = result["contradiction_rate"]
+        if b_loss_count is not None:
+            hit_rate_text = (
+                "사용 불가"
+                if hit_rate is None
+                else _markdown_value(hit_rate)
+            )
+            primary_metric = (
+                f"비푸시 적중률: {hit_rate_text}; "
+                f"B등급 패: {_markdown_value(b_loss_count)}"
+            )
+        elif contradiction_count is not None:
+            contradiction_rate_text = (
+                "사용 불가"
+                if contradiction_rate is None
+                else _markdown_value(contradiction_rate)
+            )
+            primary_metric = (
+                "경로 모순: "
+                f"{_markdown_value(contradiction_count)} "
+                f"({contradiction_rate_text})"
+            )
+        else:
+            primary_metric = "사용 불가"
+        trigger_reasons = result["trigger_reasons"]
+        if not isinstance(trigger_reasons, list):
+            raise TypeError("watchlist trigger_reasons must be a list")
+        trigger_text = (
+            ", ".join(str(reason) for reason in trigger_reasons)
+            if trigger_reasons
+            else "없음"
+        )
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    _markdown_value(result["label"]),
+                    _markdown_value(result["status"]),
+                    f"{_markdown_value(result['eligible_count'])}/"
+                    f"{_markdown_value(result['minimum_sample'])}",
+                    _markdown_value(result["excluded_count"]),
+                    primary_metric,
+                    trigger_text,
+                )
+            )
+            + " |"
+        )
 
     confirmed_games = migration["confirmed_games"]
     market_types = migration["market_types"]

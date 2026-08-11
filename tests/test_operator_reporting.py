@@ -40,6 +40,10 @@ from analysis.review.calibration import (
     build_calibration_report,
     select_primary_rows,
 )
+from analysis.review.watchlist import (
+    build_review_watchlist,
+    load_review_watchlist_config,
+)
 from analysis.shadow import deserialize_shadow_comparison
 from tests.test_calibration import calibration_row
 from tests.test_forecasting_engine import _complete_game
@@ -72,12 +76,21 @@ def _mapping(
     *,
     ledger_records=(),
 ):
-    report = build_calibration_report(tuple(rows))
+    rows = tuple(rows)
+    report = build_calibration_report(rows)
     return build_report_mapping(
         ledger_path=tmp_path / "ledger" / "shadow.jsonl",
         ledger_records=tuple(ledger_records),
-        rows=tuple(rows),
+        rows=rows,
         report=report,
+        watchlist=_watchlist(rows),
+    )
+
+
+def _watchlist(rows):
+    return build_review_watchlist(
+        tuple(rows),
+        load_review_watchlist_config(),
     )
 
 
@@ -216,6 +229,7 @@ def _mapping_from_frozen_forecast(
         ledger_records=(forecast,),
         rows=rows,
         report=build_calibration_report(rows),
+        watchlist=_watchlist(rows),
     )
 
 
@@ -336,6 +350,7 @@ def test_migration_uses_latest_corrected_link_comparison(
         ledger_records=(forecast, first_link, corrected_link),
         rows=(row,),
         report=build_calibration_report((row,)),
+        watchlist=_watchlist((row,)),
     )
 
     assert mapping["overall"]["sample_size"] == 1
@@ -478,6 +493,7 @@ def test_historical_ineligible_review_stays_in_metrics_but_not_migration(
         ledger_records=tuple(store.iter_records()),
         rows=rows,
         report=build_calibration_report(rows),
+        watchlist=_watchlist(rows),
     )
 
     assert tuple(row.market_key for row in rows) == ("sea_ml",)
@@ -518,6 +534,7 @@ def test_migration_rows_require_valid_exact_frozen_comparison(
             ledger_records=records,
             rows=(row,),
             report=build_calibration_report((row,)),
+            watchlist=_watchlist((row,)),
         )
 
 
@@ -579,7 +596,12 @@ def test_report_mapping_is_versioned_complete_and_uses_latest_ledger_append(
         ledger_records=(_ledger_record(latest), _ledger_record(early)),
     )
 
-    assert mapping["schema_version"] == REPORT_SCHEMA_VERSION == 1
+    assert mapping["schema_version"] == REPORT_SCHEMA_VERSION == 2
+    assert [row["target_id"] for row in mapping["watchlist"]] == [
+        "f5_over_early_conversion",
+        "bullpen_protection_contradiction",
+        "lineup_suppression_contradiction",
+    ]
     assert mapping["ledger_path"] == str(
         (tmp_path / "ledger" / "shadow.jsonl").resolve()
     )
@@ -658,6 +680,45 @@ def test_empty_ledger_has_null_as_of_and_unavailable_metrics(tmp_path: Path) -> 
     assert "사용 불가 (unavailable)" in markdown
     assert "ROI | 사용 불가 (unavailable)" in markdown
     assert "ROI | 0" not in markdown
+
+
+def test_watchlist_markdown_is_korean_non_authoritative_and_before_migration(
+    tmp_path: Path,
+) -> None:
+    mapping = _mapping(tmp_path, ())
+
+    markdown = render_report_markdown(mapping)
+
+    assert "## 반복 검증 Watchlist" in markdown
+    assert "모델 결정 권한 없음" in markdown
+    assert "F5 오버 초기 득점 전환" in markdown
+    assert markdown.index("## 반복 검증 Watchlist") < markdown.index(
+        "## 마이그레이션 진행"
+    )
+
+
+def test_watchlist_json_and_markdown_are_deterministic_from_rows_and_config(
+    tmp_path: Path,
+) -> None:
+    rows = (
+        _unique_row(
+            1,
+            market_key="game:910001:f5_total:over",
+            market_type="f5_total",
+            selected_side="over",
+            lineup_state="projected",
+        ),
+    )
+
+    first = _mapping(tmp_path, rows)
+    second = _mapping(tmp_path, rows)
+
+    assert canonical_json(first).encode("utf-8") == canonical_json(second).encode(
+        "utf-8"
+    )
+    assert render_report_markdown(first).encode("utf-8") == (
+        render_report_markdown(second).encode("utf-8")
+    )
 
 
 def test_migration_counts_are_unique_confirmed_only_and_cover_all_market_types(
@@ -1504,3 +1565,96 @@ def test_service_builds_rows_and_ledger_as_of_from_one_immutable_snapshot(
     assert sample_size == 0
     assert game_count == 0
     assert sum(decision_counts.values()) == 0
+
+
+def test_service_builds_calibration_and_watchlist_from_same_selected_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_rows = (_unique_row(1, lineup_state="projected"),)
+    config = object()
+    watchlist = _watchlist(selected_rows)
+    observed: dict[str, object] = {}
+    build_calibration = build_calibration_report
+
+    class SnapshotStore:
+        def iter_records(self):
+            return iter(())
+
+    def capture_calibration(rows):
+        observed["calibration_rows"] = rows
+        return build_calibration(rows)
+
+    def capture_watchlist(rows, received_config):
+        observed["watchlist_rows"] = rows
+        observed["watchlist_config"] = received_config
+        return watchlist
+
+    monkeypatch.setattr(
+        service_module,
+        "select_primary_rows",
+        lambda snapshot: selected_rows,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "build_calibration_report",
+        capture_calibration,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_review_watchlist_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "build_review_watchlist",
+        capture_watchlist,
+    )
+
+    mapping, sample_size, _, _ = service_module._calibration_report_state(
+        SnapshotStore(),
+        tmp_path / "ledger.jsonl",
+    )
+
+    assert observed == {
+        "calibration_rows": selected_rows,
+        "watchlist_rows": selected_rows,
+        "watchlist_config": config,
+    }
+    assert mapping["watchlist"] == [result.to_mapping() for result in watchlist]
+    assert sample_size == 1
+
+
+def test_invalid_watchlist_config_prevents_service_report_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published = False
+
+    class EmptyStore:
+        def iter_records(self):
+            return iter(())
+
+    def invalid_config():
+        raise ValueError("invalid watchlist config")
+
+    def publish(mapping, *, report_dir):
+        nonlocal published
+        published = True
+        raise AssertionError("publisher must not run")
+
+    monkeypatch.setattr(
+        service_module,
+        "load_review_watchlist_config",
+        invalid_config,
+    )
+    monkeypatch.setattr(service_module, "write_calibration_reports", publish)
+
+    with pytest.raises(OperatorLedgerError, match="invalid watchlist config"):
+        service_module._publish_calibration_report(
+            EmptyStore(),
+            tmp_path / "ledger.jsonl",
+            tmp_path / "reports",
+        )
+
+    assert published is False

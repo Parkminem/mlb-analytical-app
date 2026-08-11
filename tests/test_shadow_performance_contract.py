@@ -17,6 +17,10 @@ from analysis.operator.reporting import (
 from analysis.operator.schemas import parse_confirmed_bundle_json
 from analysis.operator.service import run_confirmed
 from analysis.review.calibration import build_calibration_report
+from analysis.review.watchlist import (
+    build_review_watchlist,
+    load_review_watchlist_config,
+)
 from analysis.shadow import (
     canonical_legacy_decision_payload,
     deserialize_forecast_context,
@@ -267,11 +271,13 @@ def test_decoded_forecast_and_generated_report_mapping_are_identical(
     )
     rows = (row,)
     report = build_calibration_report(rows)
+    watchlist = build_review_watchlist(rows, load_review_watchlist_config())
     compact_mapping = build_report_mapping(
         ledger_path=ledger_path,
         ledger_records=(result.forecast,),
         rows=rows,
         report=report,
+        watchlist=watchlist,
     )
     historical_mapping = build_report_mapping(
         ledger_path=ledger_path,
@@ -280,6 +286,7 @@ def test_decoded_forecast_and_generated_report_mapping_are_identical(
         ),
         rows=rows,
         report=report,
+        watchlist=watchlist,
     )
 
     assert compact_context == historical_context

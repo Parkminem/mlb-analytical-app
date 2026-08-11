@@ -51,6 +51,10 @@ from analysis.review.calibration import (
     build_calibration_report,
     select_primary_rows,
 )
+from analysis.review.watchlist import (
+    build_review_watchlist,
+    load_review_watchlist_config,
+)
 from analysis.shadow import (
     ShadowRunIdempotencyKeys,
     build_shadow_capture_command,
@@ -1836,11 +1840,14 @@ def _calibration_report_state(
         ledger_records = tuple(store.iter_records())
         rows = select_primary_rows(_LedgerSnapshot(ledger_records))
         report = build_calibration_report(rows)
+        watchlist_config = load_review_watchlist_config()
+        watchlist = build_review_watchlist(rows, watchlist_config)
         mapping = build_report_mapping(
             ledger_path=ledger_path,
             ledger_records=ledger_records,
             rows=rows,
             report=report,
+            watchlist=watchlist,
         )
     except _LEDGER_ERRORS as error:
         raise OperatorLedgerError(
