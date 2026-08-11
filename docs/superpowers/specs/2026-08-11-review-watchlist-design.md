@@ -19,6 +19,11 @@ The aggregator reads only the latest eligible review records already selected
 for calibration. It does not load or decode 20,000-draw forecast component
 arrays and it does not append new ledger records.
 
+The watchlist configuration uses schema version 1. Calibration report output
+advances from schema version 1 to schema version 2, where the top-level
+`watchlist` array is required. These versions are independent of the bundle
+schemas and fixed MLB model version.
+
 This is an observation feature, not a model-version change. The fixed legacy
 model remains `2026-08-05`.
 
@@ -74,7 +79,8 @@ Watchlist statuses are informational:
 
 No status changes a score, market direction, `play`/`lean`/`pass` decision,
 same-game assembly, final priority, or Shadow output. A `정밀 검토` status is
-not approval to modify the model.
+not approval to modify the model, model version, or Shadow authority. All
+initial statuses use confirmed-lineup review rows only.
 
 The existing migration boundary remains authoritative: avoid tuning a market
 family before 300 reviewed decisions when feasible. Any eventual model change
@@ -90,15 +96,21 @@ version, tests, and historical replay preservation.
 5. Calibration JSON stores a top-level `watchlist` section.
 6. Calibration Markdown renders a `반복 검증 Watchlist` table.
 
-The aggregator never reads raw boxscores, pregame bundles, forecast draws, or
-narrative review text. Its output is therefore reproducible from the same
-calibration review set.
+The aggregator never reads raw boxscores, pregame bundles, forecast draws,
+component distributions, or narrative review text. It does not decode
+compressed forecast values or rerun simulation. Its output is therefore
+reproducible from the same calibration review set and configuration.
 
 All initial watchlist targets require `lineup_state == "confirmed"`. Projected
 lineup reviews remain available to general calibration but cannot affect these
 repeated-verification counters.
 
 ## Output Contract
+
+New review publication uses calibration report schema version 2. Schema v2
+preserves the schema-v1 calibration fields and adds the required top-level
+`watchlist` array. Historical schema-v1 reports remain readable without a
+watchlist.
 
 Each JSON watchlist row contains:
 
@@ -117,15 +129,36 @@ Each JSON watchlist row contains:
 The Markdown table shows the target, status, sample, primary metric, trigger,
 and the explicit note that watchlist output has no decision authority.
 
+Coverage audit accepts the historical schema-v1 shape and the schema-v2 shape.
+For v2 it strictly validates the watchlist array and row contract, while
+leaving official calibration metrics unchanged; watchlist diagnostics do not
+become official or audit-only performance metrics.
+
 ## Error Handling
 
-- Reject an invalid watchlist configuration before publishing a new report.
-- Unknown target kinds, duplicate IDs, invalid rates, and non-positive sample
-  thresholds are configuration errors.
+- Reject an unreadable or invalid watchlist configuration before invoking the
+  report publisher or publishing a new generation.
+- Configuration is strict UTF-8 JSON with exact root and per-kind target keys.
+  Duplicate JSON keys or target IDs, unsupported schema versions or target
+  kinds, unknown or inapplicable keys, invalid rates, and non-positive sample
+  thresholds are errors.
 - A review row that lacks data required by a selector is excluded from that
   target and counted in an `excluded_count`; it is not guessed or repaired.
 - Report publication remains atomic. A watchlist failure must not publish a
-  partial calibration generation.
+  partial calibration generation or move the `current` pointer.
+
+## Publication Compatibility
+
+- The current operator builds new reports only as schema v2. The publisher and
+  renderer still understand schema v1 so an existing v1 generation can be
+  verified and upgraded without rewriting it.
+- Publishing schema v2 for the same ledger revision as current schema v1
+  creates a distinct immutable v2 generation and atomically swaps `current`
+  once. The v1 generation and bytes remain unchanged.
+- After schema v2 is current, publication cannot downgrade to schema v1.
+- Stale ledger revisions, equal record counts with different ledger state
+  hashes, or unequal bytes for the same ledger revision and report schema fail
+  closed and preserve the existing publication.
 
 ## Performance
 

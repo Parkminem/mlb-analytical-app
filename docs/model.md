@@ -628,6 +628,8 @@ If the legacy decision was `pass`, record component matches without assigning an
 
 Calibration reports may group the frozen decisions by model version, market family, lineup state, starter structure, model-probability bucket, and legacy priority-score bucket. Keep sample size, hit and push rates, Brier score, log loss, ROI, and closing-line value distinct; missing prices omit price-dependent metrics rather than blocking flow review.
 
+Calibration report schema v2 also publishes a confirmed-lineup repeated-verification watchlist. `관찰`, `정상 범위`, and `정밀 검토` are diagnostics only: they cannot change legacy admission, any score or market direction, the fixed model or model version, final priority, or Shadow output or authority. A watchlist status never authorizes a model change; that still requires a separate approved semantic model revision.
+
 ## Migration Gates
 
 - Shadow forecasts have no production influence until at least 100 confirmed-lineup games have been collected and evaluated.

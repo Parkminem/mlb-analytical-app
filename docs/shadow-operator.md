@@ -191,16 +191,26 @@ Expected operator 오류는 traceback 없이 간결한 원인과 가능한 parti
 
 ## Calibration 보고서
 
-`review`는 전체 ledger에서 leakage-safe primary row를 다시 선택하고 동일 mapping으로 JSON과 한국어 Markdown을 만듭니다. 각 ledger revision은 다음 불변 generation에 저장됩니다.
+`review`는 전체 ledger에서 leakage-safe primary row를 한 번 선택하고 동일한 row tuple로 calibration과 반복 검증 watchlist를 만든 뒤, calibration report schema v2 JSON과 한국어 Markdown을 게시합니다. 새 `review` 보고서는 schema v2만 생성하며 top-level `watchlist` 배열을 반드시 포함합니다. Watchlist 각 행에는 `target_id`, `label`, `status`, eligible/excluded 및 W/L/P count, A/B/C/D count, 적용 가능한 핵심 지표, `minimum_sample`, `trigger_reasons`가 들어갑니다.
+
+Watchlist 정의는 report schema와 별개인 `config/review-watchlist.json`의 config schema v1에 있습니다. Loader는 UTF-8 JSON, root와 target kind별 exact key set, 중복 JSON key와 `target_id`, 지원 schema/kind, 양의 최소 표본, `[0, 1]` rate를 fail-closed로 검증합니다. 읽기 실패는 I/O 오류, 잘못된 설정은 bundle validation 오류이며, config loading과 watchlist mapping이 모두 끝나기 전에는 report publisher를 호출하지 않습니다. 따라서 설정 오류는 새 generation이나 partial JSON/Markdown, `current` pointer를 게시하지 않습니다.
+
+초기 세 target은 모두 `lineup_state == "confirmed"`인 이미 선택된 calibration review row만 사용합니다. `관찰`은 최소 표본 미달, `정상 범위`는 최소 표본 충족 후 trigger 없음, `정밀 검토`는 최소 표본과 설정된 trigger 충족을 뜻합니다. 이 상태는 관찰 전용이며 legacy admission, score, model/version, final priority, Shadow output 또는 authority를 변경하지 않습니다.
+
+평가는 compact row의 outcome, classification, principal/contradicted path만 선형 순회합니다. Forecast component distribution이나 압축된 20,000-draw 값을 읽거나 decode하지 않고 simulation도 다시 실행하지 않습니다.
+
+각 ledger revision은 report schema version을 이름에 포함한 다음 불변 generation에 저장됩니다.
 
 ```text
 reports/private/shadow/generations/
-  generation-v1-<ledger_path_hash16>-<record_count_20자리>-<ledger_state_sha256>/
+  generation-v<report_schema_version>-<ledger_path_hash16>-<record_count_20자리>-<ledger_state_sha256>/
     calibration-latest.json
     calibration-latest.md
 ```
 
-`reports/private/shadow/current`는 현재 generation을 가리키는 atomic symbolic link입니다. 호환 경로 `reports/private/shadow/calibration-latest.json`과 `reports/private/shadow/calibration-latest.md`는 각각 `current` 아래 파일을 가리킵니다. `--report-dir`을 쓰면 같은 구조가 지정한 디렉터리 아래에 생성됩니다. Ledger revision이 같으면 기존 generation bytes를 검증하고 `calibration_report_replayed: true`를 반환합니다. 이전 generation은 덮어쓰지 않습니다.
+`reports/private/shadow/current`는 현재 generation을 가리키는 atomic symbolic link입니다. 호환 경로 `reports/private/shadow/calibration-latest.json`과 `reports/private/shadow/calibration-latest.md`는 각각 `current` 아래 파일을 가리킵니다. `--report-dir`을 쓰면 같은 구조가 지정한 디렉터리 아래에 생성됩니다. Ledger revision과 report schema가 같으면 기존 generation bytes의 exact equality를 검증하고 `calibration_report_replayed: true`를 반환합니다. Stale ledger revision, 같은 count의 다른 state hash, 같은 revision/schema의 다른 bytes는 게시를 거부하며 기존 `current`를 유지합니다. 이전 generation은 덮어쓰지 않습니다.
+
+Historical calibration report schema v1은 `watchlist`가 없는 원래 shape으로 계속 읽을 수 있고 coverage audit도 v1과 v2를 모두 지원합니다. Schema v2 coverage 입력은 `watchlist` 배열과 각 행의 strict shape 및 불변식을 검증하지만 watchlist를 official calibration metric으로 승격하지 않습니다. 현재 v1 generation과 같은 ledger revision을 schema v2로 게시하면 별도 v2 generation을 만든 뒤 pointer를 한 번만 atomic 교체하고 v1 bytes를 보존합니다. V2가 current가 된 뒤 v1으로의 schema downgrade는 금지되는 one-way `v1 -> v2` publication입니다.
 
 성공 출력과 보고서의 수치는 다음처럼 구분합니다.
 
@@ -212,7 +222,7 @@ reports/private/shadow/generations/
 - Review-eligible legacy `pass`는 migration count에 포함되지만 review-ineligible market은 제외됩니다.
 - 표본이나 필요한 가격이 없으면 JSON metric은 `null`, Markdown은 `사용 불가 (unavailable)`로 표시합니다. 이를 `0`으로 해석하지 않습니다.
 
-JSON에는 resolved `ledger_path`, ledger 최대 append 시각인 `ledger_as_of`, record count/state hash, overall/group metrics와 migration progress가 들어갑니다. Wall-clock 생성 시각은 넣지 않으므로 ledger가 같으면 결과 bytes도 같습니다.
+JSON에는 resolved `ledger_path`, ledger 최대 append 시각인 `ledger_as_of`, record count/state hash, overall/group metrics, `watchlist`, migration progress가 들어갑니다. Wall-clock 생성 시각은 넣지 않으므로 ledger와 config가 같으면 결과 bytes도 같습니다.
 
 ## 안전 경계
 

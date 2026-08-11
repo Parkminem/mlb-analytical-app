@@ -155,3 +155,16 @@ For a `C` path contradiction, first require at least one bound component outside
 The first delivery supports exactly `injury`, `ejection`, `defensive_error`, and `defensive_error_cluster` for `D`. Injury and ejection do not require unearned runs; `defensive_error` and `defensive_error_cluster` require at least three. Every event must affect a principal-bound component, include a stable non-empty `documented_source_observation_id`, and have that component outside its central 90% interval. Other predeclared exogenous event types require a future approved supported-type extension and are not currently assignable as `D`.
 
 If the legacy market was `pass`, report component matches but no A/B/C/D market class. Traffic alone is not a correct flow; it must be supported by the applicable frozen run, extra-base-hit, starter, and bullpen observations.
+
+After the market flow review, reproduce the calibration report schema-v2 watchlist in this form:
+
+```markdown
+## 반복 검증 Watchlist
+
+> 확정 라인업 복기 관찰 전용이며 모델 결정 권한 없음
+
+| 대상 | 상태 | 표본 | 제외 | 핵심 지표 | 트리거 |
+|---|---|---:|---:|---|---|
+```
+
+Show the exact configured target label, one of `관찰`, `정상 범위`, or `정밀 검토`, the eligible/minimum sample, excluded count, primary metric, and trigger reasons. Only confirmed-lineup review rows contribute. Do not convert a watchlist status into a score, model change, priority change, recommendation, or Shadow decision.
