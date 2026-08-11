@@ -39,6 +39,7 @@ from .fdio import (
 
 
 REPORT_SCHEMA_VERSION = 2
+_SUPPORTED_REPORT_SCHEMA_VERSIONS = frozenset((1, REPORT_SCHEMA_VERSION))
 CONFIRMED_GAME_THRESHOLD = 100
 DECISIONS_PER_MARKET_TYPE_THRESHOLD = 300
 CALIBRATION_JSON_FILENAME = "calibration-latest.json"
@@ -441,6 +442,21 @@ def _markdown_value(value: object) -> str:
     return canonical_json(value) if not isinstance(value, str) else value
 
 
+def _report_schema_version(
+    mapping: Mapping[str, object],
+    *,
+    source: str,
+) -> int:
+    value = mapping.get("schema_version")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OperatorLedgerError(f"{source} schema_version must be an integer")
+    if value not in _SUPPORTED_REPORT_SCHEMA_VERSIONS:
+        raise OperatorLedgerError(
+            f"{source} schema_version is unsupported: {value}"
+        )
+    return value
+
+
 def _append_metrics(
     lines: list[str],
     metrics: Mapping[str, object],
@@ -454,17 +470,29 @@ def _append_metrics(
 def render_report_markdown(mapping: Mapping[str, object]) -> str:
     """Render Korean Markdown using only the machine-readable mapping."""
 
+    schema_version = _report_schema_version(
+        mapping,
+        source="calibration report",
+    )
     overall = mapping["overall"]
     groups = mapping["groups"]
-    watchlist = mapping["watchlist"]
     migration = mapping["migration"]
     ledger_revision = mapping["ledger_revision"]
     if not isinstance(overall, Mapping):
         raise TypeError("overall must be a mapping")
     if not isinstance(groups, list):
         raise TypeError("groups must be a list")
-    if not isinstance(watchlist, list):
-        raise TypeError("watchlist must be a list")
+    if schema_version == 1:
+        if "watchlist" in mapping:
+            raise OperatorLedgerError(
+                "calibration report schema_version 1 cannot contain watchlist"
+            )
+        watchlist: list[object] = []
+    else:
+        watchlist_value = mapping.get("watchlist")
+        if not isinstance(watchlist_value, list):
+            raise TypeError("watchlist must be a list")
+        watchlist = watchlist_value
     if not isinstance(migration, Mapping):
         raise TypeError("migration must be a mapping")
     if not isinstance(ledger_revision, Mapping):
@@ -474,7 +502,7 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
     lines = [
         "# 섀도 캘리브레이션 보고서",
         "",
-        f"- 스키마 버전: {_markdown_value(mapping['schema_version'])}",
+        f"- 스키마 버전: {_markdown_value(schema_version)}",
         f"- 원장 경로: `{mapping['ledger_path']}`",
         f"- 원장 기준 시각: {_markdown_value(ledger_as_of)}",
         "- 원장 레코드 수: "
@@ -505,70 +533,71 @@ def render_report_markdown(mapping: Mapping[str, object]) -> str:
         lines.extend(("", f"### {dimension_text}", ""))
         _append_metrics(lines, metrics)
 
-    lines.extend(
-        (
-            "",
-            "## 반복 검증 Watchlist",
-            "",
-            "> 관찰 전용이며 모델 결정 권한 없음",
-            "",
-            "| 대상 | 상태 | 표본 | 제외 | 핵심 지표 | 트리거 |",
-            "|---|---|---:|---:|---|---|",
+    if schema_version == 2:
+        lines.extend(
+            (
+                "",
+                "## 반복 검증 Watchlist",
+                "",
+                "> 관찰 전용이며 모델 결정 권한 없음",
+                "",
+                "| 대상 | 상태 | 표본 | 제외 | 핵심 지표 | 트리거 |",
+                "|---|---|---:|---:|---|---|",
+            )
         )
-    )
-    for result in watchlist:
-        if not isinstance(result, Mapping):
-            raise TypeError("watchlist entries must be mappings")
-        hit_rate = result["non_push_hit_rate"]
-        b_loss_count = result["b_loss_count"]
-        contradiction_count = result["contradiction_count"]
-        contradiction_rate = result["contradiction_rate"]
-        if b_loss_count is not None:
-            hit_rate_text = (
-                "사용 불가"
-                if hit_rate is None
-                else _markdown_value(hit_rate)
-            )
-            primary_metric = (
-                f"비푸시 적중률: {hit_rate_text}; "
-                f"B등급 패: {_markdown_value(b_loss_count)}"
-            )
-        elif contradiction_count is not None:
-            contradiction_rate_text = (
-                "사용 불가"
-                if contradiction_rate is None
-                else _markdown_value(contradiction_rate)
-            )
-            primary_metric = (
-                "경로 모순: "
-                f"{_markdown_value(contradiction_count)} "
-                f"({contradiction_rate_text})"
-            )
-        else:
-            primary_metric = "사용 불가"
-        trigger_reasons = result["trigger_reasons"]
-        if not isinstance(trigger_reasons, list):
-            raise TypeError("watchlist trigger_reasons must be a list")
-        trigger_text = (
-            ", ".join(str(reason) for reason in trigger_reasons)
-            if trigger_reasons
-            else "없음"
-        )
-        lines.append(
-            "| "
-            + " | ".join(
-                (
-                    _markdown_value(result["label"]),
-                    _markdown_value(result["status"]),
-                    f"{_markdown_value(result['eligible_count'])}/"
-                    f"{_markdown_value(result['minimum_sample'])}",
-                    _markdown_value(result["excluded_count"]),
-                    primary_metric,
-                    trigger_text,
+        for result in watchlist:
+            if not isinstance(result, Mapping):
+                raise TypeError("watchlist entries must be mappings")
+            hit_rate = result["non_push_hit_rate"]
+            b_loss_count = result["b_loss_count"]
+            contradiction_count = result["contradiction_count"]
+            contradiction_rate = result["contradiction_rate"]
+            if b_loss_count is not None:
+                hit_rate_text = (
+                    "사용 불가"
+                    if hit_rate is None
+                    else _markdown_value(hit_rate)
                 )
+                primary_metric = (
+                    f"비푸시 적중률: {hit_rate_text}; "
+                    f"B등급 패: {_markdown_value(b_loss_count)}"
+                )
+            elif contradiction_count is not None:
+                contradiction_rate_text = (
+                    "사용 불가"
+                    if contradiction_rate is None
+                    else _markdown_value(contradiction_rate)
+                )
+                primary_metric = (
+                    "경로 모순: "
+                    f"{_markdown_value(contradiction_count)} "
+                    f"({contradiction_rate_text})"
+                )
+            else:
+                primary_metric = "사용 불가"
+            trigger_reasons = result["trigger_reasons"]
+            if not isinstance(trigger_reasons, list):
+                raise TypeError("watchlist trigger_reasons must be a list")
+            trigger_text = (
+                ", ".join(str(reason) for reason in trigger_reasons)
+                if trigger_reasons
+                else "없음"
             )
-            + " |"
-        )
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        _markdown_value(result["label"]),
+                        _markdown_value(result["status"]),
+                        f"{_markdown_value(result['eligible_count'])}/"
+                        f"{_markdown_value(result['minimum_sample'])}",
+                        _markdown_value(result["excluded_count"]),
+                        primary_metric,
+                        trigger_text,
+                    )
+                )
+                + " |"
+            )
 
     confirmed_games = migration["confirmed_games"]
     market_types = migration["market_types"]
@@ -1394,6 +1423,10 @@ def write_calibration_reports(
 ) -> CalibrationReportArtifacts:
     """Publish one immutable report generation through an atomic pointer."""
 
+    incoming_schema_version = _report_schema_version(
+        mapping,
+        source="incoming calibration report",
+    )
     json_bytes = (canonical_json(mapping) + "\n").encode("utf-8")
     markdown_bytes = (render_report_markdown(mapping) + "\n").encode("utf-8")
     incoming_count, incoming_hash = _report_revision(
@@ -1451,6 +1484,10 @@ def write_calibration_reports(
         )
         if current is not None and current.mapping is not None:
             current_mapping = current.mapping
+            current_schema_version = _report_schema_version(
+                current_mapping,
+                source="published calibration report",
+            )
             current_count, current_hash = _report_revision(
                 current_mapping,
                 source="published calibration report",
@@ -1471,29 +1508,39 @@ def write_calibration_reports(
                             "calibration ledger revision conflict: equal record "
                             "counts have different state hashes"
                         )
-                    _require_equal_revision_content(
-                        generations_descriptor,
-                        current.generation_name,
-                        json_bytes,
-                        markdown_bytes,
-                    )
-                    _verify_report_directories(
-                        resolved_dir,
-                        directory_descriptor,
-                        generations_descriptor,
-                    )
-                    artifacts = _artifacts(
-                        resolved_dir,
-                        current.generation_name,
-                        replayed=True,
-                    )
-                    return artifacts
+            if incoming_schema_version < current_schema_version:
+                raise OperatorLedgerError(
+                    "calibration report schema downgrade is not allowed: "
+                    f"{current_schema_version} -> {incoming_schema_version}"
+                )
+            if (
+                incoming_ledger_path == current_ledger_path
+                and incoming_count == current_count
+                and incoming_schema_version == current_schema_version
+            ):
+                _require_equal_revision_content(
+                    generations_descriptor,
+                    current.generation_name,
+                    json_bytes,
+                    markdown_bytes,
+                )
+                _verify_report_directories(
+                    resolved_dir,
+                    directory_descriptor,
+                    generations_descriptor,
+                )
+                artifacts = _artifacts(
+                    resolved_dir,
+                    current.generation_name,
+                    replayed=True,
+                )
+                return artifacts
 
         ledger_path_hash = hashlib.sha256(
             incoming_ledger_path.encode("utf-8")
         ).hexdigest()[:16]
         generation_name = (
-            f"generation-v{REPORT_SCHEMA_VERSION}-"
+            f"generation-v{incoming_schema_version}-"
             f"{ledger_path_hash}-{incoming_count:020d}-{incoming_hash}"
         )
         _, generation_created = _materialize_generation(

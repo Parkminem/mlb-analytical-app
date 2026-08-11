@@ -94,6 +94,13 @@ def _watchlist(rows):
     )
 
 
+def _schema_v1_mapping(mapping):
+    legacy = copy.deepcopy(mapping)
+    legacy["schema_version"] = 1
+    legacy.pop("watchlist")
+    return legacy
+
+
 def _unique_row(index: int, **overrides):
     values = {
         "game_pk": 910000 + index,
@@ -831,6 +838,85 @@ def test_json_and_markdown_are_byte_identical_for_unchanged_mapping(
     assert first_markdown.endswith(b"\n")
     assert json.loads(first_json) == mapping
     assert "generated_at" not in first_json.decode("utf-8")
+
+
+def test_equal_revision_atomically_upgrades_schema_v1_to_v2_and_replays(
+    tmp_path: Path,
+) -> None:
+    current = _mapping(
+        tmp_path,
+        (_unique_row(1, lineup_state="projected"),),
+    )
+    legacy = _schema_v1_mapping(current)
+    report_dir = tmp_path / "reports"
+
+    published_v1 = write_calibration_reports(legacy, report_dir=report_dir)
+    v1_json = published_v1.generation_json_path.read_bytes()
+    v1_markdown = published_v1.generation_markdown_path.read_bytes()
+    upgraded_v2 = write_calibration_reports(current, report_dir=report_dir)
+    replayed_v2 = write_calibration_reports(current, report_dir=report_dir)
+
+    assert published_v1.generation_dir.name.startswith("generation-v1-")
+    assert upgraded_v2.generation_dir.name.startswith("generation-v2-")
+    assert upgraded_v2.generation_dir != published_v1.generation_dir
+    assert upgraded_v2.current_generation_path.resolve() == (
+        upgraded_v2.generation_dir
+    )
+    assert published_v1.generation_dir.is_dir()
+    assert published_v1.generation_json_path.read_bytes() == v1_json
+    assert published_v1.generation_markdown_path.read_bytes() == v1_markdown
+    assert json.loads(v1_json)["schema_version"] == 1
+    assert json.loads(upgraded_v2.generation_json_path.read_bytes()) == current
+    assert upgraded_v2.replayed is False
+    assert replayed_v2.replayed is True
+    assert replayed_v2.generation_dir == upgraded_v2.generation_dir
+    assert {path.name for path in (report_dir / "generations").iterdir()} == {
+        published_v1.generation_dir.name,
+        upgraded_v2.generation_dir.name,
+    }
+
+
+def test_report_publication_rejects_schema_downgrade(tmp_path: Path) -> None:
+    current = _mapping(tmp_path, ())
+    legacy = _schema_v1_mapping(current)
+    report_dir = tmp_path / "reports"
+    published = write_calibration_reports(current, report_dir=report_dir)
+    published_json = published.generation_json_path.read_bytes()
+    published_markdown = published.generation_markdown_path.read_bytes()
+
+    with pytest.raises(OperatorLedgerError, match="schema downgrade"):
+        write_calibration_reports(legacy, report_dir=report_dir)
+
+    assert published.current_generation_path.resolve() == published.generation_dir
+    assert published.generation_json_path.read_bytes() == published_json
+    assert published.generation_markdown_path.read_bytes() == published_markdown
+    assert {path.name for path in (report_dir / "generations").iterdir()} == {
+        published.generation_dir.name
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda mapping: mapping.pop("schema_version"),
+        lambda mapping: mapping.update(schema_version=True),
+        lambda mapping: mapping.update(schema_version=1.0),
+        lambda mapping: mapping.update(schema_version=0),
+        lambda mapping: mapping.update(schema_version=3),
+    ),
+)
+def test_report_publication_rejects_invalid_or_unsupported_schema_without_artifacts(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    mapping = _mapping(tmp_path, ())
+    mutate(mapping)
+    report_dir = tmp_path / "reports"
+
+    with pytest.raises(OperatorLedgerError, match="schema_version"):
+        write_calibration_reports(mapping, report_dir=report_dir)
+
+    assert not report_dir.exists()
 
 
 def test_one_pointer_swap_publishes_consistent_pair_and_compatibility_links(
