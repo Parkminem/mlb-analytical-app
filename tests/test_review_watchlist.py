@@ -480,6 +480,23 @@ def test_path_contradiction_stays_observe_below_twenty() -> None:
     assert result.trigger_reasons == ()
 
 
+def test_bullpen_protection_excludes_unrecommended_review() -> None:
+    row = watchlist_row(
+        market_type="ml",
+        selected_side="away",
+        classification=None,
+        market_result="loss",
+        principal_paths=("bullpen_protection",),
+        contradicted_paths=("bullpen_protection",),
+    )
+
+    result = result_for((row,), "bullpen_protection_contradiction")
+
+    assert result.eligible_count == 0
+    assert result.excluded_count == 1
+    assert result.contradiction_count == 0
+
+
 def test_path_contradiction_triggers_at_exact_count_and_rate_thresholds() -> None:
     result = result_for(
         path_rows(

@@ -436,6 +436,7 @@ def _path_contradiction_result(
     target: WatchlistTargetConfig,
 ) -> WatchlistResult:
     eligible: list[CalibrationRow] = []
+    excluded_count = 0
     for row in rows:
         if row.lineup_state != "confirmed":
             continue
@@ -445,6 +446,12 @@ def _path_contradiction_result(
         ):
             continue
         if target.evidence_path not in row.principal_paths:
+            continue
+        if (
+            target.evidence_path == "bullpen_protection"
+            and row.classification is None
+        ):
+            excluded_count += 1
             continue
         eligible.append(row)
 
@@ -472,7 +479,7 @@ def _path_contradiction_result(
         label=target.label,
         status=_status(len(eligible_rows), target.minimum_sample, reasons),
         eligible_count=len(eligible_rows),
-        excluded_count=0,
+        excluded_count=excluded_count,
         win_count=win_count,
         loss_count=loss_count,
         push_count=push_count,
