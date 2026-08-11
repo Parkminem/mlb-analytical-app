@@ -94,6 +94,10 @@ The aggregator never reads raw boxscores, pregame bundles, forecast draws, or
 narrative review text. Its output is therefore reproducible from the same
 calibration review set.
 
+All initial watchlist targets require `lineup_state == "confirmed"`. Projected
+lineup reviews remain available to general calibration but cannot affect these
+repeated-verification counters.
+
 ## Output Contract
 
 Each JSON watchlist row contains:
