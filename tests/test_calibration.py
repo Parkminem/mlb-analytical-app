@@ -47,6 +47,10 @@ def calibration_row(**overrides: object) -> CalibrationRow:
         "lineup_state": "confirmed",
         "starter_structure": "starter_vs_starter",
         "legacy_priority_score": 80,
+        "selected_side": "away",
+        "classification": "A",
+        "principal_paths": ("starter_suppression", "top_order_matchup"),
+        "contradicted_paths": (),
         "p_win": 0.55,
         "p_push": 0.0,
         "p_loss": 0.45,
@@ -507,6 +511,26 @@ class CalibrationContractTests(unittest.TestCase):
             calibration_row(p_win=0.6)
         with self.assertRaisesRegex(ValueError, "p_push"):
             calibration_row(p_win=0.0, p_push=float("nan"), p_loss=0.0)
+
+    def test_calibration_row_validates_compact_review_metadata(self):
+        row = calibration_row()
+        self.assertEqual(row.selected_side, "away")
+        self.assertEqual(row.classification, "A")
+        with self.assertRaisesRegex(ValueError, "selected_side"):
+            calibration_row(selected_side="")
+        with self.assertRaisesRegex(ValueError, "classification"):
+            calibration_row(classification="E")
+        with self.assertRaisesRegex(ValueError, "principal_paths"):
+            calibration_row(principal_paths=("starter_suppression",) * 2)
+        with self.assertRaisesRegex(ValueError, "contradicted_paths"):
+            calibration_row(
+                contradicted_paths=("starter_suppression",) * 2,
+            )
+        with self.assertRaisesRegex(ValueError, "contradicted_paths"):
+            calibration_row(
+                principal_paths=("starter_suppression",),
+                contradicted_paths=("bullpen_protection",),
+            )
 
     def test_calibration_row_rejects_exact_one_with_residual_probability(self):
         invalid_rows = (
@@ -1525,6 +1549,59 @@ class CalibrationSelectionTests(unittest.TestCase):
                 "forecast_for_link": 0,
             },
         )
+
+    def test_selector_preserves_review_metadata(self):
+        game_pk = 920050
+        capture, forecast, link = append_capture_link(
+            self.store,
+            game_pk=game_pk,
+            captured_at=FIRST_PITCH - timedelta(hours=1),
+            lineup_state="confirmed",
+            forecast_run_id="review-metadata-run",
+            id_suffix="review-metadata",
+        )
+        append_entry_market(self.store, game_pk=game_pk, id_suffix="entry")
+        result = append_result(self.store, game_pk=game_pk)
+        append_review(
+            self.store,
+            capture=capture,
+            forecast=forecast,
+            link=link,
+            result=result,
+            classification="C",
+            contradicted_paths=("bullpen_protection",),
+            component_reviews=(
+                {
+                    "evidence_path": "starter_suppression",
+                    "component_ids": ("home_pitcher_chain_runs_allowed",),
+                    "contradicted": False,
+                    "inside_80_count": 1,
+                    "component_count": 1,
+                    "notes": (),
+                },
+                {
+                    "evidence_path": "bullpen_protection",
+                    "component_ids": (
+                        "home_bullpen_runs_allowed",
+                        "home_protected_bullpen_close_entry",
+                    ),
+                    "contradicted": True,
+                    "inside_80_count": 2,
+                    "component_count": 2,
+                    "notes": (),
+                },
+            ),
+        )
+
+        row = select_primary_rows(self.store)[0]
+
+        self.assertEqual(row.selected_side, "away")
+        self.assertEqual(row.classification, "C")
+        self.assertEqual(
+            row.principal_paths,
+            ("starter_suppression", "bullpen_protection"),
+        )
+        self.assertEqual(row.contradicted_paths, ("bullpen_protection",))
 
     def test_corrected_link_score_drives_priority_grouping(self):
         game_pk = 920100

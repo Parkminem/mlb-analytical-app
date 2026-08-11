@@ -36,6 +36,7 @@ GROUPING_DIMENSIONS = (
     "priority_score_bucket",
 )
 _MARKET_RESULTS = frozenset(("win", "loss", "push"))
+_REVIEW_CLASSIFICATIONS = frozenset(("A", "B", "C", "D"))
 _MARKET_TYPES = frozenset(
     ("f5_side", "f5_total", "ml", "plus_1_5", "full_total")
 )
@@ -337,6 +338,10 @@ class CalibrationRow:
     lineup_state: str
     starter_structure: str
     legacy_priority_score: int | None
+    selected_side: str
+    classification: str | None
+    principal_paths: tuple[str, ...]
+    contradicted_paths: tuple[str, ...]
     p_win: float
     p_push: float
     p_loss: float
@@ -363,6 +368,23 @@ class CalibrationRow:
             "starter_structure",
         ):
             _require_nonempty_string(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.selected_side, "selected_side")
+        if (
+            self.classification is not None
+            and self.classification not in _REVIEW_CLASSIFICATIONS
+        ):
+            raise ValueError("classification must be A, B, C, D, or None")
+        for field_name in ("principal_paths", "contradicted_paths"):
+            values = getattr(self, field_name)
+            if not isinstance(values, tuple) or any(
+                not isinstance(value, str) or not value.strip()
+                for value in values
+            ):
+                raise ValueError(f"{field_name} must contain nonempty strings")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{field_name} must contain unique values")
+        if not set(self.contradicted_paths).issubset(self.principal_paths):
+            raise ValueError("contradicted_paths must be present in principal_paths")
 
         if self.market_type not in _MARKET_TYPES:
             raise ValueError(f"unsupported market_type: {self.market_type!r}")
@@ -1494,6 +1516,12 @@ def _row_for_review(
     _require_nonempty_string(market_type, "market_type")
     settlement_format = capture_market.get("settlement_format")
     _require_nonempty_string(settlement_format, "settlement_format")
+    selected_side = capture_market.get("selected_side")
+    _require_nonempty_string(selected_side, "selected_side")
+    principal_paths = tuple(
+        component_review["evidence_path"]
+        for component_review in review.component_reviews
+    )
     return CalibrationRow(
         game_pk=capture.game_pk,
         capture_id=capture.capture_id,
@@ -1516,6 +1544,10 @@ def _row_for_review(
                 link.shadow_comparison is not None
             ),
         ),
+        selected_side=selected_side,
+        classification=review.classification,
+        principal_paths=principal_paths,
+        contradicted_paths=review.contradicted_paths,
         p_win=p_win,
         p_push=p_push,
         p_loss=p_loss,
