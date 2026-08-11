@@ -1172,6 +1172,105 @@ def test_pointer_swap_failure_leaves_old_pair_current_and_cleans_generation(
     assert not tuple(report_dir.rglob("*.tmp"))
 
 
+def test_post_swap_directory_fsync_oserror_restores_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    old_mapping = _mapping(tmp_path, (), ledger_records=(first_record,))
+    new_mapping = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    old = write_calibration_reports(old_mapping, report_dir=report_dir)
+    old_target = os.readlink(old.current_generation_path)
+    old_json = old.generation_json_path.read_bytes()
+    old_markdown = old.generation_markdown_path.read_bytes()
+    real_fsync = os.fsync
+    injected = False
+
+    def fail_post_swap_fsync(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and old.current_generation_path.is_symlink()
+            and os.readlink(old.current_generation_path) != old_target
+        ):
+            injected = True
+            raise OSError("post-swap directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(reporting_module.os, "fsync", fail_post_swap_fsync)
+
+    with pytest.raises(OperatorIOError, match="post-swap directory fsync failed"):
+        write_calibration_reports(new_mapping, report_dir=report_dir)
+
+    assert injected is True
+    assert os.readlink(old.current_generation_path) == old_target
+    assert old.current_generation_path.resolve() == old.generation_dir
+    assert old.generation_json_path.read_bytes() == old_json
+    assert old.generation_markdown_path.read_bytes() == old_markdown
+    assert {path.name for path in (report_dir / "generations").iterdir()} == {
+        old.generation_dir.name
+    }
+
+
+def test_post_swap_fsync_rollback_failure_takes_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appended_at = _complete_game().captured_at
+    first_record = _ledger_record(appended_at, sequence=1)
+    second_record = _ledger_record(
+        appended_at + timedelta(seconds=1),
+        sequence=2,
+    )
+    old_mapping = _mapping(tmp_path, (), ledger_records=(first_record,))
+    new_mapping = _mapping(
+        tmp_path,
+        (),
+        ledger_records=(first_record, second_record),
+    )
+    report_dir = tmp_path / "reports"
+    old = write_calibration_reports(old_mapping, report_dir=report_dir)
+    old_target = os.readlink(old.current_generation_path)
+    real_fsync = os.fsync
+    original_failed = False
+
+    def fail_publication_and_rollback_fsync(descriptor: int) -> None:
+        nonlocal original_failed
+        current_target = os.readlink(old.current_generation_path)
+        if current_target != old_target:
+            original_failed = True
+            raise OSError("post-swap directory fsync failed")
+        if original_failed:
+            raise OSError("rollback directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        reporting_module.os,
+        "fsync",
+        fail_publication_and_rollback_fsync,
+    )
+
+    with pytest.raises(
+        OperatorIOError,
+        match="unable to restore calibration current generation",
+    ) as raised:
+        write_calibration_reports(new_mapping, report_dir=report_dir)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert "rollback directory fsync failed" in str(raised.value.__cause__)
+    assert os.readlink(old.current_generation_path) == old_target
+
+
 def test_post_commit_interrupt_preserves_normal_generation_and_replays(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

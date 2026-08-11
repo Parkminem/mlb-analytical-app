@@ -1382,7 +1382,7 @@ def _publish_current_pointer(
             generations_descriptor,
         )
     except BaseException as error:
-        if pointer_replaced and isinstance(error, OperatorIOError):
+        if pointer_replaced and isinstance(error, (OSError, OperatorIOError)):
             try:
                 if _current_references_generation(
                     report_descriptor,
