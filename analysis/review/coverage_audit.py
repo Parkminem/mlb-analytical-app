@@ -83,7 +83,7 @@ _ENTRY_KEYS: Final = frozenset(
         "market_key",
     )
 )
-_CALIBRATION_KEYS: Final = frozenset(
+_CALIBRATION_V1_KEYS: Final = frozenset(
     (
         "schema_version",
         "ledger_as_of",
@@ -95,6 +95,7 @@ _CALIBRATION_KEYS: Final = frozenset(
         "groups",
     )
 )
+_CALIBRATION_V2_KEYS: Final = _CALIBRATION_V1_KEYS | frozenset(("watchlist",))
 _LEDGER_REVISION_KEYS: Final = frozenset(("record_count", "state_hash"))
 _GROUP_KEYS: Final = frozenset(("dimensions", "metrics"))
 _MIGRATION_KEYS: Final = frozenset(("confirmed_games", "market_types"))
@@ -358,12 +359,20 @@ def _validate_migration(value: object) -> None:
 
 def _load_calibration(path: Path) -> Mapping[str, object]:
     calibration = _load_json(path, "calibration")
-    _require_exact_keys(calibration, _CALIBRATION_KEYS, "calibration")
-    if _require_positive_integer(
-        calibration["schema_version"],
+    schema_version = _require_positive_integer(
+        calibration.get("schema_version"),
         "calibration schema_version",
-    ) != 1:
-        raise ValueError("calibration schema_version must be 1")
+    )
+    if schema_version not in (1, 2):
+        raise ValueError("calibration schema_version must be 1 or 2")
+    expected_keys = (
+        _CALIBRATION_V1_KEYS
+        if schema_version == 1
+        else _CALIBRATION_V2_KEYS
+    )
+    _require_exact_keys(calibration, expected_keys, "calibration")
+    if schema_version == 2 and not isinstance(calibration["watchlist"], list):
+        raise ValueError("watchlist must be a JSON array")
     ledger_as_of = calibration["ledger_as_of"]
     if ledger_as_of is not None:
         _parse_datetime(ledger_as_of, "ledger_as_of")

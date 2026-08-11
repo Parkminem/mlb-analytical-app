@@ -458,6 +458,71 @@ def test_coverage_audit_json_and_markdown_are_deterministic(tmp_path: Path) -> N
     assert disclaimer in render_coverage_audit_markdown(first)
 
 
+def test_coverage_audit_accepts_calibration_schema_v2_watchlist(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["schema_version"] = 2
+    calibration["watchlist"] = []
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    audit = build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+    assert audit["official_metrics"] == _official_metrics()
+    assert audit["official_calibration_unchanged"] is True
+
+
+def test_coverage_audit_preserves_historical_calibration_schema_v1(
+    tmp_path: Path,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    assert calibration["schema_version"] == 1
+    assert "watchlist" not in calibration
+    assert build_coverage_audit(ledger_path, calibration_path, manifest_path)[
+        "official_metrics"
+    ] == _official_metrics()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda calibration: calibration.update({"schema_version": 2}),
+            "calibration has invalid fields",
+        ),
+        (
+            lambda calibration: calibration.update({"watchlist": []}),
+            "calibration has invalid fields",
+        ),
+        (
+            lambda calibration: calibration.update(
+                {"schema_version": 2, "watchlist": {}}
+            ),
+            "watchlist must be a JSON array",
+        ),
+        (
+            lambda calibration: calibration.update({"schema_version": 3}),
+            "calibration schema_version must be 1 or 2",
+        ),
+    ),
+)
+def test_coverage_audit_requires_schema_specific_calibration_shape(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    mutation(calibration)
+    calibration_path.write_text(canonical_json(calibration), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        build_coverage_audit(ledger_path, calibration_path, manifest_path)
+
+
 def test_coverage_audit_rejects_unknown_calibration_metric_fields(tmp_path: Path) -> None:
     ledger_path, calibration_path, manifest_path = _audit_fixture(tmp_path)
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
