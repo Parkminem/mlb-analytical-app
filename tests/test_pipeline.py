@@ -42,7 +42,7 @@ EXPECTED_FORECASTING_CONFIG = {
     "market_family_tuning_decisions": 300,
 }
 
-LEGACY_CONFIG_SHA256 = "b36826bdb038e853a1188cd4743508a9af727750ec8826b934e0217422302181"
+LEGACY_CONFIG_SHA256 = "a67e1992204d9a89457266226c7de77b4f703a5070a1d078b513c281347c7f12"
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class ModelConfigTests(unittest.TestCase):
     def test_forecasting_block_matches_approved_shadow_configuration(self):
         config = load_model_config()
 
-        self.assertEqual(config["version"], "2026-08-05")
+        self.assertEqual(config["version"], "2026-09-11")
         self.assertEqual(config.get("forecasting"), EXPECTED_FORECASTING_CONFIG)
         self.assertTrue(
             config["priority_admission"][
@@ -133,6 +133,10 @@ class ModelConfigTests(unittest.TestCase):
                 "f5_market_engine_unchanged",
                 "fresh_review_requires_high_total_two_sided_bindings",
                 "fresh_review_requires_ml_starter_evidence_binding",
+                "f5_over_without_recent_run_conversion_cap",
+                "full_under_blocks_starter_volatility",
+                "full_under_requires_two_sided_recent_and_projected_suppression",
+                "full_under_support_cap",
                 "full_game_bullpen_requires_performance_support",
                 "high_total_two_sided_over_cap",
                 "high_total_two_sided_over_threshold",
@@ -442,7 +446,27 @@ class ModelConfigTests(unittest.TestCase):
             config["priority_admission"]["same_game_candidate_assembler"],
             "assemble_same_game_priority",
         )
-        self.assertEqual(config["priority_admission"]["multi_market_min_score"], 72)
+        self.assertEqual(config["priority_admission"]["multi_market_min_score"], 75)
+        self.assertEqual(
+            config["priority_admission"][
+                "f5_over_without_recent_run_conversion_cap"
+            ],
+            74,
+        )
+        self.assertEqual(
+            config["priority_admission"]["full_under_support_cap"],
+            69,
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "full_under_requires_two_sided_recent_and_projected_suppression"
+            ]
+        )
+        self.assertTrue(
+            config["priority_admission"][
+                "full_under_blocks_starter_volatility"
+            ]
+        )
         self.assertTrue(
             config["priority_admission"]["one_candidate_per_full_game_family"]
         )
@@ -532,7 +556,7 @@ class AnalysisManifestTests(unittest.TestCase):
             starter_confirmed=True,
         )
 
-        self.assertEqual(manifest["model_version"], "2026-08-05")
+        self.assertEqual(manifest["model_version"], "2026-09-11")
         self.assertTrue(manifest["fixed_model"])
         self.assertEqual(manifest["strength_adjustments"], [])
         self.assertNotIn("picks", manifest)
@@ -629,7 +653,9 @@ class AnalysisManifestTests(unittest.TestCase):
         )
 
         policy = manifest["same_game_priority_policy"]
-        self.assertEqual(policy["multi_market_min_score"], 72)
+        self.assertEqual(policy["multi_market_min_score"], 75)
+        self.assertEqual(policy["f5_over_without_recent_run_conversion_cap"], 74)
+        self.assertEqual(policy["full_under_support_cap"], 69)
         self.assertTrue(policy["one_candidate_per_full_game_family"])
         self.assertTrue(policy["allow_compatible_side_total_pair"])
         self.assertTrue(
@@ -662,12 +688,12 @@ class CurrentRuntimeDocumentationTests(unittest.TestCase):
     def test_current_runtime_docs_publish_the_current_legacy_version(self):
         project_root = Path(__file__).resolve().parents[1]
         expected_current_runtime_text = {
-            "README.md": "고정 MLB model version은 `2026-08-05`",
+            "README.md": "고정 MLB model version은 `2026-09-11`",
             "docs/analysis-output-template.md": (
-                "Use legacy model version `2026-08-05` for every fresh"
+                "Use legacy model version `2026-09-11` for every fresh"
             ),
             "docs/shadow-operator.md": (
-                "the current legacy model version is `2026-08-05`"
+                "the current legacy model version is `2026-09-11`"
             ),
         }
         for relative_path, expected_text in expected_current_runtime_text.items():
@@ -682,28 +708,25 @@ class CurrentRuntimeDocumentationTests(unittest.TestCase):
             project_root / "docs/analysis-output-template.md"
         ).read_text(encoding="utf-8")
 
+        self.assertIn("The `2026-09-11` contract inherits every `2026-08-05`", model_text)
         self.assertIn(
-            "The `2026-08-05` contract inherits the prior ML bullpen review contract",
+            "F5-over conversion cap, full-game-under suppression gate",
             model_text,
         )
         self.assertIn(
-            "the prior two-sided under review contract",
+            "model versions `2026-08-02`, `2026-08-03`, `2026-08-05`, and `2026-09-11`",
             model_text,
         )
         self.assertIn(
-            "model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`",
+            "model versions `2026-08-03`, `2026-08-05`, and `2026-09-11`",
             model_text,
         )
         self.assertIn(
-            "model versions `2026-08-03` and `2026-08-05`",
-            model_text,
-        )
-        self.assertIn(
-            "model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`",
+            "model versions `2026-08-02`, `2026-08-03`, `2026-08-05`, and `2026-09-11`",
             template_text,
         )
         self.assertIn(
-            "model versions `2026-08-03` and `2026-08-05`",
+            "model versions `2026-08-03`, `2026-08-05`, and `2026-09-11`",
             template_text,
         )
 
@@ -715,10 +738,11 @@ class CurrentRuntimeDocumentationTests(unittest.TestCase):
         ):
             with self.subTest(path=relative_path):
                 text = (project_root / relative_path).read_text(encoding="utf-8")
-                self.assertIn("score `72` or higher", text)
+                self.assertIn("score `75` or higher", text)
                 self.assertIn("capped at `71`", text)
                 self.assertIn("verified full-game over line of `9.0` or higher", text)
                 self.assertIn("capped at `69`", text)
+                self.assertIn("recent_run_conversion", text)
                 self.assertIn(
                     "suppression/protection paths do not count",
                     text.lower(),

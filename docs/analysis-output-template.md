@@ -12,7 +12,7 @@ Use decimal odds when prices are available.
 
 In the summary table, show only one side-family market per game. Apply legacy admission to the exact ML and `+1.5` candidates, then use the legacy same-game assembler. Display its retained side-family candidate; if both independent candidates survive but only one display slot is allowed, use the higher legacy `0-100` priority score. For an exact-score tie, the assembler's fixed order places `ml` before `plus_1_5`. Mark the other side-family column as `pass` or `review only` and explain it when useful. Shadow probability, fair price, no-vig probability, and shadow edge cannot choose or break a tie for the displayed side-family market.
 
-Select at most one full-game side-family market and at most one full-game total. Retain both as separate priority entries when each is non-pass, scores at least 72, has non-empty canonical evidence, and the side-total game scripts are explicitly validated as compatible. Show both in Final, for example ATL ML + O9.
+Select at most one full-game side-family market and at most one full-game total. Retain both as separate priority entries when each is non-pass, scores at least 75, has non-empty canonical evidence, and the side-total game scripts are explicitly validated as compatible. Scores `65-74` remain visible leans but do not enter the final priority list. Show both in Final, for example ATL ML + O9.
 
 The global priority list is score-sorted after same-game assembly. ML and a handicap never both enter by default, and over and under for the same horizon never both enter. F5 uses the same final family policy without changing its market engine.
 
@@ -30,16 +30,18 @@ Before first pitch and before recording the capture, freeze the review contract 
 
 - Record the `market_key` and exact legacy candidate identity: the current contract uses `legacy_candidate_index` plus `legacy_market`, with the candidate's score and `play`/`lean`/`pass` rating and the final priority preserved in the snapshot.
 - Record two to four unique canonical principal evidence paths.
-- For every recommended full-game ML in model versions `2026-08-02`, `2026-08-03`, and `2026-08-05`, declare and bind `bullpen_protection` or `late_bullpen_exposure` according to the actual pregame ML reasoning. Never add a bullpen path after the result or merely to satisfy the contract.
-- For every recommended F5 or full-game under in model versions `2026-08-03` and `2026-08-05`, declare and bind `starter_suppression` plus `lineup_suppression` with the same away/home namespace. This is the required two-sided review coverage; never freeze a one-sided under path.
-- For a current `2026-08-05` full-game ML `play`/`lean` candidate with score `72` or higher, declare and bind a directionally valid starter path. `starter_suppression` means the selected side's own starter prevents runs; `starter_collapse` means the opposing starter fails. Without either exact route, the ML is capped at `71`, and a fresh bundle submitted above that cap is rejected.
-- For a current `2026-08-05` verified full-game over line of `9.0` or higher with a `play`/`lean` score of at least `72`, bind two distinct canonical paths covering both away and home scoring directions. A conversion path (`top_order_matchup`, `recent_run_conversion`, or `underdog_run_creation`) scores for its batting side, while `starter_collapse` or `late_bullpen_exposure` scores for the side opposing the bound pitching side. Suppression/protection paths do not count as over scoring routes. Without both directions, the over is capped at `69`, and a fresh bundle submitted above that cap is rejected.
+- For every recommended full-game ML in model versions `2026-08-02`, `2026-08-03`, `2026-08-05`, and `2026-09-11`, declare and bind `bullpen_protection` or `late_bullpen_exposure` according to the actual pregame ML reasoning. Never add a bullpen path after the result or merely to satisfy the contract.
+- For every recommended F5 or full-game under in model versions `2026-08-03`, `2026-08-05`, and `2026-09-11`, declare and bind `starter_suppression` plus `lineup_suppression` with the same away/home namespace. This is the required two-sided review coverage; never freeze a one-sided under path.
+- For a current `2026-09-11` full-game ML `play`/`lean` candidate with score `75` or higher, declare and bind a directionally valid starter path. `starter_suppression` means the selected side's own starter prevents runs; `starter_collapse` means the opposing starter fails. Without either exact route, the ML is capped at `71`, and a fresh bundle submitted above that cap is rejected.
+- For a current `2026-09-11` verified full-game over line of `9.0` or higher with a `play`/`lean` score of at least `75`, bind two distinct canonical paths covering both away and home scoring directions. A conversion path (`top_order_matchup`, `recent_run_conversion`, or `underdog_run_creation`) scores for its batting side, while `starter_collapse` or `late_bullpen_exposure` scores for the side opposing the bound pitching side. Suppression/protection paths do not count as over scoring routes. Without both directions, the over is capped at `69`, and a fresh bundle submitted above that cap is rejected.
+- For a current F5 over at score `75` or higher, bind `recent_run_conversion`; starter collapse alone cannot replace current power, walk, or run conversion. Missing conversion caps the candidate at `74`.
+- For a current full-game under at score `75` or higher, both lineups must have included recent form below index `1.0` and matchup-neutral projected runs per nine below the configured league baseline. Either matchup pitcher's command, HR, injury-return, or recent-short-exit risk blocks the under. Missing suppression or present volatility caps it at `69`.
 - Bind every path to exact component IDs and its exact deterministic contradiction rule.
 - Freeze each bound `ComponentDistribution`, including `p05`, `p10`, `p20`, `median`, `p80`, `p90`, and `p95`; these fix the central 80% and 90% predictive intervals.
 
 Postgame review cannot invent or change these paths, IDs, rules, or intervals. A missing/invalid binding, candidate/market mismatch, unknown market, invalid path count or shape, or missing component distribution makes that market review-ineligible; state the reason and do not infer a substitute. See [Pregame Principal-Path Binding](model.md#pregame-principal-path-binding) for the authoritative contract.
 
-Use legacy model version `2026-08-05` for every fresh projected or confirmed capture. A stale model version is accepted only when the Operator finds and returns its exact immutable historical replay before fresh-capture validation.
+Use legacy model version `2026-09-11` for every fresh projected or confirmed capture. A stale model version is accepted only when the Operator finds and returns its exact immutable historical replay before fresh-capture validation.
 
 ## Operator Bundle Handoff
 
@@ -55,7 +57,7 @@ Fresh projected and confirmed commands require schema v2 with explicit current a
 
 Review remains schema v1 and receives the exact frozen IDs from the successful confirmed command. Every pregame schema-v1 shape, relaxed or strict, is historical exact replay only: it must come from the authenticated managed root and match an existing ledger capture, forecast, and link. Regenerate any pending unexecuted pregame v1 file as schema v2/current; rejection must not change ledger or managed bytes.
 
-Bundle schema and model version are independent. The v2 handoff leaves model `2026-08-05`, MLB scoring, F5 side and F5 total logic, full-game market engines, the same-game assembler, legacy authority, and Shadow recommendation restrictions unchanged.
+Bundle schema and model version are independent. The v2 handoff uses model `2026-09-11`; its approved negative-only total gates and `75`-point priority floor do not change Shadow recommendation authority or historical replay.
 
 ## Game Review
 

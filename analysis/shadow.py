@@ -85,12 +85,19 @@ _INELIGIBILITY_FLAG_ORDER = (
 )
 _INELIGIBILITY_FLAGS = frozenset(_INELIGIBILITY_FLAG_ORDER)
 _RECOMMENDED_DECISION_RATINGS = frozenset(("play", "lean"))
-_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION = "2026-08-05"
+_CURRENT_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION = "2026-09-11"
+_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSIONS = frozenset(
+    ("2026-08-05", _CURRENT_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION)
+)
 _ML_BULLPEN_REVIEW_BINDING_MODEL_VERSIONS = frozenset(
-    ("2026-08-02", "2026-08-03", _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION)
+    (
+        "2026-08-02",
+        "2026-08-03",
+        *_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSIONS,
+    )
 )
 _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSIONS = frozenset(
-    ("2026-08-03", _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION)
+    ("2026-08-03", *_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSIONS)
 )
 _RECORDING_REVIEW_CONTRACT_MODEL_VERSIONS = frozenset(
     _UNDER_TWO_SIDED_REVIEW_BINDING_MODEL_VERSIONS
@@ -400,6 +407,9 @@ class LegacyDecisionSnapshot:
 def validate_recommended_review_contract(
     legacy: LegacyDecisionSnapshot,
     markets: tuple[MarketInput, ...],
+    *,
+    game_input: NormalizedGameInput | None = None,
+    simulation_config: SimulationConfig | None = None,
 ) -> None:
     if not isinstance(legacy, LegacyDecisionSnapshot):
         raise TypeError("legacy must be LegacyDecisionSnapshot")
@@ -407,6 +417,15 @@ def validate_recommended_review_contract(
         not isinstance(market, MarketInput) for market in markets
     ):
         raise TypeError("markets must be a tuple of MarketInput values")
+    if game_input is not None and not isinstance(game_input, NormalizedGameInput):
+        raise TypeError("game_input must be NormalizedGameInput or None")
+    if simulation_config is not None and not isinstance(
+        simulation_config,
+        SimulationConfig,
+    ):
+        raise TypeError("simulation_config must be SimulationConfig or None")
+    if simulation_config is not None and game_input is None:
+        raise ValueError("simulation_config requires game_input")
 
     markets_by_key = {market.market_key: market for market in markets}
     bindings_by_index = {
@@ -477,14 +496,32 @@ def validate_recommended_review_contract(
             errors.append(f"{prefix}: {error}")
             continue
         if (
-            legacy.model_version == _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION
-            and candidate.score >= 72
+            legacy.model_version in _PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSIONS
+            and candidate.score
+            >= (
+                75
+                if legacy.model_version
+                == _CURRENT_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION
+                else 72
+            )
         ):
             try:
                 assessment = assess_priority_evidence_contract(
                     candidate,
                     binding,
                     market,
+                    game_input=game_input,
+                    simulation_config=simulation_config,
+                    playable_min_score=(
+                        75
+                        if legacy.model_version
+                        == _CURRENT_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION
+                        else 72
+                    ),
+                    enforce_current_total_hardening=(
+                        legacy.model_version
+                        == _CURRENT_PRIORITY_EVIDENCE_CONTRACT_MODEL_VERSION
+                    ),
                 )
             except ValueError as error:
                 errors.append(f"{prefix}: {error}")
@@ -2149,7 +2186,14 @@ def record_shadow_run(
             "forecast market_inputs do not match canonical game_input markets"
         )
     if legacy.model_version in _RECORDING_REVIEW_CONTRACT_MODEL_VERSIONS:
-        validate_recommended_review_contract(legacy, resolved_game.markets)
+        validate_recommended_review_contract(
+            legacy,
+            resolved_game.markets,
+            game_input=resolved_game,
+            simulation_config=SimulationConfig.from_mapping(
+                forecast.simulation_config
+            ),
+        )
     if comparison is None:
         comparison = compare_shadow_forecast(legacy, forecast)
     elif (

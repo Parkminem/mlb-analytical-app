@@ -13,7 +13,7 @@ from analysis.model import evaluate_pitch_velocity_sample
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "model.json"
-LEGACY_MODEL_VERSION = "2026-08-05"
+LEGACY_MODEL_VERSION = "2026-09-11"
 DECISION_AUTHORITY = "legacy_fixed_model"
 FORECASTING_MODEL_VERSION = "shadow-forecast-2026-07-14.1"
 
@@ -37,7 +37,7 @@ _APPROVED_PRIORITY_ADMISSION = {
     "canonical_evidence_paths_only": True,
     "missing_evidence_blocks_multi_market_retention": True,
     "same_game_candidate_assembler": "assemble_same_game_priority",
-    "multi_market_min_score": 72,
+    "multi_market_min_score": 75,
     "one_candidate_per_full_game_family": True,
     "allow_compatible_side_total_pair": True,
     "require_distinct_canonical_evidence_paths_for_multi_market_retention": True,
@@ -56,6 +56,10 @@ _APPROVED_PRIORITY_ADMISSION = {
     "high_total_two_sided_over_threshold": 9.0,
     "fresh_review_requires_ml_starter_evidence_binding": True,
     "fresh_review_requires_high_total_two_sided_bindings": True,
+    "f5_over_without_recent_run_conversion_cap": 74,
+    "full_under_support_cap": 69,
+    "full_under_requires_two_sided_recent_and_projected_suppression": True,
+    "full_under_blocks_starter_volatility": True,
 }
 
 MODEL_LAYERS = (

@@ -57,7 +57,7 @@ Fresh `projected`/`confirmed` 번들은 JSON integer `schema_version: 2`와 명�
 
 Shadow forecasting은 필수 비교 모드이며 기존 추천의 방향, `play`/`lean`/`pass`, `0-100` 순위 점수, 최종 우선순위를 변경하거나 재정렬하거나 상향/하향할 수 없습니다. `0-100`은 확률이 아닌 legacy rank score입니다. 최소 100개의 확정 라인업 경기 전에는 production 의사결정에 영향을 줄 수 없고, 가능하면 시장군별 300개 decision 전에는 튜닝하지 않습니다. Production 우선권, 규칙 삭제, 가중치 변경은 별도 승인된 새 모델 버전과 설계가 필요합니다.
 
-고정 MLB model version은 `2026-08-05`이며 bundle schema version과 독립적입니다. Pregame schema v2 전환은 MLB scoring, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority 또는 Shadow 권한을 변경하지 않습니다.
+고정 MLB model version은 `2026-09-11`이며 bundle schema version과 독립적입니다. 이 버전은 최종 우선순위 최소 점수를 `75`로 올리고 F5 오버 및 풀게임 언더의 음수 방향 검증을 강화하지만, Shadow의 비권위 비교 권한과 과거 동결 기록은 변경하지 않습니다.
 
 ## Local Shadow Ledger
 

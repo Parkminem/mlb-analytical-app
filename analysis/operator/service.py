@@ -801,6 +801,8 @@ def _run_pregame(
         validate_recommended_review_contract(
             bundle.payload.legacy_decision,
             resolved_game.markets,
+            game_input=resolved_game,
+            simulation_config=config,
         )
     except ValueError as error:
         exact_replay = _existing_exact_pregame_replay(

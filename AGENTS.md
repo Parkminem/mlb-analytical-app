@@ -43,7 +43,10 @@ This repository contains a fixed MLB game-analysis model. Before analyzing any g
 - Admit F5 under only after explicitly verifying both scoring directions. Unresolved long-horizon starter WHIP/BB/HR/collapse risk blocks F5 under even when recent starts improved.
 - Cap matchup-only or traffic-only side strength when recent run conversion is absent; bullpen quality cannot substitute for offensive conversion.
 - For ML, require an independent full-game margin path beyond the F5 edge. For ML and `+1.5`, rested bullpen availability must also have current role-specific performance support.
-- For fresh model-version `2026-08-03` F5 or full-game unders, bind same-namespace `starter_suppression` and `lineup_suppression` review paths before capture.
+- For fresh model versions `2026-08-03`, `2026-08-05`, and `2026-09-11`, bind same-namespace `starter_suppression` and `lineup_suppression` review paths before capture.
+- Keep scores `65-74` as table leans, but admit only scores `75+` to the final priority list.
+- Cap F5 overs without a canonical `recent_run_conversion` path at `74`.
+- Require both teams to show recent run-conversion suppression and projected scoring suppression before recommending a full-game under. Command, home-run, injury-return, or recent-short-exit risk in either matchup pitcher blocks the full-game under at every market total.
 
 ## Default Output
 

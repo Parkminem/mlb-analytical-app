@@ -274,6 +274,9 @@ class TotalContext:
     both_starters_have_five_inning_floor: bool = False
     one_starter_kbb_length_dominant: bool = False
     traffic_over_lacks_power_or_run_conversion: bool = False
+    two_sided_recent_run_conversion_suppression: bool = False
+    two_sided_projected_scoring_suppression: bool = False
+    starter_injury_or_short_exit_volatility: bool = False
 
 
 @dataclass(frozen=True)
@@ -534,7 +537,7 @@ def _evaluate_priority_admission(
 
     if score >= 80:
         tier = "primary"
-    elif score >= 72:
+    elif score >= 75:
         tier = "playable"
     elif score >= 65:
         tier = "lean"
@@ -590,7 +593,7 @@ def select_total_priority_markets(
     )
 
 
-PLAYABLE_PRIORITY_MIN_SCORE = 72
+PLAYABLE_PRIORITY_MIN_SCORE = 75
 PRIORITY_MARKET_FAMILIES = {
     "f5_side": "f5_side",
     "f5_total": "f5_total",
@@ -1225,6 +1228,27 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         and context.lower_order_run_continuity_b
     )
 
+    def validate_under_contract() -> bool:
+        if not context.two_sided_recent_run_conversion_suppression:
+            notes.append(
+                "full-game under requires two-sided recent run-conversion suppression"
+            )
+            return False
+        if not context.two_sided_projected_scoring_suppression:
+            notes.append(
+                "full-game under requires two-sided projected scoring suppression"
+            )
+            return False
+        if context.recent_starter_command_or_hr_volatility:
+            notes.append("starter command/HR volatility blocks full-game under")
+            return False
+        if context.starter_injury_or_short_exit_volatility:
+            notes.append(
+                "starter injury-return/short-exit volatility blocks full-game under"
+            )
+            return False
+        return True
+
     if context.starter_source_conflict:
         notes.append("starter source conflict lowers confidence but is not over support")
 
@@ -1293,6 +1317,8 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         if not both_lineups_muted:
             notes.append("under requires muted lineup contact")
             return TotalDecision(rating="pass", notes=notes)
+        if not validate_under_contract():
+            return TotalDecision(rating="pass", notes=notes)
         if context.under_validation_strict:
             notes.append("strict under validation passed")
         notes.append("both starters and bullpens support under")
@@ -1307,6 +1333,8 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
     ):
         if context.negative_power_bat_variance:
             notes.append("negative pitch-velocity power bats add run variance, not under support")
+            return TotalDecision(rating="pass", notes=notes)
+        if not validate_under_contract():
             return TotalDecision(rating="pass", notes=notes)
         if context.under_validation_strict:
             notes.append("strict under validation passed")
@@ -1327,6 +1355,8 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         if context.negative_power_bat_variance:
             notes.append("negative pitch-velocity power bats add run variance, not under support")
             return TotalDecision(rating="pass", notes=notes)
+        if not validate_under_contract():
+            return TotalDecision(rating="pass", notes=notes)
         if context.under_validation_strict:
             notes.append("strict under validation passed")
         notes.append("low-total starter duel prioritizes under over side")
@@ -1345,6 +1375,8 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         and not context.negative_power_bat_variance
         and not context.low_total_recent_power_hr_variance
     ):
+        if not validate_under_contract():
+            return TotalDecision(rating="pass", notes=notes)
         if context.under_validation_strict:
             notes.append("strict under validation passed")
         notes.append("dominant K/BB length starter prioritizes low-total under over side")
@@ -1367,6 +1399,8 @@ def evaluate_total(context: TotalContext) -> TotalDecision:
         and context.lineup_contact_a < 70
         and context.lineup_contact_b < 70
     ):
+        if not validate_under_contract():
+            return TotalDecision(rating="pass", notes=notes)
         if context.under_validation_strict:
             notes.append("strict under validation passed")
         notes.append("starter length tempers pitch-velocity plus slots at low total")

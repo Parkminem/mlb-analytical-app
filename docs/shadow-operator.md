@@ -36,7 +36,7 @@ Fresh pregame 실행 객체는 raw mapping 또는 JSON을 public `ProjectedBundl
 
 모든 schema-v1 `projected`/`confirmed` shape은 candidate compatibility 필드가 없는 relaxed v1과 필드가 있는 strict v1 모두 역사적 exact replay 전용입니다. 입력은 설정된 관리 번들 루트의 인증된 불변 파일이어야 하고 ledger에 정확히 일치하는 capture, forecast, link가 이미 있어야 합니다. 관리 루트 밖의 v1, exact ledger 관계가 없는 v1, 아직 실행하지 않은 pending v1은 fresh 실행으로 승격되지 않습니다. Pending v1은 schema v2/current 번들로 다시 생성해야 하며, 거부 시 ledger나 관리 번들 bytes를 쓰거나 바꾸지 않습니다.
 
-고정 MLB 모델 버전 `2026-08-05`은 번들 schema version과 독립적입니다. Schema v2 전환은 MLB 점수화, F5 side/F5 O/U, full-game market engine, same-game assembler, legacy decision authority, Shadow의 비권위 비교 모드를 변경하지 않습니다.
+고정 MLB 모델 버전 `2026-09-11`은 번들 schema version과 독립적입니다. 새 버전의 음수 방향 총점 게이트와 `75`점 우선순위 컷은 Shadow의 비권위 비교 모드나 과거 동결 기록을 변경하지 않습니다.
 
 ## Pregame 배치와 완결성 receipt
 
@@ -72,10 +72,13 @@ Pregame 번들의 `forecast_config_version`은 `config/forecasting/<version>.jso
 ## Recommended Review Eligibility Gate
 
 - every new projected or confirmed `play`/`lean` candidate must be review-eligible;
-- the current legacy model version is `2026-08-05`, and every fresh recommended full-game ML must declare and bind `bullpen_protection` or `late_bullpen_exposure`;
+- the current legacy model version is `2026-09-11`, and every fresh recommended full-game ML must declare and bind `bullpen_protection` or `late_bullpen_exposure`;
 - every fresh recommended F5 or full-game under must bind same-namespace `starter_suppression` and `lineup_suppression` paths for two-sided review coverage;
-- a current full-game ML `play`/`lean` candidate with score `72` or higher needs a directionally valid starter path: `starter_suppression` binds the selected side's own starter run prevention, while `starter_collapse` binds opposing-starter failure. Missing evidence is capped at `71`, and a fresh submission above the cap is rejected;
+- a current candidate needs score `75` or higher to enter final priority. Scores `65-74` remain table leans;
+- a current full-game ML `play`/`lean` candidate with score `75` or higher needs a directionally valid starter path: `starter_suppression` binds the selected side's own starter run prevention, while `starter_collapse` binds opposing-starter failure. Missing evidence is capped at `71`, and a fresh submission above the cap is rejected;
 - a current `play`/`lean` candidate on a verified full-game over line of `9.0` or higher needs two distinct canonical routes covering away and home scoring directions. Conversion paths score for their batting side; `starter_collapse` and `late_bullpen_exposure` score for the side opposing the bound pitching side. Suppression/protection paths do not count as over scoring routes. Missing coverage is capped at `69`, and a fresh submission above the cap is rejected;
+- a current F5 over without a canonical `recent_run_conversion` path is capped at `74`;
+- a current full-game under requires both lineups' recent-form index below `1.0` and projected runs per nine below the configured league baseline. Command, HR, injury-return, or recent-short-exit risk for either matchup pitcher caps it at `69`;
 - the Operator does not infer or inject the required bullpen path;
 - `pass` candidates are excluded from the hard gate;
 - static validation runs before simulation and dynamic validation before append;
@@ -228,6 +231,6 @@ JSON에는 resolved `ledger_path`, ledger 최대 append 시각인 `ledger_as_of`
 
 - CLI는 MLB, RotoWire, Savant/Statcast, market site를 live fetch하지 않습니다.
 - CLI와 보고서는 자동 model tuning, online learning, production promotion을 수행하지 않습니다.
-- 기존 legacy authority, `play`/`lean`/`pass`, `0-100` rank score, same-game assembler, 최종 priority와 model threshold를 변경하지 않습니다.
-- 고정 model version `2026-08-05`은 pregame schema v2 및 review schema v1과 별도로 버전 관리됩니다.
+- 기존 legacy authority, `play`/`lean`/`pass`, `0-100` rank score 산식과 Shadow 권한을 변경하지 않습니다. 현재 최종 priority 최소점은 `75`입니다.
+- 고정 model version `2026-09-11`은 pregame schema v2 및 review schema v1과 별도로 버전 관리됩니다.
 - Forecast는 반드시 첫 투구 전에 `confirmed` 단계에서 동결합니다. `review`는 공식 결과를 받은 뒤에도 forecast를 다시 만들거나 바꾸지 않습니다.

@@ -1,5 +1,5 @@
 {
-  "version": "2026-08-05",
+  "version": "2026-09-11",
   "fixed_model": true,
   "forecasting": {
     "enabled": true,
@@ -134,7 +134,10 @@
     "bullpen_over_requires_starter_length_failure_or_post_sixth_exposure": true,
     "extreme_total_over_requires_clear_two_sided_collapse_path": true,
     "one_dominant_kbb_starter_prioritizes_low_total_under": true,
-    "traffic_over_requires_power_or_run_conversion_support": true
+    "traffic_over_requires_power_or_run_conversion_support": true,
+    "full_under_requires_two_sided_recent_run_conversion_suppression": true,
+    "full_under_requires_two_sided_projected_scoring_suppression": true,
+    "block_full_under_on_command_hr_injury_short_exit_volatility": true
   },
   "f5_total_priority": {
     "independent_engine": true,
@@ -142,7 +145,8 @@
     "require_verified_market_line_and_price": true,
     "deduplicate_correlated_full_game_total": true,
     "require_two_sided_run_suppression": true,
-    "block_under_on_long_horizon_starter_baseline_risk": true
+    "block_under_on_long_horizon_starter_baseline_risk": true,
+    "cap_over_without_recent_run_conversion_at_74": true
   },
   "weather": {
     "included_by_default": false,
@@ -168,7 +172,7 @@
     "canonical_evidence_paths_only": true,
     "missing_evidence_blocks_multi_market_retention": true,
     "same_game_candidate_assembler": "assemble_same_game_priority",
-    "multi_market_min_score": 72,
+    "multi_market_min_score": 75,
     "one_candidate_per_full_game_family": true,
     "allow_compatible_side_total_pair": true,
     "require_distinct_canonical_evidence_paths_for_multi_market_retention": true,
@@ -186,6 +190,10 @@
     "high_total_two_sided_over_cap": 69,
     "high_total_two_sided_over_threshold": 9.0,
     "fresh_review_requires_ml_starter_evidence_binding": true,
-    "fresh_review_requires_high_total_two_sided_bindings": true
+    "fresh_review_requires_high_total_two_sided_bindings": true,
+    "f5_over_without_recent_run_conversion_cap": 74,
+    "full_under_support_cap": 69,
+    "full_under_requires_two_sided_recent_and_projected_suppression": true,
+    "full_under_blocks_starter_volatility": true
   }
 }

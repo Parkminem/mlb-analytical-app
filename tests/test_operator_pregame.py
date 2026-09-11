@@ -482,7 +482,7 @@ def _ordered_legacy_decision() -> LegacyDecisionSnapshot:
     return LegacyDecisionSnapshot(
         model_version=LEGACY_MODEL_VERSION,
         candidates=candidates,
-        final_priority=("ml", "full_total"),
+        final_priority=("ml",),
         review_bindings=(
             CandidateReviewBinding(
                 market_key="sea_ml",
@@ -802,7 +802,7 @@ def test_fresh_stale_legacy_model_version_rejects_before_forecast_without_artifa
     with pytest.raises(
         OperatorPreconditionError,
         match=(
-            "fresh pregame legacy model_version must be 2026-08-05; "
+            "fresh pregame legacy model_version must be 2026-09-11; "
             "received 2026-07-13"
         ),
     ):

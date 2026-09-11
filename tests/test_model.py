@@ -330,6 +330,40 @@ class SameGamePriorityTests(unittest.TestCase):
             ["ml", "full_total"],
         )
 
+    def test_scores_72_through_74_remain_leans_but_not_final_priority(self):
+        admission = evaluate_priority_admission(
+            PriorityAdmissionContext(
+                market="f5",
+                proposed_score=74,
+            )
+        )
+        selection = model.assemble_same_game_priority(
+            [
+                model.PriorityMarketCandidate(
+                    "f5_side",
+                    74,
+                    "lean",
+                    frozenset({model.PriorityEvidencePath.TOP_ORDER_MATCHUP}),
+                ),
+                model.PriorityMarketCandidate(
+                    "f5_total",
+                    75,
+                    "over",
+                    frozenset({model.PriorityEvidencePath.RECENT_RUN_CONVERSION}),
+                ),
+            ]
+        )
+
+        self.assertEqual(admission.tier, "lean")
+        self.assertEqual(
+            [candidate.market for candidate in selection.included],
+            ["f5_total"],
+        )
+        self.assertEqual(
+            [candidate.market for candidate in selection.excluded],
+            ["f5_side"],
+        )
+
     def test_pass_decisions_from_market_engines_are_excluded(self):
         handicap = evaluate_plus_handicap(
             HandicapContext(
@@ -651,7 +685,7 @@ class PriorityAdmissionTests(unittest.TestCase):
         )
 
         self.assertEqual(result.score, 74)
-        self.assertEqual(result.tier, "playable")
+        self.assertEqual(result.tier, "lean")
         self.assertIn(
             "matchup-only side lacks recent run-conversion support",
             result.notes,
@@ -668,7 +702,7 @@ class PriorityAdmissionTests(unittest.TestCase):
         )
 
         self.assertEqual(result.score, 74)
-        self.assertEqual(result.tier, "playable")
+        self.assertEqual(result.tier, "lean")
         self.assertIn(
             "matchup-only side lacks recent run-conversion support",
             result.notes,
@@ -1232,6 +1266,98 @@ class HandicapTests(unittest.TestCase):
 
 
 class TotalTests(unittest.TestCase):
+    def test_full_game_under_requires_recent_run_conversion_suppression(self):
+        context = TotalContext(
+            market_total=8.5,
+            projected_total=7.5,
+            starter_stability_a=78,
+            starter_stability_b=76,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=74,
+            bullpen_score_b=76,
+            lower_bullpen_risk=False,
+            two_sided_projected_scoring_suppression=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "full-game under requires two-sided recent run-conversion suppression",
+            result.notes,
+        )
+
+    def test_full_game_under_requires_projected_scoring_suppression(self):
+        context = TotalContext(
+            market_total=8.5,
+            projected_total=7.5,
+            starter_stability_a=78,
+            starter_stability_b=76,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=74,
+            bullpen_score_b=76,
+            lower_bullpen_risk=False,
+            two_sided_recent_run_conversion_suppression=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "full-game under requires two-sided projected scoring suppression",
+            result.notes,
+        )
+
+    def test_full_game_under_blocks_starter_volatility_above_low_total(self):
+        context = TotalContext(
+            market_total=9.0,
+            projected_total=8.0,
+            starter_stability_a=78,
+            starter_stability_b=76,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=74,
+            bullpen_score_b=76,
+            lower_bullpen_risk=False,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
+            recent_starter_command_or_hr_volatility=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "starter command/HR volatility blocks full-game under",
+            result.notes,
+        )
+
+    def test_full_game_under_blocks_injury_or_short_exit_volatility(self):
+        context = TotalContext(
+            market_total=9.0,
+            projected_total=8.0,
+            starter_stability_a=78,
+            starter_stability_b=76,
+            lineup_contact_a=48,
+            lineup_contact_b=50,
+            bullpen_score_a=74,
+            bullpen_score_b=76,
+            lower_bullpen_risk=False,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
+            starter_injury_or_short_exit_volatility=True,
+        )
+
+        result = evaluate_total(context)
+
+        self.assertEqual(result.rating, "pass")
+        self.assertIn(
+            "starter injury-return/short-exit volatility blocks full-game under",
+            result.notes,
+        )
+
     def test_under_requires_both_starters_and_bullpens_to_be_stable(self):
         context = TotalContext(
             market_total=8.0,
@@ -1345,6 +1471,8 @@ class TotalTests(unittest.TestCase):
             bullpen_score_b=68,
             lower_bullpen_risk=False,
             both_starters_recently_stable=True,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
         )
 
         result = evaluate_total(context)
@@ -1364,6 +1492,8 @@ class TotalTests(unittest.TestCase):
             bullpen_score_b=69,
             lower_bullpen_risk=False,
             low_total_starter_duel=True,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
         )
 
         result = evaluate_total(context)
@@ -1383,6 +1513,8 @@ class TotalTests(unittest.TestCase):
             bullpen_score_b=70,
             lower_bullpen_risk=False,
             one_starter_kbb_length_dominant=True,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
         )
 
         result = evaluate_total(context)
@@ -1532,6 +1664,8 @@ class TotalTests(unittest.TestCase):
             both_starters_recently_stable=True,
             both_starters_likely_to_reach_sixth=True,
             starter_length_tempers_plus_slots=True,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
         )
 
         result = evaluate_total(context)
@@ -1782,6 +1916,8 @@ class TotalTests(unittest.TestCase):
             lower_bullpen_risk=False,
             weak_favorite_lineup_with_starter_edge=True,
             under_validation_strict=True,
+            two_sided_recent_run_conversion_suppression=True,
+            two_sided_projected_scoring_suppression=True,
         )
 
         result = evaluate_total(context)

@@ -1,9 +1,16 @@
 """Negative-only priority caps derived from frozen canonical evidence."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from analysis.forecasting.inputs import MarketInput, MarketType
+from analysis.forecasting.config import SimulationConfig
+from analysis.forecasting.inputs import (
+    MarketInput,
+    MarketType,
+    NormalizedGameInput,
+)
+from analysis.forecasting.offense import forecast_offense
 from analysis.model import (
     PriorityAdmission,
     PriorityAdmissionContext,
@@ -22,11 +29,53 @@ if TYPE_CHECKING:
     from analysis.shadow import CandidateReviewBinding
 
 
-_PLAYABLE_PRIORITY_MIN_SCORE = 72
+_PLAYABLE_PRIORITY_MIN_SCORE = 75
 _ML_STARTER_EVIDENCE_CAP = 71
 _HIGH_TOTAL_TWO_SIDED_OVER_CAP = 69
+_MATCHUP_ONLY_SIDE_CAP = 74
+_NEUTRAL_HEAVY_SIDE_CAP = 74
+_STARTER_RISK_SIDE_CAP = 71
+_F5_OVER_CONVERSION_CAP = 74
+_FULL_UNDER_SUPPORT_CAP = 69
+_LOW_TOTAL_OVER_CAP = 69
+_LOW_TOTAL_OVER_MAX = 7.0
+_NEUTRAL_HEAVY_MIN_SLOTS = 6
+_NEUTRAL_HEAVY_MAX_MINUS_SLOTS = 2
+_PLUS_ADJUSTED_WOBA = 0.360
+_MINUS_ADJUSTED_WOBA = 0.290
+_SAMPLE_SHORTAGE_UNKNOWN_EXPOSURE = 0.65
 _SCORING_SIDES = frozenset(("away", "home"))
 _DECISION_RATINGS = frozenset(("play", "lean", "pass"))
+_SIDE_MARKETS = frozenset((MarketType.F5_SIDE, MarketType.ML, MarketType.PLUS_1_5))
+_DIRECT_SCORING_PATHS = frozenset(
+    (
+        PriorityEvidencePath.STARTER_COLLAPSE,
+        PriorityEvidencePath.TOP_ORDER_MATCHUP,
+        PriorityEvidencePath.RECENT_RUN_CONVERSION,
+        PriorityEvidencePath.UNDERDOG_RUN_CREATION,
+    )
+)
+_MATCHUP_ONLY_PATHS = frozenset(
+    (
+        PriorityEvidencePath.TOP_ORDER_MATCHUP,
+        PriorityEvidencePath.BULLPEN_PROTECTION,
+        PriorityEvidencePath.LATE_BULLPEN_EXPOSURE,
+    )
+)
+
+
+@dataclass(frozen=True)
+class _SelectedSideGameFacts:
+    matchup_pitcher_injury_or_short_exit: bool
+    opponent_neutral_slots: int
+    opponent_minus_slots: int
+
+
+@dataclass(frozen=True)
+class _FullUnderGameFacts:
+    two_sided_recent_run_suppression: bool
+    two_sided_projected_scoring_suppression: bool
+    starter_volatility: bool
 
 
 @dataclass(frozen=True)
@@ -149,10 +198,13 @@ def _assessment(
     )
 
 
-def _is_playable_non_pass(candidate: PriorityMarketCandidate) -> bool:
+def _is_playable_non_pass(
+    candidate: PriorityMarketCandidate,
+    playable_min_score: int,
+) -> bool:
     return (
         candidate.decision_rating in {"play", "lean"}
-        and candidate.score >= _PLAYABLE_PRIORITY_MIN_SCORE
+        and candidate.score >= playable_min_score
     )
 
 
@@ -221,10 +273,172 @@ def _full_total_scoring_sides(
     }
 
 
+def _direct_full_total_scoring_sides(
+    candidate: PriorityMarketCandidate,
+    principal_paths: tuple[PrincipalPathBinding, ...],
+) -> set[str]:
+    sides_by_path: dict[PriorityEvidencePath, set[str]] = {}
+    for path in principal_paths:
+        if (
+            path.evidence_path not in candidate.evidence_paths
+            or path.evidence_path not in _DIRECT_SCORING_PATHS
+            or not _is_valid_path_for_market(path, MarketType.FULL_TOTAL)
+        ):
+            continue
+        scoring_side = derive_canonical_scoring_side(path)
+        if scoring_side is not None:
+            sides_by_path.setdefault(path.evidence_path, set()).add(scoring_side)
+    return {
+        next(iter(sides))
+        for sides in sides_by_path.values()
+        if len(sides) == 1
+    }
+
+
+def _has_late_variance_path(
+    candidate: PriorityMarketCandidate,
+    principal_paths: tuple[PrincipalPathBinding, ...],
+) -> bool:
+    return any(
+        path.evidence_path is PriorityEvidencePath.LATE_BULLPEN_EXPOSURE
+        and path.evidence_path in candidate.evidence_paths
+        and _is_valid_path_for_market(path, MarketType.FULL_TOTAL)
+        for path in principal_paths
+    )
+
+
+def _slot_grade(
+    labels: tuple[str, ...],
+    exposure_woba: float,
+    unknown_exposure: float,
+) -> str:
+    if unknown_exposure >= _SAMPLE_SHORTAGE_UNKNOWN_EXPOSURE:
+        return "표본 부족"
+    known_labels = set(labels).difference(("표본 부족",))
+    if len(known_labels) == 1 and unknown_exposure == 0.0:
+        return next(iter(known_labels))
+    if exposure_woba >= _PLUS_ADJUSTED_WOBA:
+        return "플러스"
+    if exposure_woba < _MINUS_ADJUSTED_WOBA:
+        return "마이너스"
+    return "중립"
+
+
+@lru_cache(maxsize=32)
+def _derive_game_facts(
+    game_input: NormalizedGameInput,
+    simulation_config: SimulationConfig,
+) -> tuple[_SelectedSideGameFacts, _SelectedSideGameFacts]:
+    if not isinstance(game_input, NormalizedGameInput):
+        raise TypeError("game_input must be NormalizedGameInput")
+    if not isinstance(simulation_config, SimulationConfig):
+        raise TypeError("simulation_config must be SimulationConfig")
+
+    away_offense = forecast_offense(
+        game_input.away_lineup,
+        game_input.home_pitching.pitchers,
+        simulation_config,
+    )
+    home_offense = forecast_offense(
+        game_input.home_lineup,
+        game_input.away_pitching.pitchers,
+        simulation_config,
+    )
+
+    def side_facts(selected_side: str) -> _SelectedSideGameFacts:
+        if selected_side == "away":
+            selected_pitching = game_input.away_pitching
+            opponent_offense = home_offense
+        else:
+            selected_pitching = game_input.home_pitching
+            opponent_offense = away_offense
+
+        matchup_pitcher = next(
+            pitcher
+            for pitcher in selected_pitching.pitchers
+            if pitcher.pitcher_id == selected_pitching.matchup_pitcher_id
+        )
+        opponent_slots = opponent_offense.slot_forecasts_for(
+            selected_pitching.matchup_pitcher_id
+        )
+        grades = tuple(
+            _slot_grade(
+                slot.labels,
+                slot.exposure_weighted_adjusted_woba,
+                slot.unknown_exposure,
+            )
+            for slot in opponent_slots
+        )
+        return _SelectedSideGameFacts(
+            matchup_pitcher_injury_or_short_exit=(
+                matchup_pitcher.injury_return.value
+                or matchup_pitcher.recent_short_exit.value
+            ),
+            opponent_neutral_slots=grades.count("중립"),
+            opponent_minus_slots=grades.count("마이너스"),
+        )
+
+    return side_facts("away"), side_facts("home")
+
+
+def _game_facts_for_selected_side(
+    game_input: NormalizedGameInput | None,
+    simulation_config: SimulationConfig | None,
+    selected_side: str,
+) -> _SelectedSideGameFacts | None:
+    if game_input is None:
+        if simulation_config is not None:
+            raise ValueError("simulation_config requires game_input")
+        return None
+    config = simulation_config or SimulationConfig()
+    away_facts, home_facts = _derive_game_facts(game_input, config)
+    return away_facts if selected_side == "away" else home_facts
+
+
+@lru_cache(maxsize=32)
+def _derive_full_under_game_facts(
+    game_input: NormalizedGameInput,
+    simulation_config: SimulationConfig,
+) -> _FullUnderGameFacts:
+    lineups = (game_input.away_lineup, game_input.home_lineup)
+    matchup_pitchers = tuple(
+        next(
+            pitcher
+            for pitcher in chain.pitchers
+            if pitcher.pitcher_id == chain.matchup_pitcher_id
+        )
+        for chain in (game_input.away_pitching, game_input.home_pitching)
+    )
+    return _FullUnderGameFacts(
+        two_sided_recent_run_suppression=all(
+            lineup.recent_form_included.value
+            and lineup.recent_form_index.value < 1.0
+            for lineup in lineups
+        ),
+        two_sided_projected_scoring_suppression=all(
+            lineup.projected_runs_per_9.value
+            < simulation_config.league_runs_per_team_game
+            for lineup in lineups
+        ),
+        starter_volatility=any(
+            pitcher.command_risk.value
+            or pitcher.home_run_risk.value
+            or pitcher.injury_return.value
+            or pitcher.recent_short_exit.value
+            for pitcher in matchup_pitchers
+        ),
+    )
+
+
 def assess_priority_evidence_contract(
     candidate: PriorityMarketCandidate,
     binding: "CandidateReviewBinding",
     market_input: MarketInput,
+    *,
+    game_input: NormalizedGameInput | None = None,
+    simulation_config: SimulationConfig | None = None,
+    playable_min_score: int = _PLAYABLE_PRIORITY_MIN_SCORE,
+    enforce_current_total_hardening: bool = True,
 ) -> PriorityEvidenceAssessment:
     """Derive priority caps only from the candidate, binding, and market input."""
 
@@ -234,19 +448,87 @@ def assess_priority_evidence_contract(
         market_input,
     )
     validate_principal_path_bindings(market_input.market_type, principal_paths)
-    if not _is_playable_non_pass(candidate):
+    if (
+        isinstance(playable_min_score, bool)
+        or not isinstance(playable_min_score, int)
+        or playable_min_score < 0
+    ):
+        raise ValueError("playable_min_score must be a nonnegative integer")
+    if not isinstance(enforce_current_total_hardening, bool):
+        raise TypeError("enforce_current_total_hardening must be a boolean")
+    if not _is_playable_non_pass(candidate, playable_min_score):
         return _assessment(market_input)
+
+    caps: list[tuple[int, str]] = []
+
+    def add_cap(score_cap: int, reason_code: str) -> None:
+        caps.append((score_cap, reason_code))
 
     if market_input.market_type is MarketType.ML and not _ml_has_starter_path(
         candidate,
         principal_paths,
         market_input.selected_side,
     ):
-        return _assessment(
-            market_input,
-            score_cap=_ML_STARTER_EVIDENCE_CAP,
-            reason_codes=("missing_ml_starter_evidence",),
+        add_cap(_ML_STARTER_EVIDENCE_CAP, "missing_ml_starter_evidence")
+
+    matchup_only_side = (
+        market_input.market_type in _SIDE_MARKETS
+        and PriorityEvidencePath.TOP_ORDER_MATCHUP in candidate.evidence_paths
+        and candidate.evidence_paths.issubset(_MATCHUP_ONLY_PATHS)
+        and PriorityEvidencePath.RECENT_RUN_CONVERSION
+        not in candidate.evidence_paths
+    )
+    if matchup_only_side:
+        add_cap(
+            _MATCHUP_ONLY_SIDE_CAP,
+            "matchup_only_side_lacks_recent_run_conversion",
         )
+
+    if (
+        enforce_current_total_hardening
+        and market_input.market_type is MarketType.F5_TOTAL
+        and market_input.selected_side == "over"
+        and PriorityEvidencePath.RECENT_RUN_CONVERSION
+        not in candidate.evidence_paths
+    ):
+        add_cap(
+            _F5_OVER_CONVERSION_CAP,
+            "f5_over_lacks_recent_run_conversion",
+        )
+
+    if (
+        enforce_current_total_hardening
+        and market_input.market_type is MarketType.FULL_TOTAL
+        and market_input.selected_side == "under"
+        and game_input is not None
+        and {
+            PriorityEvidencePath.STARTER_SUPPRESSION,
+            PriorityEvidencePath.LINEUP_SUPPRESSION,
+        }.issubset(candidate.evidence_paths)
+        and {
+            PriorityEvidencePath.STARTER_SUPPRESSION,
+            PriorityEvidencePath.LINEUP_SUPPRESSION,
+        }.issubset(path.evidence_path for path in principal_paths)
+    ):
+        under_facts = _derive_full_under_game_facts(
+            game_input,
+            simulation_config or SimulationConfig(),
+        )
+        if not under_facts.two_sided_recent_run_suppression:
+            add_cap(
+                _FULL_UNDER_SUPPORT_CAP,
+                "missing_two_sided_recent_run_suppression",
+            )
+        if not under_facts.two_sided_projected_scoring_suppression:
+            add_cap(
+                _FULL_UNDER_SUPPORT_CAP,
+                "missing_two_sided_projected_scoring_suppression",
+            )
+        if under_facts.starter_volatility:
+            add_cap(
+                _FULL_UNDER_SUPPORT_CAP,
+                "starter_volatility_blocks_full_game_under",
+            )
 
     if (
         market_input.market_type is MarketType.FULL_TOTAL
@@ -255,13 +537,57 @@ def assess_priority_evidence_contract(
         and market_input.line >= 9.0
         and _full_total_scoring_sides(candidate, principal_paths) != _SCORING_SIDES
     ):
-        return _assessment(
-            market_input,
-            score_cap=_HIGH_TOTAL_TWO_SIDED_OVER_CAP,
-            reason_codes=("missing_high_total_two_sided_over_evidence",),
+        add_cap(
+            _HIGH_TOTAL_TWO_SIDED_OVER_CAP,
+            "missing_high_total_two_sided_over_evidence",
         )
 
-    return _assessment(market_input)
+    if (
+        market_input.market_type is MarketType.FULL_TOTAL
+        and market_input.selected_side == "over"
+        and market_input.line is not None
+        and market_input.line <= _LOW_TOTAL_OVER_MAX
+        and (
+            _direct_full_total_scoring_sides(candidate, principal_paths)
+            != _SCORING_SIDES
+            or not _has_late_variance_path(candidate, principal_paths)
+        )
+    ):
+        add_cap(
+            _LOW_TOTAL_OVER_CAP,
+            "missing_low_total_two_sided_scoring_or_late_variance",
+        )
+
+    if market_input.market_type in _SIDE_MARKETS:
+        game_facts = _game_facts_for_selected_side(
+            game_input,
+            simulation_config,
+            market_input.selected_side,
+        )
+        if game_facts is not None:
+            if game_facts.matchup_pitcher_injury_or_short_exit:
+                add_cap(
+                    _STARTER_RISK_SIDE_CAP,
+                    "selected_side_matchup_pitcher_injury_or_short_exit",
+                )
+            if (
+                game_facts.opponent_neutral_slots >= _NEUTRAL_HEAVY_MIN_SLOTS
+                and game_facts.opponent_minus_slots
+                <= _NEUTRAL_HEAVY_MAX_MINUS_SLOTS
+            ):
+                add_cap(
+                    _NEUTRAL_HEAVY_SIDE_CAP,
+                    "neutral_heavy_opponent_lineup",
+                )
+
+    if not caps:
+        return _assessment(market_input)
+    score_cap = min(cap for cap, _ in caps)
+    return _assessment(
+        market_input,
+        score_cap=score_cap,
+        reason_codes=tuple(reason for _, reason in caps),
+    )
 
 
 def evaluate_bound_priority_admission(
