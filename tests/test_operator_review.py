@@ -142,6 +142,7 @@ def _iso(value: datetime) -> str:
 class ReviewContext:
     ledger_path: Path
     bundle_root: Path
+    report_dir: Path
     confirmed: object
     bundle: ReviewBundle
 
@@ -272,10 +273,30 @@ def _fast_operator_config(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _require_local_report_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish = service_module._publish_calibration_report
+
+    def publish_local_report(store, ledger_path, report_dir):
+        if not Path(report_dir).resolve().is_relative_to(tmp_path.resolve()):
+            raise AssertionError("Review tests must publish reports inside tmp_path")
+        return publish(store, ledger_path, report_dir)
+
+    monkeypatch.setattr(
+        service_module,
+        "_publish_calibration_report",
+        publish_local_report,
+    )
+
+
 @pytest.fixture
 def review_context(tmp_path: Path) -> ReviewContext:
     ledger_path = tmp_path / "ledger" / "shadow.jsonl"
     bundle_root = tmp_path / "bundles"
+    report_dir = tmp_path / "reports"
     game = _complete_game()
     confirmed = _record_pregame(
         game,
@@ -283,7 +304,7 @@ def review_context(tmp_path: Path) -> ReviewContext:
         ledger_path,
     )
     bundle = parse_review_bundle_json(_raw(_review_mapping(confirmed)))
-    return ReviewContext(ledger_path, bundle_root, confirmed, bundle)
+    return ReviewContext(ledger_path, bundle_root, report_dir, confirmed, bundle)
 
 
 def _run(context: ReviewContext, bundle: ReviewBundle | None = None):
@@ -291,6 +312,7 @@ def _run(context: ReviewContext, bundle: ReviewBundle | None = None):
         context.bundle if bundle is None else bundle,
         ledger_path=context.ledger_path,
         bundle_root=context.bundle_root,
+        report_dir=context.report_dir,
     )
 
 
@@ -393,6 +415,37 @@ def test_run_review_records_exact_confirmed_result_closing_and_all_eligible_mark
         result.classification_counts["A"] = 99
     with pytest.raises(FrozenInstanceError):
         result.game_pk = 1
+
+
+def test_review_reports_are_written_only_to_the_test_directory(
+    review_context: ReviewContext,
+    tmp_path: Path,
+) -> None:
+    result = _run(review_context)
+    report_dir = tmp_path / "reports"
+
+    assert result.calibration_json_path == report_dir / "calibration-latest.json"
+    assert result.calibration_markdown_path == report_dir / "calibration-latest.md"
+    assert result.calibration_generation_dir.is_relative_to(report_dir)
+    assert result.calibration_current_generation_path == report_dir / "current"
+    report = json.loads(result.calibration_json_path.read_text())
+    assert report["ledger_path"] == str(review_context.ledger_path)
+    assert report["overall"]["sample_size"] == 2
+    assert result.calibration_markdown_path.read_text().startswith("# ")
+
+
+def test_review_tests_block_the_production_default_before_report_publication(
+    review_context: ReviewContext,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(AssertionError, match="reports inside tmp_path"):
+        run_review(
+            review_context.bundle,
+            ledger_path=review_context.ledger_path,
+            bundle_root=review_context.bundle_root,
+        )
+
+    assert not (tmp_path / "reports").exists()
 
 
 def test_exact_review_retry_replays_every_record_and_managed_bundle(
@@ -557,7 +610,12 @@ def test_review_rejects_projected_capture(tmp_path: Path) -> None:
     )
 
     with pytest.raises(OperatorPreconditionError, match="confirmed"):
-        run_review(review, ledger_path=ledger_path, bundle_root=bundle_root)
+        run_review(
+            review,
+            ledger_path=ledger_path,
+            bundle_root=bundle_root,
+            report_dir=tmp_path / "reports",
+        )
 
 
 def test_review_rejects_superseded_confirmed_capture(

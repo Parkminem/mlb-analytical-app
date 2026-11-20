@@ -18,7 +18,7 @@
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-python3 -m unittest discover -s tests -v
+.venv/bin/python -m pytest
 python3 -m analysis.pipeline --lineup projected --starter confirmed
 python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 .venv/bin/python -m analysis.operator projected --bundle <path>
@@ -30,6 +30,8 @@ python3 -m analysis.pipeline --lineup confirmed --starter confirmed --weather
 
 `analysis.pipeline`은 라이브 데이터를 스크래핑하지 않습니다. 분석에 필요한 단계, 출처 상태, 신뢰도 플래그가 고정 규칙과 맞는지 확인하는 재현성 도구입니다.
 `analysis.operator`도 라이브 데이터를 수집하거나 정규화하지 않습니다. 외부에서 준비한 엄격한 버전 번들을 받아 append-only 원장과 불변 운영 산출물을 기록합니다.
+
+전체 테스트는 `.venv/bin/python -m pytest`로 실행합니다. 기본 검색 범위는 `tests/`로 제한해 백업 복원본과 별도 프로젝트의 테스트를 실행하지 않습니다. 복기 통합 테스트는 원장·번들·보고서를 각 테스트의 임시 폴더로 분리하며, 보고서 경로가 임시 폴더 밖이면 게시 전에 실패합니다. 운영 기본 경로와 분석 모델은 변경하지 않습니다.
 
 Fresh `projected`/`confirmed` 번들은 JSON integer `schema_version: 2`와 명시적인 `authority: "current"`를 사용합니다. `review` 번들은 `schema_version: 1`을 유지합니다.
 
